@@ -581,6 +581,9 @@ fn collect_all_block_ids() -> Vec<(BlockId, &'static str)> {
     // Slabs
     push!(StoneSlab, "stone");
     push!(OakSlab, "oak_planks");
+    // Stairs
+    push!(StoneStairs, "cobblestone");
+    push!(OakStairs, "oak_planks");
     // Fungus blocks
     push!(Mycelium, "mycelium_top");
     // Mushroom blocks

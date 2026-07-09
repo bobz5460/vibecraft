@@ -166,7 +166,7 @@ pub fn build_chunk_mesh<'a>(
                     };
 
                     let block = get_block_fn(bx, by, bz);
-                    if block.is_air() || block.id.is_crossed() {
+                    if block.is_air() || block.id.is_crossed() || block.id.is_stair() {
                         continue;
                     }
 
@@ -331,6 +331,279 @@ pub fn build_chunk_mesh<'a>(
                             _ => (wx, y0, wz),
                         };
                         emit_quad(&mut vertices, &mut indices, sface, sx, sy, sz, 1.0, 0.5, side_tex, u_ax as usize, v_ax as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    // Stair post-processing pass
+    for x in 0..CHUNK_SIZE {
+        for z in 0..CHUNK_SIZE {
+            for y in 0..CHUNK_HEIGHT {
+                let block = chunk.get_block(x, y, z);
+                if !block.id.is_stair() { continue; }
+
+                let facing = block.data & 0x03;
+                let is_top = (block.data & 0x04) != 0;
+                let tex = get_texture_index(block, BlockFace::Top);
+                let wx = wox + x as f32;
+                let wz = woz + z as f32;
+                let by = y as f32;
+
+                // Determine the "back" and "front" axes based on facing
+                // facing: 0=South(+Z), 1=West(-X), 2=North(-Z), 3=East(+X)
+                // back_fx, back_fz = direction of the full-height back portion
+                // step_fx, step_fz = direction of the step front portion
+                let (back_fx, back_fz, step_fx, step_fz) = match facing {
+                    0 => (0, -1, 0, 1),  // South: back=North(-Z), step=South(+Z)
+                    1 => (-1, 0, 1, 0),  // West: back=East(+X), step=West(-X)
+                    2 => (0, 1, 0, -1),  // North: back=South(+Z), step=North(-Z)
+                    _ => (1, 0, -1, 0),  // East: back=West(-X), step=East(+X)
+                };
+
+                // Stair structure:
+                // Bottom half [y, y+0.5]: filled (full horizontal area for bottom stair,
+                //                          only back half for top stair)
+                // Top half [y+0.5, y+1]: back half only for bottom stair,
+                //                       filled for top stair
+
+                // Helper to check if a neighboring block is air/transparent
+                let is_open = |nx: i32, ny: i32, nz: i32| -> bool {
+                    if nx < 0 || nx >= CHUNK_SIZE as i32 || nz < 0 || nz >= CHUNK_SIZE as i32 { return true; }
+                    if ny < 0 || ny >= CHUNK_HEIGHT as i32 { return true; }
+                    let b = chunk.get_block(nx as usize, ny as usize, nz as usize);
+                    b.is_air() || b.id.is_transparent()
+                };
+
+                // Helper to emit a face (u_axis, v_axis based on face)
+                let emit = |verts: &mut Vec<MeshVertex>, inds: &mut Vec<u32>,
+                           face: BlockFace, fx: f32, fy: f32, fz: f32, w: f32, h: f32, tex: u32| {
+                    let (u_ax, v_ax) = match face {
+                        BlockFace::Top | BlockFace::Bottom => (0usize, 2usize),
+                        BlockFace::Left | BlockFace::Right => (2usize, 1usize),
+                        BlockFace::Front | BlockFace::Back => (0usize, 1usize),
+                    };
+                    emit_quad(verts, inds, face, fx, fy, fz, w, h, tex, u_ax, v_ax);
+                };
+
+                if !is_top {
+                    // === BOTTOM STAIR (normal orientation) ===
+                    // Bottom half [y, y+0.5]: full area filled
+                    // Top half [y+0.5, y+1]: only back half filled
+
+                    // Bottom face: full (check block below)
+                    if y == 0 || is_open(x as i32, y as i32 - 1, z as i32) {
+                        let bot_tex = get_texture_index(block, BlockFace::Bottom);
+                        emit(&mut vertices, &mut indices, BlockFace::Bottom, wx, by, wz, 1.0, 1.0, bot_tex);
+                    }
+
+                    // Top face of back (full height) portion: at y+1, back half
+                    if y + 1 >= CHUNK_HEIGHT || is_open(x as i32, y as i32 + 1, z as i32) {
+                        let (top_x, top_z, top_w, top_h) = match facing {
+                            0 => (wx, wz, 1.0, 0.5),      // South: z..z+0.5
+                            2 => (wx, wz + 0.5, 1.0, 0.5), // North: z+0.5..z+1
+                            1 => (wx, wz, 0.5, 1.0),      // West: x..x+0.5
+                            _ => (wx + 0.5, wz, 0.5, 1.0), // East: x+0.5..x+1
+                        };
+                        emit(&mut vertices, &mut indices, BlockFace::Top, top_x, by + 1.0, top_z, top_w, top_h, tex);
+                    }
+
+                    // Step top: at y+0.5, front half
+                    let (step_x, step_z, step_w, step_h) = match facing {
+                        0 => (wx, wz + 0.5, 1.0, 0.5),      // South: z+0.5..z+1
+                        2 => (wx, wz, 1.0, 0.5),            // North: z..z+0.5
+                        1 => (wx + 0.5, wz, 0.5, 1.0),      // West: x+0.5..x+1
+                        _ => (wx, wz, 0.5, 1.0),            // East: x..x+0.5
+                    };
+                    // Only emit step top if the block above at the front half is open
+                    let step_cx = (x as i32 + step_fx).max(0).min(CHUNK_SIZE as i32 - 1);
+                    let step_cz = (z as i32 + step_fz).max(0).min(CHUNK_SIZE as i32 - 1);
+                    let above = chunk.get_block(step_cx as usize, y + 1, step_cz as usize);
+                    if y + 1 >= CHUNK_HEIGHT || above.is_air() || above.id.is_transparent() || above.id.is_stair() {
+                        let step_tex = get_texture_index(block, BlockFace::Top);
+                        emit(&mut vertices, &mut indices, BlockFace::Top, step_x, by + 0.5, step_z, step_w, step_h, step_tex);
+                    }
+
+                    // Back face: full height, at the back edge (opposite the facing direction)
+                    let (back_face, back_ox, back_oz) = match facing {
+                        0 => (BlockFace::Back,  wx,        wz),  // South: back at z (north)
+                        2 => (BlockFace::Front, wx,        wz + 1.0),  // North: back at z+1 (south)
+                        1 => (BlockFace::Right, wx + 1.0,  wz),  // West: back at x+1 (east)
+                        _ => (BlockFace::Left,  wx,        wz),  // East: back at x (west)
+                    };
+                    let back_side = x as i32 + back_fx;
+                    let back_sz = z as i32 + back_fz;
+                    if is_open(back_side, y as i32, back_sz) {
+                        let back_tex = match back_face {
+                            BlockFace::Back | BlockFace::Front => get_texture_index(block, BlockFace::Front),
+                            BlockFace::Left | BlockFace::Right => get_texture_index(block, BlockFace::Left),
+                            _ => tex,
+                        };
+                        emit(&mut vertices, &mut indices, back_face, back_ox, by, back_oz, 1.0, 1.0, back_tex);
+                    }
+
+                    // Front (step) face: half height, at the front edge
+                    let (front_face, front_ox, front_oz) = match facing {
+                        0 => (BlockFace::Front, wx,        wz + 1.0),  // South: front at z+1
+                        2 => (BlockFace::Back,  wx,        wz),        // North: front at z
+                        1 => (BlockFace::Left,  wx,        wz),        // West: front at x
+                        _ => (BlockFace::Right, wx + 1.0,  wz),        // East: front at x+1
+                    };
+                    let front_side = x as i32 + step_fx;
+                    let front_sz = z as i32 + step_fz;
+                    if is_open(front_side, y as i32, front_sz) {
+                        let front_tex = match front_face {
+                            BlockFace::Front | BlockFace::Back => get_texture_index(block, BlockFace::Front),
+                            BlockFace::Left | BlockFace::Right => get_texture_index(block, BlockFace::Left),
+                            _ => tex,
+                        };
+                        emit(&mut vertices, &mut indices, front_face, front_ox, by, front_oz, 1.0, 0.5, front_tex);
+                    }
+
+                    // Left/Right sides: each has 2 quads (bottom half full depth, top half back depth)
+                    let side_pairs: &[(i32, i32, BlockFace, BlockFace)] = &[
+                        (0, -1, BlockFace::Left, BlockFace::Right),  // Left face (-X)
+                        (0, 1, BlockFace::Right, BlockFace::Left),   // Right face (+X) -- swapped for axis alignment
+                    ];
+
+                    for &(sdx, sdz, side_face, opp_face) in side_pairs {
+                        let sx = x as i32 + sdx;
+                        let sz = z as i32 + sdz;
+                        if is_open(sx, y as i32, sz) {
+                            let side_tex = get_texture_index(block, opp_face);
+                            // Bottom half of side: full depth, half height
+                            let (sx_pos, sy_pos, sz_pos) = match side_face {
+                                BlockFace::Left => (wx, by, wz),
+                                BlockFace::Right => (wx + 1.0, by, wz),
+                                _ => unreachable!(),
+                            };
+                            emit(&mut vertices, &mut indices, side_face, sx_pos, sy_pos, sz_pos, 1.0, 0.5, side_tex);
+                            // Top half of side: only back half depth
+                            let (back_depth_w, back_depth_h, back_ox_s, back_oz_s) = match facing {
+                                0 => (0.5, 0.5, 0.0, 0.0),    // South: back half in z [z..z+0.5]
+                                2 => (0.5, 0.5, 0.0, 0.5),    // North: back half in z [z+0.5..z+1]
+                                1 => (0.5, 0.5, 0.0, 0.0),    // West: back half in x [x..x+0.5]
+                                _ => (0.5, 0.5, 0.5, 0.0),    // East: back half in x [x+0.5..x+1]
+                            };
+                            let (sx2, sy2, sz2) = match side_face {
+                                BlockFace::Left => (wx + back_ox_s, by + 0.5, wz + back_oz_s),
+                                BlockFace::Right => (wx + 1.0 + back_ox_s, by + 0.5, wz + back_oz_s),
+                                _ => unreachable!(),
+                            };
+                            emit(&mut vertices, &mut indices, side_face, sx2, sy2, sz2, back_depth_w, back_depth_h, side_tex);
+                        }
+                    }
+                } else {
+                    // === TOP STAIR (upside down) ===
+                    // Bottom half [y, y+0.5]: only back half filled
+                    // Top half [y+0.5, y+1]: full area filled
+
+                    // Top face: full (check block above)
+                    if y + 1 >= CHUNK_HEIGHT || is_open(x as i32, y as i32 + 1, z as i32) {
+                        let top_tex = get_texture_index(block, BlockFace::Top);
+                        emit(&mut vertices, &mut indices, BlockFace::Top, wx, by + 1.0, wz, 1.0, 1.0, top_tex);
+                    }
+
+                    // Bottom face: only back half (at y)
+                    let (bot_x, bot_z, bot_w, bot_h) = match facing {
+                        0 => (wx, wz, 1.0, 0.5),
+                        2 => (wx, wz + 0.5, 1.0, 0.5),
+                        1 => (wx, wz, 0.5, 1.0),
+                        _ => (wx + 0.5, wz, 0.5, 1.0),
+                    };
+                    if y == 0 || is_open(x as i32, y as i32 - 1, z as i32) {
+                        let bot_tex = get_texture_index(block, BlockFace::Bottom);
+                        emit(&mut vertices, &mut indices, BlockFace::Bottom, bot_x, by, bot_z, bot_w, bot_h, bot_tex);
+                    }
+
+                    // Step ceiling (bottom of the upper full slab visible from below): at y+0.5, front half
+                    let (ceil_x, ceil_z, ceil_w, ceil_h) = match facing {
+                        0 => (wx, wz + 0.5, 1.0, 0.5),
+                        2 => (wx, wz, 1.0, 0.5),
+                        1 => (wx + 0.5, wz, 0.5, 1.0),
+                        _ => (wx, wz, 0.5, 1.0),
+                    };
+                    if y == 0 || is_open(x as i32, y as i32 - 1, z as i32) {
+                        let ceil_tex = get_texture_index(block, BlockFace::Bottom);
+                        emit(&mut vertices, &mut indices, BlockFace::Bottom, ceil_x, by + 0.5, ceil_z, ceil_w, ceil_h, ceil_tex);
+                    }
+
+                    // Back face: full height
+                    let (back_face, back_ox, back_oz) = match facing {
+                        0 => (BlockFace::Back,  wx,        wz),
+                        2 => (BlockFace::Front, wx,        wz + 1.0),
+                        1 => (BlockFace::Right, wx + 1.0,  wz),
+                        _ => (BlockFace::Left,  wx,        wz),
+                    };
+                    let back_side = x as i32 + back_fx;
+                    let back_sz = z as i32 + back_fz;
+                    if is_open(back_side, y as i32, back_sz) {
+                        let back_tex = match back_face {
+                            BlockFace::Back | BlockFace::Front => get_texture_index(block, BlockFace::Front),
+                            BlockFace::Left | BlockFace::Right => get_texture_index(block, BlockFace::Left),
+                            _ => tex,
+                        };
+                        emit(&mut vertices, &mut indices, back_face, back_ox, by, back_oz, 1.0, 1.0, back_tex);
+                    }
+
+                    // Front (step) face: top half only at the front edge
+                    let (front_face, front_ox, front_oz) = match facing {
+                        0 => (BlockFace::Front, wx,        wz + 1.0),
+                        2 => (BlockFace::Back,  wx,        wz),
+                        1 => (BlockFace::Left,  wx,        wz),
+                        _ => (BlockFace::Right, wx + 1.0,  wz),
+                    };
+                    let front_side = x as i32 + step_fx;
+                    let front_sz = z as i32 + step_fz;
+                    if is_open(front_side, y as i32, front_sz) {
+                        let front_tex = match front_face {
+                            BlockFace::Front | BlockFace::Back => get_texture_index(block, BlockFace::Front),
+                            BlockFace::Left | BlockFace::Right => get_texture_index(block, BlockFace::Left),
+                            _ => tex,
+                        };
+                        emit(&mut vertices, &mut indices, front_face, front_ox, by + 0.5, front_oz, 1.0, 0.5, front_tex);
+                    }
+
+                    // Side faces for top stair
+                    // Bottom half of side: only back half depth
+                    // Top half of side: full depth
+                    let side_pairs: &[(i32, i32, BlockFace, BlockFace)] = &[
+                        (0, -1, BlockFace::Left, BlockFace::Right),
+                        (0, 1, BlockFace::Right, BlockFace::Left),
+                    ];
+                    for &(sdx, sdz, side_face, opp_face) in side_pairs {
+                        let sx = x as i32 + sdx;
+                        let sz = z as i32 + sdz;
+                        if is_open(sx, y as i32, sz) {
+                            let side_tex = get_texture_index(block, opp_face);
+                            // Bottom half: only back depth
+                            let (back_ox_s, back_oz_s) = match facing {
+                                0 => (0.0, 0.0),
+                                2 => (0.0, 0.5),
+                                1 => (0.0, 0.0),
+                                _ => (0.5, 0.0),
+                            };
+                            // For left/right faces at bottom half: extends from back edge to center
+                            // Top half: full depth
+
+                            // Actually for emit_quad with Left face: origin at (x, y, z), extends +z by w, +y by h
+                            // Bottom half, back portion: at the back edge
+                            let (bsx, bsy, bsz) = match side_face {
+                                BlockFace::Left => (wx + back_ox_s, by, wz + back_oz_s),
+                                BlockFace::Right => (wx + 1.0 + back_ox_s, by, wz + back_oz_s),
+                                _ => unreachable!(),
+                            };
+                            emit(&mut vertices, &mut indices, side_face, bsx, bsy, bsz, 1.0, 0.5, side_tex);
+
+                            // Top half: full depth
+                            let (tsx, tsy, tsz) = match side_face {
+                                BlockFace::Left => (wx, by + 0.5, wz),
+                                BlockFace::Right => (wx + 1.0, by + 0.5, wz),
+                                _ => unreachable!(),
+                            };
+                            emit(&mut vertices, &mut indices, side_face, tsx, tsy, tsz, 1.0, 0.5, side_tex);
+                        }
                     }
                 }
             }

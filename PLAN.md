@@ -105,7 +105,7 @@
 
 ### Missing Block Types
 - [x] **Slabs**: stone + oak, bottom/top via data field, half-height mesh (emit_quad with y-offset), hotbar slots
-- [ ] **Stairs**: all wood and stone types with correct shape and face culling
+- [x] **Stairs**: stone + oak with correct shape, 4-facing direction, top/bottom, side face culling
 - [ ] **Fences & walls**: with connected post/bar shapes, collision shape
 - [ ] **Fence gates**: open/close animation
 - [ ] **Doors**: wood and iron, open/close animation, double doors

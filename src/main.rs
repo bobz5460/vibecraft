@@ -86,6 +86,7 @@ async fn run() {
         BlockId::Netherrack, BlockId::Obsidian, BlockId::Sponge,
         BlockId::HayBlock, BlockId::Melon, BlockId::Pumpkin,
         BlockId::StoneSlab, BlockId::OakSlab,
+        BlockId::StoneStairs, BlockId::OakStairs,
     ];
     let mut selected_slot: usize = 0;
 

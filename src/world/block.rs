@@ -405,6 +405,8 @@ pub enum BlockId {
     OakSlab = 404,
     RedMushroomBlock = 401,
     BrownMushroomBlock = 402,
+    StoneStairs = 405,
+    OakStairs = 406,
 }
 
 impl BlockId {
@@ -531,6 +533,8 @@ impl BlockId {
             BlockId::BrownMushroomBlock => "BrnMshCap",
             BlockId::StoneSlab => "StnSlab",
             BlockId::OakSlab => "OakSlab",
+            BlockId::StoneStairs => "StnStair",
+            BlockId::OakStairs => "OakStair",
             BlockId::WhiteCarpet => "WhtCarpet",
             BlockId::RedCarpet => "RedCarpet",
             BlockId::RedWool => "RedWool",
@@ -727,6 +731,10 @@ impl BlockId {
 
     pub fn is_slab(&self) -> bool {
         matches!(self, BlockId::StoneSlab | BlockId::OakSlab)
+    }
+
+    pub fn is_stair(&self) -> bool {
+        matches!(self, BlockId::StoneStairs | BlockId::OakStairs)
     }
 
     #[allow(dead_code)]

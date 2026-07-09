@@ -1,0 +1,33 @@
+[package]
+name = "vibecraft"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "24.0"
+winit = "0.30"
+nalgebra = "0.33"
+bytemuck = { version = "1.21", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+noise = "0.9"
+futures = "0.3"
+pollster = "0.4"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.dev]
+opt-level = 0
+debug = true
+codegen-units = 256
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+

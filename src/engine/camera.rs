@@ -81,4 +81,17 @@ impl Camera {
     pub fn get_ray(&self) -> (Vector3<f32>, Vector3<f32>) {
         (self.position.coords, self.forward())
     }
+
+    pub fn light_vp_matrix(&self, light_dir: &Vector3<f32>) -> Matrix4<f32> {
+        let center = self.position;
+        let light_pos = center - light_dir * 200.0;
+        let up = Vector3::y();
+        let view = Matrix4::look_at_rh(&light_pos, &center, &up);
+
+        let size = 128.0;
+        let near = 0.1;
+        let far = 400.0;
+        let proj = nalgebra::Orthographic3::new(-size, size, -size, size, near, far).to_homogeneous();
+        proj * view
+    }
 }

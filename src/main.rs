@@ -550,11 +550,16 @@ async fn run() {
                     1.0
                 };
 
+                let light_dir = camera.forward().normalize().cross(&nalgebra::Vector3::y()).normalize();
+                let light_vp = camera.light_vp_matrix(&light_dir);
+                let shadow_vp: [[f32; 4]; 4] = *light_vp.as_ref();
+
                 match renderer.render(&camera, &chunk_render_data, highlight.as_ref(),
                     border_data.as_ref(),
                     if show_debug { Some(&debug_lines) } else { None },
                     &hotbar,
                     night_factor,
+                    &shadow_vp,
                 ) {
                     Ok(_) => {}
                     Err(wgpu::SurfaceError::Lost) => renderer.resize(renderer.size),

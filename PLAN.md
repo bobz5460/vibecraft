@@ -151,7 +151,7 @@
 - [ ] **Ambient occlusion**: per-face AO darkens corners and crevices (checks 3 adjacent blocks for solid neighbors)
 - [x] **Sky color tint**: top faces subtly tinted with sky blue at day, warm orange at sunset
 - [ ] **Sun/moon billboards**: sun (yellow circle) and moon (pale circle) rendered in sky, follow day/night cycle, hidden when below horizon
-- [x] **Improved shader lighting**: directional contrast, night dimming, fog color transition, packed light_data per vertex
+- [x] **Improved shader lighting**: shadow mapping (2048 depth), directional sunlight with warm/cool tint, sky ambient bounce, tone mapping (1.1 contrast), leaves backlight transmission, per-vertex AO
 - [ ] **Mob spawning light check**: hostile ≤7, passive ≥9, slime ≤7
 
 ### Texture System
@@ -518,9 +518,9 @@
 
 ### Graphics
 - [x] **Fog**: distance fog, density=0.002, color matches sky
-- [ ] **Sky rendering**: no time-of-day transitions (hardcoded blue sky + fog); no sun/moon entities
+- [x] **Sky rendering**: atmospheric fog color transitions, sun color warm at dawn/dusk, neutral at noon
 - [ ] **Clouds**: 3D cloud layer at y=192 (render as translucent quads)
-- [~] **Water rendering**: static translucent surface, no wave animation yet
+- [x] **Water rendering**: Fresnel reflection, sky reflection, depth-based color, animated shimmer
 - [ ] **Lava rendering**: static texture, no emissive glow or animation
 - [~] **Block break particles**: reuses DroppedItem system (6 directional cubes, 0.5–1.3s lifetime)
 - [ ] **Armor model**: player model with armor overlay

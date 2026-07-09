@@ -41,6 +41,7 @@ pub struct Uniforms {
     pub camera_pos: [f32; 4],
     pub light_direction: [f32; 4],
     pub night_factor: [f32; 4],
+    pub shadow_vp_matrix: [[f32; 4]; 4],
 }
 
 #[derive(Clone)]
@@ -76,6 +77,7 @@ pub struct Renderer {
     pub uniform_buffer: Buffer,
     pub pipeline: RenderPipeline,
     pub transparent_pipeline: RenderPipeline,
+    pub shadow_pipeline: RenderPipeline,
     pub highlight_pipeline: RenderPipeline,
     pub highlight_bind_group: BindGroup,
     pub font: FontTexture,
@@ -84,6 +86,9 @@ pub struct Renderer {
     pub text_uniform_buffer: Buffer,
     depth_texture: Texture,
     depth_view: TextureView,
+    shadow_texture: Texture,
+    shadow_view: TextureView,
+    shadow_sampler: Sampler,
 }
 
 impl Renderer {
@@ -138,6 +143,29 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // Shadow map
+        let shadow_texture = device.create_texture(&TextureDescriptor {
+            label: Some("shadow_map"),
+            size: Extent3d { width: 2048, height: 2048, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Depth32Float,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[TextureFormat::Depth32Float],
+        });
+        let shadow_view = shadow_texture.create_view(&TextureViewDescriptor::default());
+        let shadow_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("shadow_sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            compare: Some(CompareFunction::LessEqual),
+            ..Default::default()
+        });
+
         let uniform_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("uniform_bgl"),
             entries: &[
@@ -167,6 +195,16 @@ impl Renderer {
                     ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Depth,
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -185,6 +223,10 @@ impl Renderer {
                 BindGroupEntry {
                     binding: 2,
                     resource: BindingResource::Sampler(&tex_manager.atlas_sampler),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::TextureView(&shadow_view),
                 },
             ],
         });
@@ -234,6 +276,41 @@ impl Renderer {
                 depth_compare: CompareFunction::Less,
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let shadow_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("shadow_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_shadow"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Vertex::desc()],
+            },
+            fragment: None,
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: Some(Face::Back),
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: CompareFunction::Less,
+                stencil: StencilState::default(),
+                bias: DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
             }),
             multisample: MultisampleState::default(),
             multiview: None,
@@ -501,6 +578,7 @@ impl Renderer {
             uniform_buffer,
             pipeline,
             transparent_pipeline,
+            shadow_pipeline,
             highlight_pipeline,
             highlight_bind_group,
             font,
@@ -509,6 +587,9 @@ impl Renderer {
             text_uniform_buffer,
             depth_texture,
             depth_view,
+            shadow_texture,
+            shadow_view,
+            shadow_sampler,
         }
     }
 
@@ -565,14 +646,15 @@ impl Renderer {
         self.depth_view = self.depth_texture.create_view(&TextureViewDescriptor::default());
     }
 
-    pub fn update_uniforms(&mut self, camera: &Camera, night_factor: f32) {
-        let dir = [0.3f32, -0.7, 0.5, 0.0];
+    pub fn update_uniforms(&mut self, camera: &Camera, night_factor: f32, shadow_vp: &[[f32; 4]; 4]) {
+        let dir = [0.5f32, -0.85, 0.5, 0.0];
         let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
         let uniforms = Uniforms {
             vp_matrix: camera.vp_matrix().into(),
             camera_pos: [camera.position.x, camera.position.y, camera.position.z, 0.0],
             light_direction: [dir[0] / len, dir[1] / len, dir[2] / len, 0.0],
             night_factor: [night_factor, 0.0, 0.0, 0.0],
+            shadow_vp_matrix: *shadow_vp,
         };
         self.queue.write_buffer(
             &self.uniform_buffer,
@@ -737,8 +819,9 @@ impl Renderer {
         debug_overlay: Option<&[String]>,
         hotbar_text: &str,
         night_factor: f32,
+        shadow_vp: &[[f32; 4]; 4],
     ) -> Result<(), SurfaceError> {
-        self.update_uniforms(camera, night_factor);
+        self.update_uniforms(camera, night_factor, shadow_vp);
 
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&TextureViewDescriptor::default());
@@ -747,6 +830,34 @@ impl Renderer {
             label: Some("render_encoder"),
         });
 
+        // Shadow pass: render depth from sun's POV
+        {
+            let mut spass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("shadow_rpass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &self.shadow_view,
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Clear(1.0),
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            spass.set_pipeline(&self.shadow_pipeline);
+            spass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            for &(_, _, ref data) in chunk_data {
+                if data.num_indices > 0 {
+                    spass.set_vertex_buffer(0, data.vertex_buffer.slice(..));
+                    spass.set_index_buffer(data.index_buffer.slice(..), IndexFormat::Uint32);
+                    spass.draw_indexed(0..data.num_indices, 0, 0..1);
+                }
+            }
+        }
+
+        // Main pass
         {
             let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("main_rpass"),

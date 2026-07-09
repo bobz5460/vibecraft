@@ -79,12 +79,18 @@ pub struct Renderer {
     pub pipeline: RenderPipeline,
     pub transparent_pipeline: RenderPipeline,
     pub shadow_pipeline: RenderPipeline,
+    pub star_pipeline: RenderPipeline,
+    pub moon_pipeline: RenderPipeline,
     pub highlight_pipeline: RenderPipeline,
     pub highlight_bind_group: BindGroup,
     pub font: FontTexture,
     pub text_pipeline: RenderPipeline,
     pub text_bind_group: BindGroup,
     pub text_uniform_buffer: Buffer,
+    star_vertex_buffer: Buffer,
+    star_count: u32,
+    moon_vertex_buffer: Buffer,
+    moon_index_buffer: Buffer,
     depth_texture: Texture,
     depth_view: TextureView,
     shadow_texture: Texture,
@@ -405,6 +411,151 @@ impl Renderer {
             cache: None,
         });
 
+        // Sky shader for stars and moon
+        let sky_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("sky_shader"),
+            source: ShaderSource::Wgsl(include_str!("../shaders/sky.wgsl").into()),
+        });
+
+        let star_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("star_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &sky_shader,
+                entry_point: Some("vs_star"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: std::mem::size_of::<[f32; 3]>() as u64,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[VertexAttribute { format: VertexFormat::Float32x3, offset: 0, shader_location: 0 }],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &sky_shader,
+                entry_point: Some("fs_star"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: config.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::PointList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: CompareFunction::Always,
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        #[repr(C)]
+        #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MoonVertex { pos: [f32; 3], uv: [f32; 2] }
+
+        let moon_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("moon_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &sky_shader,
+                entry_point: Some("vs_moon"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: std::mem::size_of::<MoonVertex>() as u64,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute { format: VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                        VertexAttribute { format: VertexFormat::Float32x2, offset: 12, shader_location: 1 },
+                    ],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &sky_shader,
+                entry_point: Some("fs_moon"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: config.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: CompareFunction::Always,
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Generate star positions (random points on a dome 200 blocks up)
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut star_positions: Vec<[f32; 3]> = Vec::with_capacity(300);
+        for _ in 0..300 {
+            let theta = rng.gen::<f32>() * std::f32::consts::TAU;
+            let phi = rng.gen::<f32>() * std::f32::consts::PI * 0.45;
+            let r: f32 = 512.0;
+            let x = r * phi.cos() * theta.cos();
+            let y = r * phi.sin() + 64.0;
+            let z = r * phi.cos() * theta.sin();
+            star_positions.push([x, y, z]);
+        }
+        let star_vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("star_vb"),
+            size: (star_positions.len() as u64) * std::mem::size_of::<[f32; 3]>() as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&star_vertex_buffer, 0, bytemuck::cast_slice(&star_positions));
+
+        // Moon geometry: a 4×4 quad facing upward
+        let moon_verts: [MoonVertex; 4] = [
+            MoonVertex { pos: [-2.0, 128.0, -2.0], uv: [0.0, 0.0] },
+            MoonVertex { pos: [ 2.0, 128.0, -2.0], uv: [1.0, 0.0] },
+            MoonVertex { pos: [ 2.0, 128.0,  2.0], uv: [1.0, 1.0] },
+            MoonVertex { pos: [-2.0, 128.0,  2.0], uv: [0.0, 1.0] },
+        ];
+        let moon_indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+        let moon_vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("moon_vb"),
+            size: std::mem::size_of::<[MoonVertex; 4]>() as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&moon_vertex_buffer, 0, bytemuck::cast_slice(&moon_verts));
+        let moon_index_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("moon_ib"),
+            size: std::mem::size_of::<[u32; 6]>() as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&moon_index_buffer, 0, bytemuck::cast_slice(&moon_indices));
+
         let highlight_shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("highlight_shader"),
             source: ShaderSource::Wgsl(include_str!("../shaders/highlight.wgsl").into()),
@@ -621,8 +772,14 @@ impl Renderer {
             pipeline,
             transparent_pipeline,
             shadow_pipeline,
+            star_pipeline,
+            moon_pipeline,
             highlight_pipeline,
             highlight_bind_group,
+            star_vertex_buffer,
+            star_count: 300,
+            moon_vertex_buffer,
+            moon_index_buffer,
             font,
             text_pipeline,
             text_bind_group,
@@ -899,6 +1056,31 @@ impl Renderer {
             }
         }
 
+        // Sky clear color: dynamic day→night transition
+        let nf = night_factor as f64;
+        let day_sky = wgpu::Color { r: 0.5, g: 0.65, b: 0.85, a: 1.0 };
+        let night_sky = wgpu::Color { r: 0.03, g: 0.03, b: 0.1, a: 1.0 };
+        let dusk_sky = wgpu::Color { r: 0.7, g: 0.4, b: 0.2, a: 1.0 };
+        let sky_clear = if nf < 0.3 {
+            day_sky
+        } else if nf < 0.5 {
+            let t = (nf - 0.3) / 0.2;
+            wgpu::Color {
+                r: day_sky.r + (dusk_sky.r - day_sky.r) * t,
+                g: day_sky.g + (dusk_sky.g - day_sky.g) * t,
+                b: day_sky.b + (dusk_sky.b - day_sky.b) * t,
+                a: 1.0,
+            }
+        } else {
+            let t = (nf - 0.5) / 0.5;
+            wgpu::Color {
+                r: dusk_sky.r + (night_sky.r - dusk_sky.r) * t,
+                g: dusk_sky.g + (night_sky.g - dusk_sky.g) * t,
+                b: dusk_sky.b + (night_sky.b - dusk_sky.b) * t,
+                a: 1.0,
+            }
+        };
+
         // Main pass
         {
             let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -907,7 +1089,7 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color { r: 0.5, g: 0.65, b: 0.85, a: 1.0 }),
+                        load: LoadOp::Clear(sky_clear),
                         store: StoreOp::Store,
                     },
                 })],
@@ -922,6 +1104,19 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+
+            // Render stars (always passes depth test, appears behind everything)
+            rpass.set_pipeline(&self.star_pipeline);
+            rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.star_vertex_buffer.slice(..));
+            rpass.draw(0..self.star_count, 0..1);
+
+            // Render moon
+            rpass.set_pipeline(&self.moon_pipeline);
+            rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.moon_vertex_buffer.slice(..));
+            rpass.set_index_buffer(self.moon_index_buffer.slice(..), IndexFormat::Uint32);
+            rpass.draw_indexed(0..6, 0, 0..1);
 
             rpass.set_pipeline(&self.pipeline);
             rpass.set_bind_group(0, &self.uniform_bind_group, &[]);

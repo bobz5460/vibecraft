@@ -137,7 +137,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let ao_factor = 0.75 + 0.25 * input.ao;
 
     let brightness = (ambient_contrib + sun_contrib) * input.light * ao_factor;
-    color = vec4<f32>(color.r * brightness, color.g * brightness, color.b * brightness, color.a);
+    color = vec4<f32>(color.rgb * brightness, color.a);
 
     // Leaves: subtle backlight transmission
     if is_leaf_tile(input.tex_index) {

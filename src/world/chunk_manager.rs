@@ -102,6 +102,8 @@ impl ChunkManager {
             if !self.chunks.contains_key(&(result.cx, result.cz)) {
                 let mut chunk = Chunk::new(result.cx, result.cz);
                 chunk.blocks = result.blocks;
+                chunk.compute_skylight();
+                chunk.compute_block_light();
                 chunk.is_dirty = true;
                 chunk.recount_fluids();
                 self.chunks.insert((result.cx, result.cz), chunk);
@@ -120,6 +122,8 @@ impl ChunkManager {
         self.chunks.entry((cx, cz)).or_insert_with(|| {
             let mut chunk = Chunk::new(cx, cz);
             generator.generate_chunk(&mut chunk);
+            chunk.compute_skylight();
+            chunk.compute_block_light();
             chunk
         })
     }
@@ -178,6 +182,10 @@ impl ChunkManager {
             .collect();
 
         for key in dirty_keys {
+            if let Some(chunk) = self.chunks.get_mut(&key) {
+                chunk.compute_skylight();
+                chunk.compute_block_light();
+            }
             if let Some(chunk) = self.chunks.get(&key) {
                 let neighbor_fn = |cx: i32, cz: i32| -> Option<&Chunk> {
                     self.chunks.get(&(cx, cz))

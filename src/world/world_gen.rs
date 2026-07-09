@@ -958,6 +958,8 @@ impl WorldGenerator {
         }
 
         chunk.recount_fluids();
+        chunk.compute_skylight();
+        chunk.compute_block_light();
         chunk.is_dirty = true;
     }
 

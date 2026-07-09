@@ -539,10 +539,22 @@ async fn run() {
                     None
                 };
 
+                // Daylight cycle: game_time 0-1200 = 20 min day/night
+                let night_factor = if game_time < 300.0 {
+                    1.0 - game_time / 300.0
+                } else if game_time < 600.0 {
+                    0.0
+                } else if game_time < 900.0 {
+                    (game_time - 600.0) / 300.0
+                } else {
+                    1.0
+                };
+
                 match renderer.render(&camera, &chunk_render_data, highlight.as_ref(),
                     border_data.as_ref(),
                     if show_debug { Some(&debug_lines) } else { None },
                     &hotbar,
+                    night_factor,
                 ) {
                     Ok(_) => {}
                     Err(wgpu::SurfaceError::Lost) => renderer.resize(renderer.size),

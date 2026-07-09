@@ -13,14 +13,16 @@ pub struct Vertex {
     pub uv: [f32; 2],
     pub normal: [f32; 3],
     pub tex_index: u32,
+    pub light_data: u32,
 }
 
 impl Vertex {
-    const ATTRIBS: [VertexAttribute; 4] = vertex_attr_array![
+    const ATTRIBS: [VertexAttribute; 5] = vertex_attr_array![
         0 => Float32x3,
         1 => Float32x2,
         2 => Float32x3,
         3 => Uint32,
+        4 => Uint32,
     ];
 
     pub fn desc() -> VertexBufferLayout<'static> {
@@ -38,6 +40,7 @@ pub struct Uniforms {
     pub vp_matrix: [[f32; 4]; 4],
     pub camera_pos: [f32; 4],
     pub light_direction: [f32; 4],
+    pub night_factor: [f32; 4],
 }
 
 #[derive(Clone)]
@@ -562,13 +565,14 @@ impl Renderer {
         self.depth_view = self.depth_texture.create_view(&TextureViewDescriptor::default());
     }
 
-    pub fn update_uniforms(&mut self, camera: &Camera) {
+    pub fn update_uniforms(&mut self, camera: &Camera, night_factor: f32) {
         let dir = [0.3f32, -0.7, 0.5, 0.0];
         let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
         let uniforms = Uniforms {
             vp_matrix: camera.vp_matrix().into(),
             camera_pos: [camera.position.x, camera.position.y, camera.position.z, 0.0],
             light_direction: [dir[0] / len, dir[1] / len, dir[2] / len, 0.0],
+            night_factor: [night_factor, 0.0, 0.0, 0.0],
         };
         self.queue.write_buffer(
             &self.uniform_buffer,
@@ -586,6 +590,7 @@ impl Renderer {
             uv: v.uv,
             normal: v.normal,
             tex_index: v.tex_index,
+            light_data: v.light_data,
         }).collect();
 
         let transparent_vertices: Vec<Vertex> = mesh.transparent_vertices.iter().map(|v| Vertex {
@@ -593,6 +598,7 @@ impl Renderer {
             uv: v.uv,
             normal: v.normal,
             tex_index: v.tex_index,
+            light_data: v.light_data,
         }).collect();
 
         let vertex_buffer = self.device.create_buffer(&BufferDescriptor {
@@ -730,8 +736,9 @@ impl Renderer {
         chunk_borders: Option<&(Buffer, u32)>,
         debug_overlay: Option<&[String]>,
         hotbar_text: &str,
+        night_factor: f32,
     ) -> Result<(), SurfaceError> {
-        self.update_uniforms(camera);
+        self.update_uniforms(camera, night_factor);
 
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&TextureViewDescriptor::default());

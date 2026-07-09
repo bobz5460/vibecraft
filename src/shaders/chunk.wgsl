@@ -2,6 +2,7 @@ struct Uniforms {
     vp_matrix: mat4x4<f32>,
     camera_pos: vec4<f32>,
     light_direction: vec4<f32>,
+    night_factor: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -13,6 +14,7 @@ struct VertexInput {
     @location(1) uv: vec2<f32>,
     @location(2) normal: vec3<f32>,
     @location(3) tex_index: u32,
+    @location(4) light_data: u32,
 }
 
 struct VertexOutput {
@@ -22,6 +24,16 @@ struct VertexOutput {
     @location(2) tex_index: u32,
     @location(3) world_pos: vec3<f32>,
     @location(4) distance: f32,
+    @location(5) light: f32,
+}
+
+fn unpack_light(light_data: u32) -> f32 {
+    let block_light = f32(light_data & 0xFu);
+    let sky_light = f32((light_data >> 4u) & 0xFu);
+    let night = uniforms.night_factor.x;
+    let night_sky = sky_light * (1.0 - night * 0.85);
+    let combined = max(block_light, night_sky);
+    return combined / 15.0;
 }
 
 @vertex
@@ -34,6 +46,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.tex_index = input.tex_index;
     output.world_pos = world_pos;
     output.distance = length(world_pos - uniforms.camera_pos.xyz);
+    output.light = unpack_light(input.light_data);
     return output;
 }
 
@@ -55,12 +68,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     let light_dir = normalize(uniforms.light_direction.xyz);
     let ndotl = max(dot(input.normal, light_dir), 0.0);
-    let ambient = 0.4;
-    let brightness = ambient + ndotl * 0.6;
+    let ambient = mix(0.35, 0.06, uniforms.night_factor.x);
+    let brightness = (ambient + ndotl * (1.0 - uniforms.night_factor.x * 0.5)) * input.light;
     color = vec4<f32>(color.r * brightness, color.g * brightness, color.b * brightness, color.a);
 
+    let night_sky = mix(vec3<f32>(0.5, 0.65, 0.85), vec3<f32>(0.05, 0.05, 0.15), uniforms.night_factor.x);
     let fog_factor = 1.0 - exp(-0.002 * input.distance);
-    color = vec4<f32>(mix(color.rgb, vec3<f32>(0.5, 0.65, 0.85), fog_factor), color.a);
+    color = vec4<f32>(mix(color.rgb, night_sky, fog_factor), color.a);
 
     return color;
 }

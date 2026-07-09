@@ -19,6 +19,7 @@ pub struct MeshVertex {
     pub uv: [f32; 2],
     pub normal: [f32; 3],
     pub tex_index: u32,
+    pub light_data: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +66,20 @@ fn emit_quad(
     u_axis: usize,
     v_axis: usize,
 ) {
+    emit_quad_light(verts, indices, face, x, y, z, w, h, tex_index, u_axis, v_axis, 0);
+}
+
+fn emit_quad_light(
+    verts: &mut Vec<MeshVertex>,
+    indices: &mut Vec<u32>,
+    face: BlockFace,
+    x: f32, y: f32, z: f32,
+    w: f32, h: f32,
+    tex_index: u32,
+    u_axis: usize,
+    v_axis: usize,
+    light_data: u32,
+) {
     let normal = get_face_normal(face);
     let base = verts.len() as u32;
 
@@ -94,6 +109,7 @@ fn emit_quad(
             uv: uvs[i],
             normal,
             tex_index,
+            light_data,
         });
     }
 
@@ -108,6 +124,49 @@ fn emit_quad(
             base, base + 2, base + 3,
         ]);
     }
+}
+
+/// Get packed light data at a world block position, reading from chunk or neighbor.
+fn get_light_data<'a>(chunk: &'a Chunk, get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>, bx: i32, by: i32, bz: i32) -> u32 {
+    if bx >= 0 && bx < CHUNK_SIZE as i32 && by >= 0 && by < CHUNK_HEIGHT as i32 && bz >= 0 && bz < CHUNK_SIZE as i32 {
+        let (sky, block) = chunk.get_light_at(bx, by, bz);
+        Chunk::pack_light(sky, block)
+    } else {
+        let cx = chunk.cx + bx.div_euclid(CHUNK_SIZE as i32);
+        let cz = chunk.cz + bz.div_euclid(CHUNK_SIZE as i32);
+        let lx = bx.rem_euclid(CHUNK_SIZE as i32);
+        let lz = bz.rem_euclid(CHUNK_SIZE as i32);
+        if by >= 0 && by < CHUNK_HEIGHT as i32 {
+            match get_neighbor(cx, cz) {
+                Some(nc) => {
+                    let (sky, block) = nc.get_light_at(lx, by, lz);
+                    Chunk::pack_light(sky, block)
+                }
+                None => Chunk::pack_light(15, 0),
+            }
+        } else {
+            Chunk::pack_light(15, 0)
+        }
+    }
+}
+
+/// Get light at the neighbor position adjacent to a face.
+fn get_face_center_light<'a>(chunk: &'a Chunk, get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
+    face: BlockFace, bx: i32, by: i32, bz: i32, rect_w: i32, rect_h: i32) -> u32 {
+    let half_w = rect_w as f32 / 2.0;
+    let half_h = rect_h as f32 / 2.0;
+    let (cx, cy, cz) = match face {
+        BlockFace::Top => (bx as f32 + half_w, (by + 1) as f32, bz as f32 + half_h),
+        BlockFace::Bottom => (bx as f32 + half_w, (by - 1) as f32, bz as f32 + half_h),
+        BlockFace::Left => ((bx - 1) as f32, by as f32 + half_h, bz as f32 + half_w),
+        BlockFace::Right => ((bx + 1) as f32, by as f32 + half_h, bz as f32 + half_w),
+        BlockFace::Front => (bx as f32 + half_w, by as f32 + half_h, (bz + 1) as f32),
+        BlockFace::Back => (bx as f32 + half_w, by as f32 + half_h, (bz - 1) as f32),
+    };
+    let lx = cx.floor() as i32;
+    let ly = cy.floor() as i32;
+    let lz = cz.floor() as i32;
+    get_light_data(chunk, get_neighbor, lx, ly, lz)
 }
 
 pub fn build_chunk_mesh<'a>(
@@ -264,12 +323,14 @@ pub fn build_chunk_mesh<'a>(
                         BlockFace::Left | BlockFace::Right => (2usize, 1usize),
                         BlockFace::Front | BlockFace::Back => (0usize, 1usize),
                     };
-                    emit_quad(
+                    let light = get_face_center_light(chunk, get_neighbor, face, bx, by, bz, rect_w, rect_h);
+                    emit_quad_light(
                         verts, inds, face,
                         wox + fx, fy, woz + fz,
                         rect_w as f32, rect_h as f32,
                         face_tex,
                         u_axis, v_axis,
+                        light,
                     );
                 }
             }
@@ -284,10 +345,11 @@ pub fn build_chunk_mesh<'a>(
                 let block = chunk.get_block(x, y, z);
                 if block.id.is_crossed() {
                     let tex = get_crossed_texture(block);
-                    emit_crossed_quad(
+                    let light = get_light_data(chunk, get_neighbor, x as i32, y as i32, z as i32);
+                    emit_crossed_quad_light(
                         &mut transparent_vertices, &mut transparent_indices,
                         wox + x as f32, y as f32 + 0.5, woz + z as f32,
-                        tex,
+                        tex, light,
                     );
                 }
             }
@@ -305,11 +367,14 @@ pub fn build_chunk_mesh<'a>(
                 let wz = woz + z as f32;
                 let (y0, y1) = if is_top { (y as f32 + 0.5, y as f32 + 1.0) } else { (y as f32, y as f32 + 0.5) };
 
+                let slab_top_light = get_light_data(chunk, get_neighbor, x as i32, y as i32 + 1, z as i32);
+                let slab_bot_light = get_light_data(chunk, get_neighbor, x as i32, y as i32 - 1, z as i32);
+
                 if y + 1 >= CHUNK_HEIGHT || chunk.get_block(x, y + 1, z).is_air() || chunk.get_block(x, y + 1, z).id.is_transparent() {
-                    emit_quad(&mut vertices, &mut indices, BlockFace::Top, wx, y1, wz, 1.0, 1.0, tex, 0, 2);
+                    emit_quad_light(&mut vertices, &mut indices, BlockFace::Top, wx, y1, wz, 1.0, 1.0, tex, 0, 2, slab_top_light);
                 }
                 if y == 0 || chunk.get_block(x, y - 1, z).is_air() || chunk.get_block(x, y - 1, z).id.is_transparent() {
-                    emit_quad(&mut vertices, &mut indices, BlockFace::Bottom, wx, y0, wz, 1.0, 1.0, tex, 0, 2);
+                    emit_quad_light(&mut vertices, &mut indices, BlockFace::Bottom, wx, y0, wz, 1.0, 1.0, tex, 0, 2, slab_bot_light);
                 }
                 let side_checks: &[(i32,i32,BlockFace,i32,i32)] = &[(1,0,BlockFace::Right,2,1), (-1,0,BlockFace::Left,2,1), (0,1,BlockFace::Front,0,1), (0,-1,BlockFace::Back,0,1)];
                 for &(dx, dz, sface, u_ax, v_ax) in side_checks {
@@ -330,7 +395,8 @@ pub fn build_chunk_mesh<'a>(
                             BlockFace::Back => (wx, y0, wz),
                             _ => (wx, y0, wz),
                         };
-                        emit_quad(&mut vertices, &mut indices, sface, sx, sy, sz, 1.0, 0.5, side_tex, u_ax as usize, v_ax as usize);
+                        let slab_side_light = get_light_data(chunk, get_neighbor, x as i32 + dx, y as i32, z as i32 + dz);
+                        emit_quad_light(&mut vertices, &mut indices, sface, sx, sy, sz, 1.0, 0.5, side_tex, u_ax as usize, v_ax as usize, slab_side_light);
                     }
                 }
             }
@@ -379,12 +445,21 @@ pub fn build_chunk_mesh<'a>(
                 // Helper to emit a face (u_axis, v_axis based on face)
                 let emit = |verts: &mut Vec<MeshVertex>, inds: &mut Vec<u32>,
                            face: BlockFace, fx: f32, fy: f32, fz: f32, w: f32, h: f32, tex: u32| {
+                    let (lx, ly, lz) = match face {
+                        BlockFace::Top => (x as i32, y as i32 + 1, z as i32),
+                        BlockFace::Bottom => (x as i32, y as i32 - 1, z as i32),
+                        BlockFace::Left => (x as i32 - 1, y as i32, z as i32),
+                        BlockFace::Right => (x as i32 + 1, y as i32, z as i32),
+                        BlockFace::Front => (x as i32, y as i32, z as i32 + 1),
+                        BlockFace::Back => (x as i32, y as i32, z as i32 - 1),
+                    };
+                    let light = get_light_data(chunk, get_neighbor, lx, ly, lz);
                     let (u_ax, v_ax) = match face {
                         BlockFace::Top | BlockFace::Bottom => (0usize, 2usize),
                         BlockFace::Left | BlockFace::Right => (2usize, 1usize),
                         BlockFace::Front | BlockFace::Back => (0usize, 1usize),
                     };
-                    emit_quad(verts, inds, face, fx, fy, fz, w, h, tex, u_ax, v_ax);
+                    emit_quad_light(verts, inds, face, fx, fy, fz, w, h, tex, u_ax, v_ax, light);
                 };
 
                 if !is_top {
@@ -625,11 +700,12 @@ fn get_crossed_texture(block: Block) -> u32 {
         .unwrap_or(0)
 }
 
-fn emit_crossed_quad(
+fn emit_crossed_quad_light(
     verts: &mut Vec<MeshVertex>,
     indices: &mut Vec<u32>,
     x: f32, y: f32, z: f32,
     tex_index: u32,
+    light_data: u32,
 ) {
     let h = 0.5;
     let normal = [0.0, 1.0, 0.0];
@@ -646,6 +722,7 @@ fn emit_crossed_quad(
                 uv: uvs[i],
                 normal,
                 tex_index,
+                light_data,
             });
         }
         indices.extend_from_slice(&[

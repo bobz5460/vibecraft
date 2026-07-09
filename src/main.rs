@@ -5,7 +5,7 @@ mod player;
 mod ui;
 mod inventory;
 mod gamemode;
-use gamemode::GameMode;
+use gamemode::{GameMode, Difficulty};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,6 +46,8 @@ async fn run() {
     let mut renderer = Renderer::new(window.clone(), &asset_path).await;
 
     let mut game_mode = GameMode::Creative;
+    let mut difficulty = Difficulty::Normal;
+    let mut hardcore = false;
     let mut flying = game_mode.can_fly();
     let mut player = Player::new(0.0, 100.0, 0.0);
     let mut camera = Camera::new(
@@ -126,7 +128,7 @@ async fn run() {
                                     Key::Named(NamedKey::Enter) => {
                                         let cmd = command_buffer.trim().to_string();
                                         let was_gm = game_mode;
-                                        execute_command(&cmd, &mut chunk_manager, &mut render_cache, &last_hit_pos, &mut command_feedback, &mut game_mode, &mut game_time, &mut dropped_items, &camera);
+                                        execute_command(&cmd, &mut chunk_manager, &mut render_cache, &last_hit_pos, &mut command_feedback, &mut game_mode, &mut difficulty, &mut hardcore, &mut game_time, &mut dropped_items, &camera);
                                         if was_gm != game_mode {
                                             flying = game_mode.can_fly();
                                         }
@@ -250,17 +252,25 @@ async fn run() {
                     player.vy += player::GRAVITY * dt;
                     let dy = player.vy * dt;
 
-                    player.try_move(dx, dy, dz, &chunk_manager);
-                    // Natural health regen
+                    player.try_move_with_difficulty(dx, dy, dz, &chunk_manager, difficulty.damage_multiplier());
+                    // Natural health regen (disabled on Hard, always on Peaceful)
                     if game_mode.takes_damage() && player.health < player::MAX_HEALTH && player.health > 0.0 {
-                        player.health = (player.health + 0.5 * dt).min(player::MAX_HEALTH);
+                        let regen_rate = if difficulty == Difficulty::Peaceful { 1.0 } else if difficulty.natural_regen_allowed() { 0.5 } else { 0.0 };
+                        if regen_rate > 0.0 {
+                            player.health = (player.health + regen_rate * dt).min(player::MAX_HEALTH);
+                        }
                     }
-                    // Respawn if dead
+                    // Respawn if dead (disabled for hardcore)
                     if !player.is_alive() {
-                        player.health = player::MAX_HEALTH;
-                        player.x = 0.0; player.y = 100.0; player.z = 0.0;
-                        player.vy = 0.0;
-                        flying = game_mode.can_fly();
+                        if hardcore {
+                            // Permanent death in hardcore mode: lock controls
+                            flying = false;
+                        } else {
+                            player.health = player::MAX_HEALTH;
+                            player.x = 0.0; player.y = 100.0; player.z = 0.0;
+                            player.vy = 0.0;
+                            flying = game_mode.can_fly();
+                        }
                     }
 
                     if input.is_key_pressed(KeyCode::Space) && player.on_ground {
@@ -455,7 +465,7 @@ async fn run() {
                         block,
                         biome,
                         facing,
-                        format!("Time: {:.0}s  HP: {:.0}/{}  Mode: {}  Flying: {}  Borders: {}", game_time, player.health, player::MAX_HEALTH, game_mode.name(), if flying { "yes" } else { "no" }, if show_chunk_borders { "ON" } else { "OFF" }),
+                        format!("Time: {:.0}s  HP: {:.0}/{}  Mode: {}  Diff: {}{}  Flying: {}  Borders: {}", game_time, player.health, player::MAX_HEALTH, game_mode.name(), difficulty.name(), if hardcore { " (HC)" } else { "" }, if flying { "yes" } else { "no" }, if show_chunk_borders { "ON" } else { "OFF" }),
                     ];
                     if !break_info.is_empty() {
                         lines.push(break_info);
@@ -551,6 +561,8 @@ fn execute_command(
     target: &Option<(i32, i32, i32)>,
     feedback: &mut String,
     game_mode: &mut GameMode,
+    difficulty: &mut Difficulty,
+    hardcore: &mut bool,
     game_time: &mut f32,
     dropped_items: &mut Vec<DroppedItem>,
     camera: &Camera,
@@ -565,6 +577,10 @@ fn execute_command(
     // Handle game mode commands (no target needed)
     if action == "gamemode" || action == "gm" {
         if let Some(mode) = GameMode::from_str(subj) {
+            if *hardcore && mode != GameMode::Survival {
+                *feedback = "Cannot change game mode in hardcore mode!".to_string();
+                return;
+            }
             *game_mode = mode;
             *feedback = format!("Set game mode to {}", mode.name());
         } else if subj.is_empty() {
@@ -572,6 +588,32 @@ fn execute_command(
         } else {
             *feedback = format!("Unknown game mode: {}. Use: survival, creative, adventure, spectator", subj);
         }
+        return;
+    }
+
+    // Handle difficulty command
+    if action == "difficulty" || action == "d" {
+        if *hardcore {
+            *feedback = "Cannot change difficulty in hardcore mode (locked to Hard).".to_string();
+            return;
+        }
+        if let Some(d) = Difficulty::from_str(subj) {
+            *difficulty = d;
+            *feedback = format!("Set difficulty to {}", d.name());
+        } else if subj.is_empty() {
+            *feedback = format!("Current difficulty: {}", difficulty.name());
+        } else {
+            *feedback = format!("Unknown difficulty: {}. Use: peaceful, easy, normal, hard", subj);
+        }
+        return;
+    }
+
+    // Handle hardcore command
+    if action == "hardcore" || action == "hc" {
+        *hardcore = true;
+        *difficulty = Difficulty::Hard;
+        *game_mode = GameMode::Survival;
+        *feedback = "Hardcore mode enabled! Difficulty locked to Hard, permanent death.".to_string();
         return;
     }
 
@@ -671,7 +713,7 @@ fn execute_command(
             *feedback = format!("Summoned ocean ruin at ({}, {}, {})", pos.0, pos.1, pos.2);
         }
         "help" | "?" | "h" => {
-            *feedback = "Commands: /summon <structure>, /gamemode <mode>, /time set <val>, /give <block> [n]".to_string();
+            *feedback = "Commands: /summon <struct>, /gamemode <mode>, /difficulty <level>, /hardcore, /time set <val>, /give <block> [n]".to_string();
         }
         _ => {
             *feedback = format!("Unknown: /{}. Try /help", structure);

@@ -35,8 +35,8 @@
 - [x] **Adventure mode**: no block breaking/placing, gravity enabled
 - [x] **Spectator mode**: noclip (fly through blocks), no block interaction, always flying
 - [x] **Switch via command**: `/gamemode <name>` or `/gm <mode>`, numbers supported (0-3)
-- [ ] Hardcore: survival locked to Hard, permanent death
-- [ ] Difficulty levels: Peaceful, Easy, Normal, Hard with scaling damage/hunger
+- [x] Hardcore: survival locked to Hard, permanent death (/hardcore command)
+- [x] Difficulty levels: Peaceful, Easy, Normal, Hard with scaling damage, regen control, /difficulty command
 
 ## Phase 2: World Generation & Terrain
 
@@ -47,7 +47,7 @@
 - [x] **River carving**: continuous river noise cuts channels into terrain, water fills to sea level
 - [x] **Beach transition**: sand at water's edge where grass meets sea level
 - [x] **Cave carvers**: winding spaghetti tunnels carved post-generation, 1-3 branches per chunk, varying radius 1.5-4 blocks
-- [ ] **Ore vein shapes**: blob-shaped 3D ellipsoid veins (planned, code removed — no ores generate in terrain)
+- [x] **Ore vein shapes**: blob-shaped 3D ellipsoid veins (coal, iron, copper, gold, redstone, lapis, diamond, emerald) with deepslate variants
 - [x] **Deepslate transition**: smooth gradient from stone→deepslate across y=0..16 (uses noise with depth-based probability)
 - [x] **Aquifers**: water source regions underground that carve out lakes when exposed
 - [x] **Tree proximity check**: 5-block minimum distance prevents trees from spawning overlapping
@@ -56,7 +56,7 @@
 - [x] Trees: Oak, Spruce, Jungle, Acacia with correct log/leaf shapes
 - [x] **Fallen trees**: sideways logs on forest floor
 - [x] **Birch trees**: 30% chance in forests (instead of oak)
-- [ ] **Dark oak trees**: 2×2 trunk, large rounded canopy (planned, code removed — not placed by generator)
+- [x] **Dark oak trees**: 2×2 trunk, large rounded canopy, DarkForest biome with podzol surface, vines, mushrooms
 - [x] **Giant mushrooms**: 2% chance in swamps, stem + 3-layer cap (MushroomStem, RedMushroomBlock, BrownMushroomBlock)
 - [x] **Cacti**: 2% chance in deserts, 1-3 tall, requires air around
 - [x] **Sugar cane**: 5% chance near water in warm biomes, 1-3 tall

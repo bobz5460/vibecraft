@@ -34,6 +34,14 @@ impl Player {
         self.damage_flash = 0.3;
     }
 
+    pub fn take_damage_with_mult(&mut self, base_amount: f32, mult: f32) {
+        let final_damage = base_amount * mult;
+        if final_damage > 0.0 {
+            self.health = (self.health - final_damage).max(0.0);
+            self.damage_flash = 0.3;
+        }
+    }
+
     pub fn is_alive(&self) -> bool {
         self.health > 0.0
     }
@@ -77,6 +85,10 @@ impl Player {
     }
 
     pub fn try_move(&mut self, dx: f32, dy: f32, dz: f32, cm: &ChunkManager) {
+        self.try_move_with_difficulty(dx, dy, dz, cm, 1.0);
+    }
+
+    pub fn try_move_with_difficulty(&mut self, dx: f32, dy: f32, dz: f32, cm: &ChunkManager, damage_mult: f32) {
         let nx = self.x + dx;
         if !self.collides(nx, self.y, self.z, cm) {
             self.x = nx;
@@ -89,7 +101,7 @@ impl Player {
             if self.last_vy < -10.0 {
                 let fall_dist = (self.last_vy * self.last_vy) / (2.0 * -GRAVITY);
                 let dmg = ((fall_dist - 3.0) / 3.0).max(0.0).ceil();
-                if dmg > 0.0 { self.take_damage(dmg); }
+                if dmg > 0.0 { self.take_damage_with_mult(dmg, damage_mult); }
             }
             self.vy = 0.0;
         }

@@ -40,7 +40,9 @@ impl WorldGenerator {
             }
         } else if temp > -0.1 {
             // Warm / Temperate
-            if humidity > 0.2 {
+            if humidity > 0.5 {
+                Biome::DarkForest
+            } else if humidity > 0.2 {
                 if continental > 0.2 { Biome::Forest } else { Biome::Swamp }
             } else if humidity > -0.3 {
                 Biome::Forest
@@ -49,7 +51,9 @@ impl WorldGenerator {
             }
         } else if temp > -0.4 {
             // Cool
-            if humidity > 0.0 {
+            if humidity > 0.3 {
+                Biome::DarkForest
+            } else if humidity > 0.0 {
                 Biome::Taiga
             } else {
                 Biome::Plains
@@ -78,6 +82,7 @@ impl WorldGenerator {
             Biome::Mountains => (72.0, 35.0, 0.025),
             Biome::Swamp => (65.0, 3.0, 0.01),
             Biome::Jungle => (69.0, 18.0, 0.017),
+            Biome::DarkForest => (68.0, 12.0, 0.015),
         };
 
         let h1 = self.height_noise.get([wx * scale, wz * scale]) * amp;
@@ -152,6 +157,99 @@ impl WorldGenerator {
         }
     }
 
+    /// Generate ore veins: blob-shaped 3D ellipsoid deposits replacing stone/deepslate.
+    /// Called after terrain columns but before water fill so ores appear in correct stone type.
+    pub fn generate_ores(&self, chunk: &mut Chunk, rng: &mut impl Rng) {
+        let ores: &[(BlockId, BlockId, i32, i32, usize, f64)] = &[
+            // (stone_ore, deepslate_ore, y_min, y_max, attempts, vein_radius)
+            (BlockId::CoalOre,  BlockId::DeepslateCoalOre,   0, 128, 20, 3.0),
+            (BlockId::IronOre,  BlockId::DeepslateIronOre,   0,  63, 15, 3.0),
+            (BlockId::CopperOre, BlockId::DeepslateCopperOre, 0,  96, 12, 2.5),
+            (BlockId::GoldOre,  BlockId::DeepslateGoldOre,   0,  32,  6, 2.5),
+            (BlockId::RedstoneOre, BlockId::DeepslateRedstoneOre, 0, 16, 10, 2.0),
+            (BlockId::LapisOre, BlockId::DeepslateLapisOre,  0,  32,  3, 2.0),
+            (BlockId::DiamondOre, BlockId::DeepslateDiamondOre, 0, 16,  3, 2.0),
+        ];
+
+        for &(stone_ore, deepslate_ore, y_min, y_max, attempts, radius) in ores {
+            for _ in 0..attempts {
+                let ox = (rng.gen::<f64>() * CHUNK_SIZE as f64) as i32;
+                let oz = (rng.gen::<f64>() * CHUNK_SIZE as f64) as i32;
+                let oy = y_min + (rng.gen::<f64>() * (y_max - y_min).max(1) as f64) as i32;
+                if oy < 1 || oy >= CHUNK_HEIGHT as i32 - 1 { continue; }
+
+                let rx = radius * (0.8 + rng.gen::<f64>() * 0.4);
+                let ry = radius * (0.6 + rng.gen::<f64>() * 0.4);
+                let rz = radius * (0.8 + rng.gen::<f64>() * 0.4);
+
+                let rx_i = rx.ceil() as i32;
+                let ry_i = ry.ceil() as i32;
+                let rz_i = rz.ceil() as i32;
+
+                for dx in -rx_i..=rx_i {
+                    for dy in -ry_i..=ry_i {
+                        for dz in -rz_i..=rz_i {
+                            let bx = ox + dx;
+                            let by = oy + dy;
+                            let bz = oz + dz;
+                            if bx < 0 || bx >= CHUNK_SIZE as i32 || bz < 0 || bz >= CHUNK_SIZE as i32 { continue; }
+                            if by < 1 || by >= CHUNK_HEIGHT as i32 - 1 { continue; }
+                            let dist = (dx as f64 / rx).powi(2) + (dy as f64 / ry).powi(2) + (dz as f64 / rz).powi(2);
+                            if dist > 1.0 { continue; }
+                            let block = chunk.get_block(bx as usize, by as usize, bz as usize);
+                            if block.id == BlockId::Stone {
+                                chunk.set_block(bx as usize, by as usize, bz as usize, Block::new(stone_ore));
+                            } else if block.id == BlockId::Deepslate {
+                                chunk.set_block(bx as usize, by as usize, bz as usize, Block::new(deepslate_ore));
+                            }
+                        }
+                    }
+                }
+                // Also replace Granite, Diorite, Andesite with stone ore (not deepslate)
+                for dx in -rx_i..=rx_i {
+                    for dy in -ry_i..=ry_i {
+                        for dz in -rz_i..=rz_i {
+                            let bx = ox + dx;
+                            let by = oy + dy;
+                            let bz = oz + dz;
+                            if bx < 0 || bx >= CHUNK_SIZE as i32 || bz < 0 || bz >= CHUNK_SIZE as i32 { continue; }
+                            if by < 1 || by >= CHUNK_HEIGHT as i32 - 1 { continue; }
+                            let dist = (dx as f64 / rx).powi(2) + (dy as f64 / ry).powi(2) + (dz as f64 / rz).powi(2);
+                            if dist > 1.0 { continue; }
+                            let block = chunk.get_block(bx as usize, by as usize, bz as usize);
+                            if (block.id == BlockId::Granite || block.id == BlockId::Diorite || block.id == BlockId::Andesite)
+                                && stone_ore != BlockId::CoalOre // only coal spawns in granite/diorite/andesite
+                            {
+                                // Small chance for other ores in stone variants
+                                if rng.gen_bool(0.3) {
+                                    chunk.set_block(bx as usize, by as usize, bz as usize, Block::new(stone_ore));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Emeralds: only in Mountains biome, single blocks
+        let wx = (chunk.cx as i64 * CHUNK_SIZE as i64) as f64 + 8.0;
+        let wz = (chunk.cz as i64 * CHUNK_SIZE as i64) as f64 + 8.0;
+        if matches!(self.get_biome(wx, wz), Biome::Mountains) {
+            for _ in 0..4 {
+                let ex = (rng.gen::<f64>() * CHUNK_SIZE as f64) as i32;
+                let ez = (rng.gen::<f64>() * CHUNK_SIZE as f64) as i32;
+                let ey = 4 + (rng.gen::<f64>() * 28.0) as i32;
+                if ey < 1 || ey >= CHUNK_HEIGHT as i32 - 1 { continue; }
+                let block = chunk.get_block(ex as usize, ey as usize, ez as usize);
+                if block.id == BlockId::Stone {
+                    chunk.set_block(ex as usize, ey as usize, ez as usize, Block::new(BlockId::EmeraldOre));
+                } else if block.id == BlockId::Deepslate {
+                    chunk.set_block(ex as usize, ey as usize, ez as usize, Block::new(BlockId::DeepslateEmeraldOre));
+                }
+            }
+        }
+    }
+
     pub fn generate_chunk(&self, chunk: &mut Chunk) {
         let base_x = chunk.cx as i64 * CHUNK_SIZE as i64;
         let base_z = chunk.cz as i64 * CHUNK_SIZE as i64;
@@ -179,6 +277,7 @@ impl WorldGenerator {
                     Biome::SnowyTundra => (BlockId::SnowBlock, BlockId::Dirt, BlockId::Stone),
                     Biome::Mountains => (BlockId::Stone, BlockId::Stone, BlockId::Stone),
                     Biome::Swamp => (BlockId::GrassBlock, BlockId::Dirt, BlockId::Stone),
+                    Biome::DarkForest => (BlockId::Podzol, BlockId::Dirt, BlockId::Stone),
                 };
 
                 // Generate column
@@ -304,6 +403,9 @@ impl WorldGenerator {
             }
         }
 
+        // Ore veins: blob-shaped 3D ellipsoid deposits
+        self.generate_ores(chunk, &mut rng);
+
         // Aquifers: replace stone with water in blobs (placed BEFORE caves so caves carve around the water pocket)
         if rng.gen_bool(0.35) {
             let ax = (rng.gen::<f64>() * CHUNK_SIZE as f64) as i32;
@@ -400,6 +502,7 @@ impl WorldGenerator {
                     Biome::Jungle => 0.10,
                     Biome::Swamp => 0.06,
                     Biome::Savanna => 0.05,
+                    Biome::DarkForest => 0.02,
                     _ => 0.0,
                 };
                 let grass_chance = match biome {
@@ -409,6 +512,7 @@ impl WorldGenerator {
                     Biome::Swamp => 0.10,
                     Biome::Jungle => 0.20,
                     Biome::Taiga => 0.05,
+                    Biome::DarkForest => 0.05,
                     _ => 0.0,
                 };
 
@@ -450,6 +554,7 @@ impl WorldGenerator {
             Biome::Savanna => 0.15,
             Biome::Swamp => 0.20,
             Biome::Plains => 0.05,
+            Biome::DarkForest => 0.40,
             _ => 0.0,
         };
         let mut tree_positions: Vec<(i32, i32)> = Vec::new();
@@ -493,6 +598,9 @@ impl WorldGenerator {
                         Biome::Savanna => {
                             self.place_tree(chunk, tx, tz, ground, BlockId::AcaciaLog, BlockId::AcaciaLeaves, &mut rng);
                         }
+                        Biome::DarkForest => {
+                            self.place_dark_oak_tree(chunk, tx, tz, ground, &mut rng);
+                        }
                         _ => {}
                     }
                 }
@@ -500,7 +608,7 @@ impl WorldGenerator {
         }
 
         // Fallen trees (sideways logs on forest floor)
-        if matches!(center_biome, Biome::Forest | Biome::Taiga | Biome::Jungle) {
+        if matches!(center_biome, Biome::Forest | Biome::Taiga | Biome::Jungle | Biome::DarkForest) {
             for _ in 0..2 {
                 if !rng.gen_bool(0.3) { continue; }
                 let fx = rng.gen_range(2..CHUNK_SIZE - 3);
@@ -515,6 +623,7 @@ impl WorldGenerator {
                 let log_id = match center_biome {
                     Biome::Jungle => BlockId::JungleLog,
                     Biome::Taiga => BlockId::SpruceLog,
+                    Biome::DarkForest => BlockId::DarkOakLog,
                     _ => BlockId::OakLog,
                 };
                 for li in 0..log_len {
@@ -535,10 +644,10 @@ impl WorldGenerator {
                 let wx = (base_x + x as i64) as f64;
                 let wz = (base_z + z as i64) as f64;
                 let (_height, v_biome) = self.get_height(wx, wz);
-                if !matches!(v_biome, Biome::Jungle | Biome::Swamp) { continue; }
+                if !matches!(v_biome, Biome::Jungle | Biome::Swamp | Biome::DarkForest) { continue; }
                 for y in (2..CHUNK_HEIGHT - 1).rev() {
                     let block = chunk.get_block(x, y, z);
-                    if block.id == BlockId::JungleLeaves || block.id == BlockId::OakLeaves {
+                    if block.id == BlockId::JungleLeaves || block.id == BlockId::OakLeaves || block.id == BlockId::DarkOakLeaves {
                         // Find a side that faces air (edge of canopy)
                         let has_air_side = [(-1i32,0i32),(1,0),(0,-1),(0,1)].iter().any(|(dx, dz)| {
                             let nx = x as i32 + dx;
@@ -633,23 +742,29 @@ impl WorldGenerator {
             }
         }
 
-        // Mushrooms in swamp
+        // Mushrooms in swamp and dark forest
         for x in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
                 let wx = (base_x + x as i64) as f64;
                 let wz = (base_z + z as i64) as f64;
                 let (mh, mb) = self.get_height(wx, wz);
-                if mb != Biome::Swamp || mh < Self::SEA_LEVEL || mh >= CHUNK_HEIGHT as i32 - 1 { continue; }
+                if !matches!(mb, Biome::Swamp | Biome::DarkForest) || mh < Self::SEA_LEVEL || mh >= CHUNK_HEIGHT as i32 - 1 { continue; }
                 let top = chunk.get_block(x, (mh - 1).max(0) as usize, z);
-                if top.id != BlockId::GrassBlock { continue; }
+                let is_dark_forest = mb == Biome::DarkForest;
+                let surface_allowed = if is_dark_forest {
+                    top.id == BlockId::Podzol || top.id == BlockId::GrassBlock || top.id == BlockId::Dirt
+                } else {
+                    top.id == BlockId::GrassBlock
+                };
+                if !surface_allowed { continue; }
                 if !chunk.get_block(x, mh as usize, z).is_air() { continue; }
-                if rng.gen_bool(0.04) {
+                let mush_chance = if is_dark_forest { 0.15 } else { 0.04 };
+                let giant_chance = if is_dark_forest { 0.10 } else { 0.02 };
+                if rng.gen_bool(mush_chance) {
                     let mush = if rng.gen_bool(0.6) { BlockId::BrownMushroom } else { BlockId::RedMushroom };
                     chunk.set_block(x, mh as usize, z, Block::new(mush));
-                // Giant mushrooms
-                if rng.gen_bool(0.02) {
+                } else if rng.gen_bool(giant_chance) {
                     self.place_giant_mushroom(chunk, x, z, mh, rng.gen_bool(0.5), &mut rng);
-                }
                 }
             }
         }
@@ -1168,6 +1283,52 @@ impl WorldGenerator {
         }
     }
 
+    fn place_dark_oak_tree(&self, chunk: &mut Chunk, tx: usize, tz: usize, height: i32, _rng: &mut impl Rng) {
+        // Dark oak: 2x2 trunk, large rounded canopy
+        let trunk_height = 6 + (_rng.gen::<f64>().abs() * 2.0) as i32;
+        // 2x2 trunk
+        for ty in 1..=trunk_height {
+            for dx in 0..2 {
+                for dz in 0..2 {
+                    let bx = tx as i32 + dx;
+                    let bz = tz as i32 + dz;
+                    let by = height + ty;
+                    if bx >= 0 && bx < CHUNK_SIZE as i32 && bz >= 0 && bz < CHUNK_SIZE as i32
+                        && by < CHUNK_HEIGHT as i32
+                    {
+                        chunk.set_block(bx as usize, by as usize, bz as usize, Block::new(BlockId::DarkOakLog));
+                    }
+                }
+            }
+        }
+        // Large rounded canopy: 4 layers, radius 4 at bottom tapering to 1 at top
+        let leaf_start = height + trunk_height - 3;
+        for dy in 0..=4 {
+            let radius = match dy {
+                0 => 4,
+                1 => 4,
+                2 => 3,
+                3 => 2,
+                _ => 1,
+            };
+            for dx in -(radius as i32)..=radius as i32 {
+                for dz in -(radius as i32)..=radius as i32 {
+                    let lx = (tx as i32 + dx).max(0).min(CHUNK_SIZE as i32 - 1);
+                    let lz = (tz as i32 + dz).max(0).min(CHUNK_SIZE as i32 - 1);
+                    let ly = leaf_start + dy;
+                    if ly > 0 && ly < CHUNK_HEIGHT as i32 {
+                        let d = dx.abs().max(dz.abs());
+                        if d > radius { continue; }
+                        if d == radius && dy > 0 && dy < 4 && _rng.gen_bool(0.5) { continue; }
+                        if chunk.get_block(lx as usize, ly as usize, lz as usize).is_air() {
+                            chunk.set_block(lx as usize, ly as usize, lz as usize, Block::new(BlockId::DarkOakLeaves));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn place_desert_well(&self, chunk: &mut Chunk, tx: usize, tz: usize, height: i32, _rng: &mut impl Rng) {
         let gy = (height - 1).max(0) as usize;
         if chunk.get_block(tx, gy, tz).id != BlockId::Sand { return; }
@@ -1334,4 +1495,5 @@ pub enum Biome {
     Mountains,
     Swamp,
     Jungle,
+    DarkForest,
 }

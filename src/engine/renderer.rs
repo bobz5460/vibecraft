@@ -75,6 +75,7 @@ pub struct Renderer {
     pub tex_manager: LoadedTextureManager,
     pub uniform_bind_group: BindGroup,
     pub uniform_buffer: Buffer,
+    pub shadow_bind_group: BindGroup,
     pub pipeline: RenderPipeline,
     pub transparent_pipeline: RenderPipeline,
     pub shadow_pipeline: RenderPipeline,
@@ -214,6 +215,30 @@ impl Renderer {
             ],
         });
 
+        // Shadow bind group: just the uniform buffer (no texture bindings to avoid write+read conflict)
+        let shadow_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("shadow_bgl"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let shadow_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("shadow_bg"),
+            layout: &shadow_bgl,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
         let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("uniform_bg"),
             layout: &uniform_bind_group_layout,
@@ -292,9 +317,15 @@ impl Renderer {
             cache: None,
         });
 
+        let shadow_pl_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("shadow_pl_layout"),
+            bind_group_layouts: &[&shadow_bgl],
+            push_constant_ranges: &[],
+        });
+
         let shadow_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("shadow_pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&shadow_pl_layout),
             vertex: VertexState {
                 module: &shader,
                 entry_point: Some("vs_shadow"),
@@ -586,6 +617,7 @@ impl Renderer {
             tex_manager,
             uniform_bind_group,
             uniform_buffer,
+            shadow_bind_group,
             pipeline,
             transparent_pipeline,
             shadow_pipeline,
@@ -857,7 +889,7 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             spass.set_pipeline(&self.shadow_pipeline);
-            spass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            spass.set_bind_group(0, &self.shadow_bind_group, &[]);
             for &(_, _, ref data) in chunk_data {
                 if data.num_indices > 0 {
                     spass.set_vertex_buffer(0, data.vertex_buffer.slice(..));

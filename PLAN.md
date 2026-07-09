@@ -143,12 +143,13 @@
 - [x] Skylight: column-based vertical propagation via per-chunk `sky_light` array
 - [x] Daylight cycle: night_factor uniform, 20-min cycle, sky color transitions
 - [x] **Block light propagation**: flood-fill BFS from light-emitting blocks (torch=14, glowstone=15, lava=15, etc.), stored in per-chunk `block_light`, combined with skylight in mesh vertex light
-- [ ] **Light smoothing**: 3×3×3 box blur pass after flood-fill reduces light banding across faces
+- [x] **Per-vertex lighting**: each vertex samples its own light value, interpolated across faces
+- [x] **Ambient Occlusion**: per-vertex corner darkening (3-block check), smooth AO 0-15 encoded in light_data
 - [x] **Light updates**: re-compute on block change via rebuild_dirty_meshes
 - [ ] **Internal light**: max(skylight, blocklight) for gameplay (mob spawn, plant growth)
 - [x] **Night-time darkness**: sky light dims at night via `night_factor` uniform, block light unaffected
 - [ ] **Ambient occlusion**: per-face AO darkens corners and crevices (checks 3 adjacent blocks for solid neighbors)
-- [ ] **Sky color tint**: top faces subtly tinted with sky color at day, warm tones at sunset
+- [x] **Sky color tint**: top faces subtly tinted with sky blue at day, warm orange at sunset
 - [ ] **Sun/moon billboards**: sun (yellow circle) and moon (pale circle) rendered in sky, follow day/night cycle, hidden when below horizon
 - [x] **Improved shader lighting**: directional contrast, night dimming, fog color transition, packed light_data per vertex
 - [ ] **Mob spawning light check**: hostile ≤7, passive ≥9, slime ≤7

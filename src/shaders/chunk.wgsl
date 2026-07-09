@@ -25,15 +25,19 @@ struct VertexOutput {
     @location(3) world_pos: vec3<f32>,
     @location(4) distance: f32,
     @location(5) light: f32,
+    @location(6) ao: f32,
 }
 
-fn unpack_light(light_data: u32) -> f32 {
+fn unpack_light(light_data: u32) -> vec2<f32> {
     let block_light = f32(light_data & 0xFu);
     let sky_light = f32((light_data >> 4u) & 0xFu);
+    let ao = f32((light_data >> 8u) & 0xFu) / 15.0;
+
     let night = uniforms.night_factor.x;
     let night_sky = sky_light * (1.0 - night * 0.85);
-    let combined = max(block_light, night_sky);
-    return combined / 15.0;
+    let combined = max(block_light, night_sky) / 15.0;
+
+    return vec2<f32>(combined, ao);
 }
 
 @vertex
@@ -46,7 +50,9 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.tex_index = input.tex_index;
     output.world_pos = world_pos;
     output.distance = length(world_pos - uniforms.camera_pos.xyz);
-    output.light = unpack_light(input.light_data);
+    let light_info = unpack_light(input.light_data);
+    output.light = light_info.x;
+    output.ao = light_info.y;
     return output;
 }
 
@@ -68,11 +74,29 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     let light_dir = normalize(uniforms.light_direction.xyz);
     let ndotl = max(dot(input.normal, light_dir), 0.0);
-    let ambient = mix(0.35, 0.06, uniforms.night_factor.x);
-    let brightness = (ambient + ndotl * (1.0 - uniforms.night_factor.x * 0.5)) * input.light;
+
+    let night = uniforms.night_factor.x;
+    let ambient = mix(0.35, 0.06, night);
+    let directional = ndotl * (1.0 - night * 0.5);
+
+    // AO multiplier: 0.75 at full occlusion, 1.0 at no occlusion
+    let ao_factor = 0.75 + 0.25 * input.ao;
+
+    let brightness = (ambient + directional) * input.light * ao_factor;
     color = vec4<f32>(color.r * brightness, color.g * brightness, color.b * brightness, color.a);
 
-    let night_sky = mix(vec3<f32>(0.5, 0.65, 0.85), vec3<f32>(0.05, 0.05, 0.15), uniforms.night_factor.x);
+    // Sky color tint on upward-facing surfaces (daytime)
+    let is_top = input.normal.y > 0.5;
+    let day_factor = 1.0 - night;
+    let sky_tint = vec3<f32>(0.85, 0.9, 1.0);
+    let warm_tint = vec3<f32>(1.0, 0.7, 0.4);
+    let sunset_tint = mix(sky_tint, warm_tint, smoothstep(0.0, 0.5, night) * (1.0 - smoothstep(0.5, 1.0, night)));
+    if is_top && day_factor > 0.1 {
+        let tint_strength = 0.12 * day_factor;
+        color = vec4<f32>(mix(color.rgb, color.rgb * sunset_tint, tint_strength), color.a);
+    }
+
+    let night_sky = mix(vec3<f32>(0.5, 0.65, 0.85), vec3<f32>(0.05, 0.05, 0.15), night);
     let fog_factor = 1.0 - exp(-0.002 * input.distance);
     color = vec4<f32>(mix(color.rgb, night_sky, fog_factor), color.a);
 

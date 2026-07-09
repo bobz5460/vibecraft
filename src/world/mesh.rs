@@ -126,6 +126,91 @@ fn emit_quad_light(
     }
 }
 
+/// Check if a block at chunk-local coords is solid (opaque).
+fn is_solid_block<'a>(chunk: &'a Chunk, get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>, bx: i32, by: i32, bz: i32) -> bool {
+    let block = if bx >= 0 && bx < CHUNK_SIZE as i32 && by >= 0 && by < CHUNK_HEIGHT as i32 && bz >= 0 && bz < CHUNK_SIZE as i32 {
+        chunk.get_block(bx as usize, by as usize, bz as usize)
+    } else {
+        let cx = chunk.cx + bx.div_euclid(CHUNK_SIZE as i32);
+        let cz = chunk.cz + bz.div_euclid(CHUNK_SIZE as i32);
+        let lx = bx.rem_euclid(CHUNK_SIZE as i32) as usize;
+        let lz = bz.rem_euclid(CHUNK_SIZE as i32) as usize;
+        if by >= 0 && by < CHUNK_HEIGHT as i32 {
+            match get_neighbor(cx, cz) {
+                Some(nc) => nc.get_block(lx, by as usize, lz),
+                None => Block::air(),
+            }
+        } else {
+            Block::air()
+        }
+    };
+    !block.is_air() && !block.id.is_transparent()
+}
+
+/// Apply per-vertex AO + per-vertex light to the last 4 vertices emitted by emit_quad_light.
+/// Uses the vertex world positions to compute corner AO and sample light at each corner.
+fn apply_vertex_lighting<'a>(
+    verts: &mut Vec<MeshVertex>,
+    chunk: &'a Chunk,
+    get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
+    _face: BlockFace,
+    u_axis: usize,
+    v_axis: usize,
+) {
+    let n = verts.len();
+    if n < 4 { return; }
+    let base = n - 4;
+
+    // AO check directions for each of the 4 vertices.
+    // For each vertex, two directions go "behind" the vertex along the face edges.
+    // du goes in u_axis direction, dv goes in v_axis direction.
+    // v0=origin, v1=+u, v2=+u+v, v3=+v
+    let ao_dirs: [[i32; 2]; 4] = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+
+    for i in 0..4 {
+        let pos = verts[base + i].pos;
+        let vx = pos[0].floor() as i32;
+        let vy = pos[1].floor() as i32;
+        let vz = pos[2].floor() as i32;
+
+        // Per-vertex light: sample at the vertex position
+        let lx = vx - chunk.cx * CHUNK_SIZE as i32;
+        let lz = vz - chunk.cz * CHUNK_SIZE as i32;
+        let base_light = get_light_data(chunk, get_neighbor, lx, vy, lz);
+
+        // AO: check 3 blocks at the vertex corner
+        let d = ao_dirs[i];
+        let mut off_a = [0i32; 3];
+        let mut off_b = [0i32; 3];
+        off_a[u_axis] = d[0];
+        off_b[v_axis] = d[1];
+
+        let ax = vx + off_a[0]; let ay = vy + off_a[1]; let az = vz + off_a[2];
+        let bx = vx + off_b[0]; let by = vy + off_b[1]; let bz = vz + off_b[2];
+        let cx = vx + off_a[0] + off_b[0]; let cy = vy + off_a[1] + off_b[1]; let cz = vz + off_a[2] + off_b[2];
+
+        let la = ax - chunk.cx * CHUNK_SIZE as i32; let lla = az - chunk.cz * CHUNK_SIZE as i32;
+        let lb = bx - chunk.cx * CHUNK_SIZE as i32; let llb = bz - chunk.cz * CHUNK_SIZE as i32;
+        let lc = cx - chunk.cx * CHUNK_SIZE as i32; let llc = cz - chunk.cz * CHUNK_SIZE as i32;
+
+        let s1 = is_solid_block(chunk, get_neighbor, la, ay, lla) as u32;
+        let s2 = is_solid_block(chunk, get_neighbor, lb, by, llb) as u32;
+        let s3 = is_solid_block(chunk, get_neighbor, lc, cy, llc) as u32;
+
+        let ao = match s1 + s2 + s3 {
+            0 => 15,
+            1 => 11,
+            2 => 6,
+            _ => 0,
+        };
+
+        // Pack: bits 0-3 = block_light, 4-7 = sky_light, 8-11 = ao
+        let sky = (base_light >> 4) & 0xF;
+        let block = base_light & 0xF;
+        verts[base + i].light_data = (ao << 8) | (sky << 4) | block;
+    }
+}
+
 /// Get packed light data at a world block position, reading from chunk or neighbor.
 fn get_light_data<'a>(chunk: &'a Chunk, get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>, bx: i32, by: i32, bz: i32) -> u32 {
     if bx >= 0 && bx < CHUNK_SIZE as i32 && by >= 0 && by < CHUNK_HEIGHT as i32 && bz >= 0 && bz < CHUNK_SIZE as i32 {
@@ -332,6 +417,7 @@ pub fn build_chunk_mesh<'a>(
                         u_axis, v_axis,
                         light,
                     );
+                    apply_vertex_lighting(verts, chunk, get_neighbor, face, u_axis, v_axis);
                 }
             }
         }
@@ -372,9 +458,11 @@ pub fn build_chunk_mesh<'a>(
 
                 if y + 1 >= CHUNK_HEIGHT || chunk.get_block(x, y + 1, z).is_air() || chunk.get_block(x, y + 1, z).id.is_transparent() {
                     emit_quad_light(&mut vertices, &mut indices, BlockFace::Top, wx, y1, wz, 1.0, 1.0, tex, 0, 2, slab_top_light);
+                    apply_vertex_lighting(&mut vertices, chunk, get_neighbor, BlockFace::Top, 0, 2);
                 }
                 if y == 0 || chunk.get_block(x, y - 1, z).is_air() || chunk.get_block(x, y - 1, z).id.is_transparent() {
                     emit_quad_light(&mut vertices, &mut indices, BlockFace::Bottom, wx, y0, wz, 1.0, 1.0, tex, 0, 2, slab_bot_light);
+                    apply_vertex_lighting(&mut vertices, chunk, get_neighbor, BlockFace::Bottom, 0, 2);
                 }
                 let side_checks: &[(i32,i32,BlockFace,i32,i32)] = &[(1,0,BlockFace::Right,2,1), (-1,0,BlockFace::Left,2,1), (0,1,BlockFace::Front,0,1), (0,-1,BlockFace::Back,0,1)];
                 for &(dx, dz, sface, u_ax, v_ax) in side_checks {
@@ -397,6 +485,7 @@ pub fn build_chunk_mesh<'a>(
                         };
                         let slab_side_light = get_light_data(chunk, get_neighbor, x as i32 + dx, y as i32, z as i32 + dz);
                         emit_quad_light(&mut vertices, &mut indices, sface, sx, sy, sz, 1.0, 0.5, side_tex, u_ax as usize, v_ax as usize, slab_side_light);
+                        apply_vertex_lighting(&mut vertices, chunk, get_neighbor, sface, u_ax as usize, v_ax as usize);
                     }
                 }
             }
@@ -460,6 +549,7 @@ pub fn build_chunk_mesh<'a>(
                         BlockFace::Front | BlockFace::Back => (0usize, 1usize),
                     };
                     emit_quad_light(verts, inds, face, fx, fy, fz, w, h, tex, u_ax, v_ax, light);
+                    apply_vertex_lighting(verts, chunk, get_neighbor, face, u_ax, v_ax);
                 };
 
                 if !is_top {

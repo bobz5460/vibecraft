@@ -37,12 +37,13 @@ fn unpack_light(light_data: u32) -> f32 {
     let sky_light = f32((light_data >> 4u) & 0xFu);
     let night = uniforms.night_factor.x;
     let night_sky = sky_light * (1.0 - night * 0.85);
-    return max(block_light, night_sky) / 15.0;
+    let raw = max(block_light, night_sky) / 15.0;
+    // Minecraft's default gamma curve: sqrt (makes midtones brighter)
+    return sqrt(raw);
 }
 
 fn unpack_ao(light_data: u32) -> f32 {
     let ao_raw = f32((light_data >> 8u) & 0xFu) / 15.0;
-    // Subtle AO: 0.88 at full occlusion, 1.0 at none
     return 0.88 + 0.12 * ao_raw;
 }
 
@@ -56,13 +57,12 @@ fn sample_shadow(world_pos: vec3<f32>) -> f32 {
     return textureSampleCompareLevel(shadow_map, shadow_sampler, shadow_uv, light_ndc.z - 0.005);
 }
 
-/// Vanilla Minecraft face brightness multipliers.
+// Vanilla face brightness: top=1.0, east/west=0.8, north/south=0.6, bottom=0.5
 fn face_multiplier(normal: vec3<f32>) -> f32 {
-    let n = normalize(normal);
-    if n.y > 0.5 { return 1.0; }       // Top
-    if n.y < -0.5 { return 0.5; }      // Bottom
-    if abs(n.x) > 0.5 { return 0.8; }  // East / West
-    return 0.6;                          // North / South
+    if normal.y > 0.5 { return 1.0; }
+    if normal.y < -0.5 { return 0.5; }
+    if abs(normal.x) > 0.5 { return 0.8; }
+    return 0.6;
 }
 
 @vertex
@@ -110,75 +110,61 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let tile_uv = get_tile_uv(input.uv, input.tex_index);
     var color = textureSample(atlas, atlas_sampler, tile_uv);
 
-    // Vanilla face brightness (applied to base color before lighting)
-    let face_mult = face_multiplier(input.normal);
-    color = vec4<f32>(color.rgb * face_mult, color.a);
-
-    // Normalized light direction
-    let light_dir = normalize(uniforms.light_direction.xyz);
-    let ndotl = max(dot(input.normal, light_dir), 0.0);
     let night = uniforms.night_factor.x;
     let day = 1.0 - night;
 
-    // === Lighting ===
-    // Minecraft uses skylight as the dominant light source during the day.
-    // Skylight (input.light) is the combined sky+block light, 0-1.
-    // It's multiplied by the face brightness for the base ambient.
+    // Face brightness multiplier (vanilla Minecraft style)
+    let face_mult = face_multiplier(input.normal);
+    color = vec4<f32>(color.rgb * face_mult, color.a);
 
-    // Face-dependent skylight: skylight fully illuminates all faces
-    let sky_base = input.light; // 0-1 from chunk light data
+    // Sunlight direction and shadow
+    let light_dir = normalize(uniforms.light_direction.xyz);
+    let ndotl = max(dot(input.normal, light_dir), 0.0);
+    let shadow = sample_shadow(input.shadow_pos);
 
-    // Directional sunlight (neutral white at noon, warm at edges)
+    // Sun color: warm at edges, neutral at noon
     let sun_color = mix(
-        vec3<f32>(1.0, 0.78, 0.45),  // warm sunrise/sunset
-        vec3<f32>(1.0, 0.92, 0.80),  // neutral noon
+        vec3<f32>(1.0, 0.75, 0.45),
+        vec3<f32>(1.0, 0.92, 0.80),
         smoothstep(0.0, 0.5, day)
     );
-    let shadow = sample_shadow(input.shadow_pos);
-    let sun_diffuse = ndotl * day * shadow;
 
-    // Combine: skylight base + directional sunlight
-    // Skylight provides strong ambient; sun adds directional emphasis
-    let skylight_contrib = sky_base * (0.6 + 0.4 * day);
-    let sunlight_contrib = sun_diffuse * 0.7;
-    let brightness = (skylight_contrib + sunlight_contrib) * input.ao;
+    // === Lighting ===
+    // Base illumination from sky/block light (Minecraft's lightmap curve)
+    let sky_base = input.light;
+
+    // Directional sunlight adds on top
+    let sun_contrib = ndotl * day * (0.3 + 0.5 * shadow);
+
+    // Final brightness with AO
+    let brightness = (sky_base * 0.8 + sun_contrib) * input.ao;
 
     color = vec4<f32>(color.rgb * brightness * sun_color, color.a);
 
-    // === Special block handling ===
-
-    // Leaves: brighten interiors, partial transmission
+    // Leaves: subtle light transmission
     if is_leaf_tile(input.tex_index) {
-        // Brighter base from skylight
-        let leaf_transmission = 0.12 * max(0.0, dot(input.normal, -light_dir)) * day * shadow;
-        color = vec4<f32>(color.rgb + vec3<f32>(leaf_transmission * 0.9, leaf_transmission * 0.7, leaf_transmission * 0.3), color.a);
-        // Leaves use alpha test
+        let transmission = 0.08 * max(0.0, dot(input.normal, -light_dir)) * day;
+        color = vec4<f32>(color.rgb + vec3<f32>(transmission * 0.8, transmission * 0.6, transmission * 0.2), color.a);
         if color.a < 0.5 { discard; }
     }
 
-    // Water: sky reflection + blue tint
+    // Water: subtle reflection + blue tint
     if is_water_tile(input.tex_index) {
         let view_dir = normalize(uniforms.camera_pos.xyz - input.world_pos);
-        let fresnel = 0.05 + 0.95 * pow(1.0 - max(dot(view_dir, input.normal), 0.0), 4.0);
-        let sky_reflect = mix(vec3<f32>(0.3, 0.5, 0.9), vec3<f32>(0.02, 0.02, 0.1), night);
-        let water_shallow = vec3<f32>(0.2, 0.6, 0.7);
-        let water_deep = vec3<f32>(0.0, 0.15, 0.35);
-        let water_color = mix(water_shallow, water_deep, 0.5);
-        let colored = mix(color.rgb, sky_reflect, fresnel * 0.5);
-        color = vec4<f32>(mix(colored, water_color, 0.25), 0.6);
+        let fresnel = 0.05 + 0.3 * pow(1.0 - max(dot(view_dir, input.normal), 0.0), 4.0);
+        let sky_reflect = mix(vec3<f32>(0.4, 0.6, 0.9), vec3<f32>(0.02, 0.02, 0.1), night);
+        let water_blue = vec3<f32>(0.1, 0.3, 0.4);
+        let reflected = mix(color.rgb, sky_reflect, fresnel);
+        color = vec4<f32>(mix(reflected, water_blue, 0.15), 0.75);
     }
 
-    // === Gamma correction: linear → sRGB ===
-    // Minecraft renders in gamma space. Convert our linear result to sRGB.
-    let gamma_corrected = pow(color.rgb, vec3<f32>(1.0 / 2.2));
-
-    // === Fog ===
-    let day_sky = vec3<f32>(0.6, 0.75, 0.95);
-    let night_sky = vec3<f32>(0.03, 0.03, 0.12);
-    let sky_color = mix(day_sky, night_sky, night);
-    let fog_density = 0.0008 + night * 0.0015;
+    // Fog
+    let day_fog = vec3<f32>(0.55, 0.7, 0.9);
+    let night_fog = vec3<f32>(0.02, 0.02, 0.1);
+    let fog_color = mix(day_fog, night_fog, night);
+    let fog_density = 0.0006 + night * 0.001;
     let fog_factor = 1.0 - exp(-fog_density * input.distance * input.distance);
-    color = vec4<f32>(mix(gamma_corrected, sky_color, fog_factor), color.a);
+    color = vec4<f32>(mix(color.rgb, fog_color, fog_factor), color.a);
 
     return color;
 }

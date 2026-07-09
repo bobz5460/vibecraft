@@ -205,6 +205,12 @@ impl Renderer {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Comparison),
+                    count: None,
+                },
             ],
         });
 
@@ -227,6 +233,10 @@ impl Renderer {
                 BindGroupEntry {
                     binding: 3,
                     resource: BindingResource::TextureView(&shadow_view),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: BindingResource::Sampler(&shadow_sampler),
                 },
             ],
         });

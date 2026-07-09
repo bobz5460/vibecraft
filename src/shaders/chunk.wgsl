@@ -10,6 +10,7 @@ struct Uniforms {
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
 @group(0) @binding(3) var shadow_map: texture_depth_2d;
+@group(0) @binding(4) var shadow_sampler: sampler_comparison;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -44,18 +45,15 @@ fn unpack_light(light_data: u32) -> vec2<f32> {
 fn sample_shadow(world_pos: vec3<f32>) -> f32 {
     let light_clip = uniforms.shadow_vp_matrix * vec4<f32>(world_pos, 1.0);
     let light_ndc = light_clip.xyz / light_clip.w;
-    // Convert from [-1,1] to [0,1] for texture coords
     let shadow_uv = light_ndc.xy * 0.5 + vec2<f32>(0.5, 0.5);
     if shadow_uv.x < 0.0 || shadow_uv.x > 1.0 || shadow_uv.y < 0.0 || shadow_uv.y > 1.0 || light_ndc.z > 1.0 {
-        return 1.0; // outside shadow map = fully lit
+        return 1.0;
     }
-    let sampled_depth = textureSampleLevel(shadow_map, atlas_sampler, shadow_uv, 0.0);
     // Bias to reduce shadow acne
     let bias = 0.005;
-    if light_ndc.z - bias > sampled_depth {
-        return 0.3; // in shadow
-    }
-    return 1.0;
+    // textureSampleCompareLevel returns 1.0 if ref <= stored depth (lit), 0.0 if not (shadowed)
+    // With LessEqual comparison: lit = stored_depth >= ref - bias
+    return textureSampleCompareLevel(shadow_map, shadow_sampler, shadow_uv, light_ndc.z - bias);
 }
 
 @vertex

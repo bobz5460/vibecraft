@@ -1,6 +1,6 @@
-use nalgebra::Vector3;
 use crate::world::block::Block;
 use crate::world::chunk_manager::ChunkManager;
+use nalgebra::Vector3;
 
 #[derive(Clone, Debug)]
 pub struct RaycastHit {
@@ -18,6 +18,10 @@ impl ChunkManager {
         direction: Vector3<f32>,
         max_dist: f32,
     ) -> Option<RaycastHit> {
+        if !max_dist.is_finite() || max_dist < 0.0 || direction.norm_squared() == 0.0 {
+            return None;
+        }
+        let max_dist_sq = max_dist * max_dist;
         let dir = direction.normalize();
         let mut x = origin.x.floor() as i32;
         let mut y = origin.y.floor() as i32;
@@ -27,9 +31,9 @@ impl ChunkManager {
         let step_y = if dir.y > 0.0 { 1 } else { -1 };
         let step_z = if dir.z > 0.0 { 1 } else { -1 };
 
-        let t_delta_x = (1.0 / dir.x).abs();
-        let t_delta_y = (1.0 / dir.y).abs();
-        let t_delta_z = (1.0 / dir.z).abs();
+        let t_delta_x = if dir.x == 0.0 { f32::MAX } else { (1.0 / dir.x).abs() };
+        let t_delta_y = if dir.y == 0.0 { f32::MAX } else { (1.0 / dir.y).abs() };
+        let t_delta_z = if dir.z == 0.0 { f32::MAX } else { (1.0 / dir.z).abs() };
 
         let mut t_max_x = if dir.x > 0.0 {
             (x as f32 + 1.0 - origin.x) / dir.x
@@ -57,11 +61,13 @@ impl ChunkManager {
 
         let mut last_normal: (i32, i32, i32) = (0, 0, 0);
 
-        for _ in 0..(max_dist as i32 * 3).max(1) {
+        for _ in 0..(max_dist.ceil() as i32 * 3).max(1) {
             let block = self.get_block(x, y, z);
             if !block.is_air() {
                 return Some(RaycastHit {
-                    x, y, z,
+                    x,
+                    y,
+                    z,
                     normal: last_normal,
                     block,
                 });
@@ -89,14 +95,40 @@ impl ChunkManager {
                 }
             }
 
-            let dist = ((x as f32 - origin.x).powi(2)
+            let dist_sq = (x as f32 - origin.x).powi(2)
                 + (y as f32 - origin.y).powi(2)
-                + (z as f32 - origin.z).powi(2))
-            .sqrt();
-            if dist > max_dist {
+                + (z as f32 - origin.z).powi(2);
+            if dist_sq > max_dist_sq {
                 return None;
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::block::BlockId;
+    use crate::world::chunk::Chunk;
+    use std::sync::Arc;
+
+    #[test]
+    fn raycast_hits_expected_block_and_face() {
+        let mut manager = ChunkManager::new(7, 2);
+        let mut chunk = Chunk::new(0, 0);
+        chunk.set_block(2, 10, 2, Block::new(BlockId::Stone));
+        manager.chunks.insert((0, 0), Arc::new(chunk));
+        let hit = manager
+            .raycast(Vector3::new(0.5, 10.5, 2.5), Vector3::new(1.0, 0.0, 0.0), 5.0)
+            .expect("ray must hit stone");
+        assert_eq!((hit.x, hit.y, hit.z), (2, 10, 2));
+        assert_eq!(hit.normal, (-1, 0, 0));
+    }
+
+    #[test]
+    fn zero_direction_returns_no_hit() {
+        let manager = ChunkManager::new(7, 2);
+        assert!(manager.raycast(Vector3::zeros(), Vector3::zeros(), 5.0).is_none());
     }
 }

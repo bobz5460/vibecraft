@@ -1,0 +1,1 @@
+Required baseline for coding changes: `cargo build && timeout 15 cargo run --release`. A timeout after 15 seconds is expected only if the game remains healthy; investigate any panic, GPU error, or freeze.

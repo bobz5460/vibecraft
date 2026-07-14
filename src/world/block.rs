@@ -1,4 +1,5 @@
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u16)]
 pub enum BlockId {
     Air = 0,
     Stone = 1,
@@ -407,7 +408,97 @@ pub enum BlockId {
     BrownMushroomBlock = 402,
     StoneStairs = 405,
     OakStairs = 406,
+    MagmaBlock = 407,
+    Ladder = 408,
+    SweetBerryBush = 409,
+    Bamboo = 410,
+    OakDoor = 411,
+    OakFence = 412,
+    RedstoneDust = 413,
 }
+
+macro_rules! bitmask {
+    ($($variant:ident),* $(,)?) => {{
+        let mut m = [0u64; 7];
+        $(
+            let d = BlockId::$variant as u16;
+            m[(d / 64) as usize] |= 1u64 << (d as u64 % 64);
+        )*
+        m
+    }};
+}
+
+const NON_SOLID_BITMASK: [u64; 7] = bitmask!(
+    Air, Water, Lava, OakDoor, RedstoneDust,
+    Torch, WallTorch, SoulTorch, SoulWallTorch, RedstoneTorch, RedstoneWallTorch,
+    Fire, SoulFire, EndRod, AmethystCluster,
+    Glass, TintedGlass,
+    WhiteStainedGlass, OrangeStainedGlass, MagentaStainedGlass, LightBlueStainedGlass,
+    YellowStainedGlass, LimeStainedGlass, PinkStainedGlass, GrayStainedGlass,
+    LightGrayStainedGlass, CyanStainedGlass, PurpleStainedGlass, BlueStainedGlass,
+    BrownStainedGlass, GreenStainedGlass, RedStainedGlass, BlackStainedGlass,
+    OakLeaves, OakLeaves2, SpruceLeaves, BirchLeaves, JungleLeaves, AcaciaLeaves,
+    DarkOakLeaves, CherryLeaves, MangroveLeaves, AzaleaLeaves, FloweringAzaleaLeaves,
+    Ice, Snow, Snow2, PowderSnow,
+    StoneSlab, OakSlab, StoneStairs, OakStairs,
+    Grass, Fern, DeadBush, Dandelion, Poppy, BlueOrchid, Allium, AzureBluet,
+    RedTulip, OrangeTulip, WhiteTulip, PinkTulip, OxeyeDaisy, Cornflower,
+    LilyOfTheValley, WitherRose, BrownMushroom, RedMushroom,
+    CrimsonFungus, WarpedFungus, CrimsonRoots, WarpedRoots, NetherSprouts,
+    WeepingVines, TwistingVines, Vine, GlowLichen, LilyPad,
+    Seagrass, TallSeagrass, Kelp, KelpPlant,
+    SporeBlossom, Azalea, FloweringAzalea, MossCarpet, HangingRoots,
+    OakSapling, SpruceSapling, BirchSapling, SugarCane,
+    JungleSapling, AcaciaSapling, DarkOakSapling, CherrySapling,
+    Ladder, SweetBerryBush, Cactus, Bamboo, SeaPickle,
+    TubeCoral, BrainCoral, BubbleCoral, FireCoral, HornCoral,
+    DeadTubeCoral, DeadBrainCoral, DeadBubbleCoral, DeadFireCoral, DeadHornCoral,
+    TubeCoralFan, BrainCoralFan, BubbleCoralFan, FireCoralFan, HornCoralFan,
+    DeadTubeCoralFan, DeadBrainCoralFan, DeadBubbleCoralFan, DeadFireCoralFan, DeadHornCoralFan,
+);
+
+const TRANSPARENT_BITMASK: [u64; 7] = bitmask!(
+    Air, Water, Lava,
+    Glass, TintedGlass,
+    WhiteStainedGlass, OrangeStainedGlass, MagentaStainedGlass, LightBlueStainedGlass,
+    YellowStainedGlass, LimeStainedGlass, PinkStainedGlass, GrayStainedGlass,
+    LightGrayStainedGlass, CyanStainedGlass, PurpleStainedGlass, BlueStainedGlass,
+    BrownStainedGlass, GreenStainedGlass, RedStainedGlass, BlackStainedGlass,
+    OakLeaves, OakLeaves2, SpruceLeaves, BirchLeaves, JungleLeaves, AcaciaLeaves,
+    DarkOakLeaves, CherryLeaves, MangroveLeaves, AzaleaLeaves, FloweringAzaleaLeaves,
+    Ice, Snow, Snow2, PowderSnow,
+    StoneSlab, OakSlab, StoneStairs, OakStairs,
+    Torch, WallTorch, SoulTorch, SoulWallTorch, RedstoneTorch, RedstoneWallTorch,
+    Fire, SoulFire,
+    Grass, Fern, DeadBush, Dandelion, Poppy, BlueOrchid, Allium, AzureBluet,
+    RedTulip, OrangeTulip, WhiteTulip, PinkTulip, OxeyeDaisy, Cornflower,
+    LilyOfTheValley, WitherRose, BrownMushroom, RedMushroom,
+    CrimsonFungus, WarpedFungus, CrimsonRoots, WarpedRoots, NetherSprouts,
+    OakSapling, SpruceSapling, BirchSapling, JungleSapling, AcaciaSapling,
+    DarkOakSapling, CherrySapling,
+    Vine, WeepingVines, TwistingVines, GlowLichen, LilyPad,
+    Seagrass, TallSeagrass, KelpPlant, Kelp,
+    SporeBlossom, Azalea, FloweringAzalea, MossCarpet, HangingRoots,
+    Ladder, SweetBerryBush, Cactus, SugarCane, Bamboo, SeaPickle,
+    TubeCoral, BrainCoral, BubbleCoral, FireCoral, HornCoral,
+    DeadTubeCoral, DeadBrainCoral, DeadBubbleCoral, DeadFireCoral, DeadHornCoral,
+    TubeCoralFan, BrainCoralFan, BubbleCoralFan, FireCoralFan, HornCoralFan,
+    DeadTubeCoralFan, DeadBrainCoralFan, DeadBubbleCoralFan, DeadFireCoralFan, DeadHornCoralFan,
+);
+
+const CROSSED_BITMASK: [u64; 7] = bitmask!(
+    Grass, Fern, DeadBush,
+    Dandelion, Poppy, BlueOrchid, Allium, AzureBluet,
+    RedTulip, OrangeTulip, WhiteTulip, PinkTulip, OxeyeDaisy, Cornflower,
+    LilyOfTheValley, WitherRose, BrownMushroom, RedMushroom,
+    CrimsonFungus, WarpedFungus, CrimsonRoots, WarpedRoots, NetherSprouts,
+    OakSapling, SpruceSapling, BirchSapling, JungleSapling, AcaciaSapling,
+    DarkOakSapling, CherrySapling,
+    SugarCane, Bamboo, LilyPad, Vine, WeepingVines, TwistingVines, GlowLichen,
+    Ladder, SweetBerryBush,
+    Torch, SoulTorch, RedstoneTorch,
+    Fire, SoulFire,
+);
 
 impl BlockId {
     pub const fn name(&self) -> &'static str {
@@ -539,6 +630,10 @@ impl BlockId {
             BlockId::RedCarpet => "RedCarpet",
             BlockId::RedWool => "RedWool",
             BlockId::WhiteWool => "WhiteWool",
+            BlockId::MagmaBlock => "Magma",
+            BlockId::Ladder => "Ladder",
+            BlockId::Bamboo => "Bamboo",
+            BlockId::SweetBerryBush => "BerryBush",
             BlockId::CryingObsidian => "CryObsid",
             BlockId::BoneBlock => "BoneBlock",
             BlockId::NetherBricks => "NetherBri",
@@ -569,8 +664,289 @@ impl BlockId {
             BlockId::QuartzBlock => "Quartz",
             BlockId::ChiseledQuartzBlock => "ChslQuart",
             BlockId::QuartzPillar => "QrtzPilar",
-            _ => "?",
+            // Colored wools
+            BlockId::OrangeWool => "OrngWool",
+            BlockId::MagentaWool => "MagWool",
+            BlockId::LightBlueWool => "LBluWool",
+            BlockId::YellowWool => "YlwWool",
+            BlockId::LimeWool => "LimeWool",
+            BlockId::PinkWool => "PinkWool",
+            BlockId::GrayWool => "GrayWool",
+            BlockId::LightGrayWool => "LGryWool",
+            BlockId::CyanWool => "CyanWool",
+            BlockId::PurpleWool => "PrplWool",
+            BlockId::BlueWool => "BlueWool",
+            BlockId::BrownWool => "BrwnWool",
+            BlockId::GreenWool => "GrnWool",
+            BlockId::BlackWool => "BlckWool",
+            // Colored terracottas
+            BlockId::OrangeTerracotta => "OrngTerr",
+            BlockId::MagentaTerracotta => "MagTerra",
+            BlockId::LightBlueTerracotta => "LBluTerr",
+            BlockId::YellowTerracotta => "YlwTerra",
+            BlockId::LimeTerracotta => "LimeTerr",
+            BlockId::PinkTerracotta => "PinkTerr",
+            BlockId::GrayTerracotta => "GrayTerr",
+            BlockId::LightGrayTerracotta => "LGryTerr",
+            BlockId::CyanTerracotta => "CyanTerr",
+            BlockId::PurpleTerracotta => "PrplTerr",
+            BlockId::BlueTerracotta => "BlueTerr",
+            BlockId::BrownTerracotta => "BrwnTerr",
+            BlockId::GreenTerracotta => "GrnTerr",
+            BlockId::RedTerracotta => "RedTerra",
+            BlockId::BlackTerracotta => "BlckTerr",
+            // Concrete
+            BlockId::WhiteConcrete => "WhtConc",
+            BlockId::OrangeConcrete => "OrngConc",
+            BlockId::MagentaConcrete => "MagConc",
+            BlockId::LightBlueConcrete => "LBluConc",
+            BlockId::YellowConcrete => "YlwConc",
+            BlockId::LimeConcrete => "LimeConc",
+            BlockId::PinkConcrete => "PinkConc",
+            BlockId::GrayConcrete => "GrayConc",
+            BlockId::LightGrayConcrete => "LGryConc",
+            BlockId::CyanConcrete => "CyanConc",
+            BlockId::PurpleConcrete => "PrplConc",
+            BlockId::BlueConcrete => "BlueConc",
+            BlockId::BrownConcrete => "BrwnConc",
+            BlockId::GreenConcrete => "GrnConc",
+            BlockId::RedConcrete => "RedConc",
+            BlockId::BlackConcrete => "BlckConc",
+            // Concrete powder
+            BlockId::WhiteConcretePowder => "WhtCPwd",
+            BlockId::OrangeConcretePowder => "OrngCPwd",
+            BlockId::MagentaConcretePowder => "MagCPwd",
+            BlockId::LightBlueConcretePowder => "LBluCPwd",
+            BlockId::YellowConcretePowder => "YlwCPwd",
+            BlockId::LimeConcretePowder => "LimeCPwd",
+            BlockId::PinkConcretePowder => "PinkCPwd",
+            BlockId::GrayConcretePowder => "GrayCPwd",
+            BlockId::LightGrayConcretePowder => "LGryCPwd",
+            BlockId::CyanConcretePowder => "CyanCPwd",
+            BlockId::PurpleConcretePowder => "PrplCPwd",
+            BlockId::BlueConcretePowder => "BlueCPwd",
+            BlockId::BrownConcretePowder => "BrwnCPwd",
+            BlockId::GreenConcretePowder => "GrnCPwd",
+            BlockId::RedConcretePowder => "RedCPwd",
+            BlockId::BlackConcretePowder => "BlckCPwd",
+            // Stained glass
+            BlockId::WhiteStainedGlass => "WhtSGlass",
+            BlockId::OrangeStainedGlass => "OrngSGls",
+            BlockId::MagentaStainedGlass => "MagSGlas",
+            BlockId::LightBlueStainedGlass => "LBluSGls",
+            BlockId::YellowStainedGlass => "YlwSGlas",
+            BlockId::LimeStainedGlass => "LimeSGls",
+            BlockId::PinkStainedGlass => "PinkSGls",
+            BlockId::GrayStainedGlass => "GraySGls",
+            BlockId::LightGrayStainedGlass => "LGrySGls",
+            BlockId::CyanStainedGlass => "CyanSGls",
+            BlockId::PurpleStainedGlass => "PrplSGls",
+            BlockId::BlueStainedGlass => "BlueSGls",
+            BlockId::BrownStainedGlass => "BrwnSGls",
+            BlockId::GreenStainedGlass => "GrnSGls",
+            BlockId::RedStainedGlass => "RedSGlas",
+            BlockId::BlackStainedGlass => "BlckSGls",
+            BlockId::TintedGlass => "TntdGlas",
+            // Shulker boxes
+            BlockId::ShulkerBox => "Shulker",
+            BlockId::WhiteShulkerBox => "WhtShul",
+            BlockId::OrangeShulkerBox => "OrngShul",
+            BlockId::MagentaShulkerBox => "MagShul",
+            BlockId::LightBlueShulkerBox => "LBluShul",
+            BlockId::YellowShulkerBox => "YlwShul",
+            BlockId::LimeShulkerBox => "LimeShul",
+            BlockId::PinkShulkerBox => "PinkShul",
+            BlockId::GrayShulkerBox => "GrayShul",
+            BlockId::LightGrayShulkerBox => "LGryShul",
+            BlockId::CyanShulkerBox => "CyanShul",
+            BlockId::PurpleShulkerBox => "PrplShul",
+            BlockId::BlueShulkerBox => "BlueShul",
+            BlockId::BrownShulkerBox => "BrwnShul",
+            BlockId::GreenShulkerBox => "GrnShul",
+            BlockId::RedShulkerBox => "RedShul",
+            BlockId::BlackShulkerBox => "BlckShul",
+            // Carpet
+            BlockId::OrangeCarpet => "OrngCrpt",
+            BlockId::MagentaCarpet => "MagCrpt",
+            BlockId::LightBlueCarpet => "LBluCrpt",
+            BlockId::YellowCarpet => "YlwCrpt",
+            BlockId::LimeCarpet => "LimeCrpt",
+            BlockId::PinkCarpet => "PinkCrpt",
+            BlockId::GrayCarpet => "GrayCrpt",
+            BlockId::LightGrayCarpet => "LGryCrpt",
+            BlockId::CyanCarpet => "CyanCrpt",
+            BlockId::PurpleCarpet => "PrplCrpt",
+            BlockId::BlueCarpet => "BlueCrpt",
+            BlockId::BrownCarpet => "BrwnCrpt",
+            BlockId::GreenCarpet => "GrnCrpt",
+            BlockId::BlackCarpet => "BlckCrpt",
+            // Coral blocks
+            BlockId::TubeCoralBlock => "TubeCrl",
+            BlockId::BrainCoralBlock => "BrainCrl",
+            BlockId::BubbleCoralBlock => "BublCrl",
+            BlockId::FireCoralBlock => "FireCrl",
+            BlockId::HornCoralBlock => "HornCrl",
+            BlockId::DeadTubeCoralBlock => "DTubeCrl",
+            BlockId::DeadBrainCoralBlock => "DBrainCrl",
+            BlockId::DeadBubbleCoralBlock => "DBublCrl",
+            BlockId::DeadFireCoralBlock => "DFireCrl",
+            BlockId::DeadHornCoralBlock => "DHornCrl",
+            // Coral
+            BlockId::TubeCoral => "TubeCor",
+            BlockId::BrainCoral => "BrainCor",
+            BlockId::BubbleCoral => "BublCor",
+            BlockId::FireCoral => "FireCor",
+            BlockId::HornCoral => "HornCor",
+            BlockId::DeadTubeCoral => "DTubeCor",
+            BlockId::DeadBrainCoral => "DBrainCor",
+            BlockId::DeadBubbleCoral => "DBublCor",
+            BlockId::DeadFireCoral => "DFireCor",
+            BlockId::DeadHornCoral => "DHornCor",
+            // Coral fans
+            BlockId::TubeCoralFan => "TubeFan",
+            BlockId::BrainCoralFan => "BrainFan",
+            BlockId::BubbleCoralFan => "BublFan",
+            BlockId::FireCoralFan => "FireFan",
+            BlockId::HornCoralFan => "HornFan",
+            BlockId::DeadTubeCoralFan => "DTubeFan",
+            BlockId::DeadBrainCoralFan => "DBrainFan",
+            BlockId::DeadBubbleCoralFan => "DBublFan",
+            BlockId::DeadFireCoralFan => "DFireFan",
+            BlockId::DeadHornCoralFan => "DHornFan",
+            // Wood/log variants
+            BlockId::OakLog2 => "OakLog",
+            BlockId::CherryLog => "CheryLog",
+            BlockId::MangroveLog => "MangLog",
+            BlockId::StrippedOakLog => "StrpOak",
+            BlockId::StrippedSpruceLog => "StrpSprc",
+            BlockId::StrippedBirchLog => "StrpBirc",
+            BlockId::StrippedJungleLog => "StrpJngl",
+            BlockId::StrippedAcaciaLog => "StrpAcac",
+            BlockId::StrippedDarkOakLog => "StrpDrkO",
+            BlockId::StrippedCherryLog => "StrpCher",
+            BlockId::StrippedMangroveLog => "StrpMang",
+            BlockId::OakWood => "OakWood",
+            BlockId::SpruceWood => "SprcWood",
+            BlockId::BirchWood => "BircWood",
+            BlockId::JungleWood => "JnglWood",
+            BlockId::AcaciaWood => "AcacWood",
+            BlockId::DarkOakWood => "DrkOWood",
+            BlockId::CherryWood => "CherWood",
+            BlockId::MangroveWood => "MangWood",
+            BlockId::StrippedOakWood => "SOakWd",
+            BlockId::StrippedSpruceWood => "SSprcWd",
+            BlockId::StrippedBirchWood => "SBircWd",
+            BlockId::StrippedJungleWood => "SJnglWd",
+            BlockId::StrippedAcaciaWood => "SAcacWd",
+            BlockId::StrippedDarkOakWood => "SDrkOWd",
+            BlockId::StrippedCherryWood => "SCherWd",
+            BlockId::StrippedMangroveWood => "SMangWd",
+            BlockId::OakPlanks2 => "Planks",
+            BlockId::CherryPlanks => "CherPlk",
+            BlockId::MangrovePlanks => "MangPlk",
+            BlockId::BambooPlanks => "BambPlk",
+            BlockId::BambooMosaic => "BambMosa",
+            BlockId::OakLeaves2 => "Leaves",
+            BlockId::CherryLeaves => "CherLvs",
+            BlockId::MangroveLeaves => "MangLvs",
+            BlockId::AzaleaLeaves => "AzaLvs",
+            BlockId::FloweringAzaleaLeaves => "FlwAzaLv",
+            // Plants & flowers
+            BlockId::Allium => "Allium",
+            BlockId::AzureBluet => "AzBluet",
+            BlockId::OrangeTulip => "OrngTulp",
+            BlockId::WhiteTulip => "WhtTulip",
+            BlockId::PinkTulip => "PinkTulp",
+            BlockId::LilyOfTheValley => "LilyVal",
+            BlockId::WitherRose => "WithRose",
+            BlockId::CrimsonFungus => "CrmFung",
+            BlockId::WarpedFungus => "WrpFung",
+            BlockId::CrimsonRoots => "CrmRoots",
+            BlockId::WarpedRoots => "WrpRoots",
+            BlockId::NetherSprouts => "NthrSprt",
+            BlockId::WeepingVines => "WeepVine",
+            BlockId::TwistingVines => "TwstVine",
+            BlockId::GlowLichen => "GlwLichn",
+            BlockId::Seagrass => "SeaGrass",
+            BlockId::TallSeagrass => "TallSGrs",
+            BlockId::Kelp => "Kelp",
+            BlockId::KelpPlant => "KelpPlnt",
+            BlockId::DriedKelpBlock => "DryKelpB",
+            BlockId::SporeBlossom => "SporeBls",
+            BlockId::Azalea => "Azalea",
+            BlockId::FloweringAzalea => "FlwAzal",
+            BlockId::MossCarpet => "MossCrpt",
+            BlockId::HangingRoots => "HangRoot",
+            BlockId::RootedDirt => "RootDirt",
+            BlockId::SeaPickle => "SeaPickl",
+            // Ice variants
+            BlockId::BlueIce => "BlueIce",
+            BlockId::PackedIce => "PckIce",
+            BlockId::FrostedIce => "FrstIce",
+            BlockId::Snow2 => "Snow",
+            BlockId::PowderSnow => "PwdrSnow",
+            // Saplings
+            BlockId::CherrySapling => "CherySap",
+            // Copper variants
+            BlockId::ExposedCopper => "ExpCopper",
+            BlockId::WeatheredCopper => "WthCopper",
+            BlockId::OxidizedCopper => "OxdCopper",
+            BlockId::CutCopper => "CutCopper",
+            BlockId::ExposedCutCopper => "ExpCutCu",
+            BlockId::WeatheredCutCopper => "WthCutCu",
+            BlockId::OxidizedCutCopper => "OxdCutCu",
+            BlockId::WaxedCopperBlock => "WaxCBlk",
+            BlockId::WaxedExposedCopper => "WaxExpCu",
+            BlockId::WaxedWeatheredCopper => "WaxWthCu",
+            BlockId::WaxedOxidizedCopper => "WaxOxdCu",
+            BlockId::WaxedCutCopper => "WaxCutCu",
+            BlockId::WaxedExposedCutCopper => "WExCutCu",
+            BlockId::WaxedWeatheredCutCopper => "WWthCutCu",
+            BlockId::WaxedOxidizedCutCopper => "WOxdCutCu",
+            // Deepslate
+            BlockId::DeepslateCopperOre => "DpCopper",
+            // Special blocks
+            BlockId::WallTorch => "WTorch",
+            BlockId::Fire => "Fire",
+            BlockId::SoulFire => "SoulFire",
+            BlockId::SoulTorch => "SoulTrch",
+            BlockId::SoulWallTorch => "SWallTrc",
+            BlockId::RedstoneTorch => "RstnTrch",
+            BlockId::RedstoneWallTorch => "RWstnTrc",
+            BlockId::EndRod => "EndRod",
+            BlockId::RespawnAnchor => "RspwnAnc",
+            BlockId::Target => "Target",
+            BlockId::Lodestone => "Loadston",
+            BlockId::HoneyBlock => "HoneyBlk",
+            BlockId::HoneycombBlock => "HonycmBl",
+            BlockId::NetherGoldOre => "NthrGOre",
+            BlockId::AncientDebris => "AncDebri",
+            BlockId::NetheriteBlock => "NthertBl",
+            BlockId::AmethystCluster => "AmethCls",
+            BlockId::BuddingAmethyst => "BudAmeth",
+            BlockId::QuartzStairs => "QrtzStrs",
+            BlockId::EmeraldBlock => "Emerald",
+            BlockId::RedstoneBlock => "Redstone",
+            BlockId::WetSponge => "WetSponge",
+            BlockId::SmoothRedSandstone => "SmthRdSd",
+            BlockId::PurpurPillar => "PrprPillr",
+            BlockId::EndStoneBricks => "EndStBri",
+            BlockId::OakDoor => "OakDoor",
+            BlockId::OakFence => "OakFence",
+            BlockId::RedstoneDust => "RedstDust",
         }
+    }
+
+    pub fn from_repr(value: u16) -> Option<Self> {
+        // BlockId discriminants are contiguous; keep this bound in sync.
+        // Use a match for O(1) lookup via the compiler's jump table.
+        // When adding new variants, update MAX_DISCRIMINANT to match.
+        const MAX_DISCRIMINANT: u16 = 413;
+        if value > MAX_DISCRIMINANT {
+            return None;
+        }
+        // SAFETY: every u16 in 0..=MAX_DISCRIMINANT maps to a valid BlockId variant.
+        Some(unsafe { std::mem::transmute(value) })
     }
 
     pub fn from_name(s: &str) -> Option<Self> {
@@ -627,6 +1003,9 @@ impl BlockId {
             "shroomlight" => Some(BlockId::Shroomlight),
             "jack_o_lantern" => Some(BlockId::JackOLantern),
             "redstone_lamp" => Some(BlockId::RedstoneLamp),
+            "oak_door" => Some(BlockId::OakDoor),
+            "oak_fence" => Some(BlockId::OakFence),
+            "redstone_dust" | "redstone_wire" => Some(BlockId::RedstoneDust),
             "soul_sand" => Some(BlockId::SoulSand),
             "soul_soil" => Some(BlockId::SoulSoil),
             "red_sand" => Some(BlockId::RedSand),
@@ -644,6 +1023,10 @@ impl BlockId {
             "basalt" => Some(BlockId::Basalt),
             "smooth_stone" => Some(BlockId::SmoothStone),
             "quartz_block" => Some(BlockId::QuartzBlock),
+            "magma_block" | "magma" => Some(BlockId::MagmaBlock),
+            "sweet_berry_bush" | "berry_bush" => Some(BlockId::SweetBerryBush),
+            "ladder" => Some(BlockId::Ladder),
+            "bamboo" => Some(BlockId::Bamboo),
             "bone_block" => Some(BlockId::BoneBlock),
             "purpur_block" => Some(BlockId::PurpurBlock),
             _ => None,
@@ -651,81 +1034,24 @@ impl BlockId {
     }
 
     pub fn is_solid(&self) -> bool {
-        !matches!(self,
-            BlockId::Air | BlockId::Water | BlockId::Lava | BlockId::Torch |
-            BlockId::WallTorch | BlockId::Fire | BlockId::SoulFire |
-            BlockId::Grass | BlockId::Fern | BlockId::DeadBush |
-            BlockId::Dandelion | BlockId::Poppy | BlockId::BlueOrchid |
-            BlockId::Allium | BlockId::AzureBluet | BlockId::RedTulip |
-            BlockId::OrangeTulip | BlockId::WhiteTulip | BlockId::PinkTulip |
-            BlockId::OxeyeDaisy | BlockId::Cornflower | BlockId::LilyOfTheValley |
-            BlockId::WitherRose | BlockId::BrownMushroom | BlockId::RedMushroom |
-            BlockId::CrimsonFungus | BlockId::WarpedFungus |
-            BlockId::CrimsonRoots | BlockId::WarpedRoots | BlockId::NetherSprouts |
-            BlockId::WeepingVines | BlockId::TwistingVines | BlockId::Vine |
-            BlockId::GlowLichen | BlockId::LilyPad | BlockId::Seagrass |
-            BlockId::TallSeagrass | BlockId::KelpPlant |
-            BlockId::SporeBlossom | BlockId::Azalea | BlockId::FloweringAzalea |
-            BlockId::MossCarpet | BlockId::HangingRoots |
-            BlockId::OakSapling | BlockId::SpruceSapling | BlockId::BirchSapling |
-            BlockId::Cactus | BlockId::SugarCane |
-            BlockId::JungleSapling | BlockId::AcaciaSapling | BlockId::DarkOakSapling |
-            BlockId::CherrySapling
-        )
+        let d = *self as u16;
+        (NON_SOLID_BITMASK[(d / 64) as usize] >> (d % 64)) & 1 == 0
     }
 
     pub fn is_crossed(&self) -> bool {
-        matches!(self,
-            BlockId::Grass | BlockId::Fern | BlockId::DeadBush |
-            BlockId::Dandelion | BlockId::Poppy | BlockId::BlueOrchid |
-            BlockId::Allium | BlockId::AzureBluet | BlockId::RedTulip |
-            BlockId::OrangeTulip | BlockId::WhiteTulip | BlockId::PinkTulip |
-            BlockId::OxeyeDaisy | BlockId::Cornflower | BlockId::LilyOfTheValley |
-            BlockId::WitherRose | BlockId::BrownMushroom | BlockId::RedMushroom |
-            BlockId::CrimsonFungus | BlockId::WarpedFungus |
-            BlockId::CrimsonRoots | BlockId::WarpedRoots | BlockId::NetherSprouts |
-            BlockId::OakSapling | BlockId::SpruceSapling | BlockId::BirchSapling |
-            BlockId::JungleSapling | BlockId::AcaciaSapling | BlockId::DarkOakSapling |
-            BlockId::CherrySapling |
-            BlockId::SugarCane | BlockId::Cactus |
-            BlockId::LilyPad |
-            BlockId::Vine | BlockId::WeepingVines | BlockId::TwistingVines |
-            BlockId::GlowLichen
-        )
+        let d = *self as u16;
+        (CROSSED_BITMASK[(d / 64) as usize] >> (d % 64)) & 1 == 1
     }
 
     pub fn is_transparent(&self) -> bool {
-        matches!(self,
-            BlockId::Air | BlockId::Water | BlockId::Lava |
-            BlockId::Glass | BlockId::OakLeaves | BlockId::SpruceLeaves |
-            BlockId::BirchLeaves | BlockId::JungleLeaves | BlockId::AcaciaLeaves |
-            BlockId::DarkOakLeaves | BlockId::CherryLeaves | BlockId::MangroveLeaves |
-            BlockId::AzaleaLeaves | BlockId::FloweringAzaleaLeaves | BlockId::Ice |
-            BlockId::TintedGlass | BlockId::WhiteStainedGlass | BlockId::OrangeStainedGlass |
-            BlockId::MagentaStainedGlass | BlockId::LightBlueStainedGlass |
-            BlockId::YellowStainedGlass | BlockId::LimeStainedGlass | BlockId::PinkStainedGlass |
-            BlockId::GrayStainedGlass | BlockId::LightGrayStainedGlass | BlockId::CyanStainedGlass |
-            BlockId::PurpleStainedGlass | BlockId::BlueStainedGlass | BlockId::BrownStainedGlass |
-            BlockId::GreenStainedGlass | BlockId::RedStainedGlass | BlockId::BlackStainedGlass |
-            BlockId::Snow | BlockId::SnowBlock | BlockId::PowderSnow |
-            BlockId::Glowstone | BlockId::RedstoneLamp | BlockId::SeaLantern |
-            BlockId::Shroomlight | BlockId::JackOLantern |
-            BlockId::Grass | BlockId::Fern | BlockId::DeadBush |
-            BlockId::Dandelion | BlockId::Poppy | BlockId::BlueOrchid |
-            BlockId::Allium | BlockId::AzureBluet | BlockId::RedTulip |
-            BlockId::OrangeTulip | BlockId::WhiteTulip | BlockId::PinkTulip |
-            BlockId::OxeyeDaisy | BlockId::Cornflower | BlockId::LilyOfTheValley |
-            BlockId::WitherRose | BlockId::BrownMushroom | BlockId::RedMushroom |
-            BlockId::CrimsonFungus | BlockId::WarpedFungus |
-            BlockId::CrimsonRoots | BlockId::WarpedRoots | BlockId::NetherSprouts |
-            BlockId::OakSapling | BlockId::SpruceSapling | BlockId::BirchSapling |
-            BlockId::JungleSapling | BlockId::AcaciaSapling | BlockId::DarkOakSapling |
-            BlockId::CherrySapling | BlockId::Vine |
-            BlockId::WeepingVines | BlockId::TwistingVines |
-            BlockId::GlowLichen | BlockId::LilyPad | BlockId::Seagrass |
-            BlockId::TallSeagrass | BlockId::KelpPlant |
-            BlockId::SporeBlossom | BlockId::Azalea | BlockId::FloweringAzalea |
-            BlockId::MossCarpet | BlockId::HangingRoots
+        let d = *self as u16;
+        (TRANSPARENT_BITMASK[(d / 64) as usize] >> (d % 64)) & 1 == 1
+    }
+
+    pub fn is_climbable(&self) -> bool {
+        matches!(
+            self,
+            BlockId::Vine | BlockId::WeepingVines | BlockId::TwistingVines | BlockId::Ladder
         )
     }
 
@@ -741,14 +1067,19 @@ impl BlockId {
     pub fn light_level(&self) -> u8 {
         match self {
             BlockId::Torch | BlockId::WallTorch => 14,
+            BlockId::EndRod => 14,
             BlockId::Glowstone | BlockId::Shroomlight | BlockId::SeaLantern => 15,
-            BlockId::Fire | BlockId::SoulFire => 15,
+            BlockId::Fire => 15,
+            BlockId::SoulFire => 10,
             BlockId::SoulTorch | BlockId::SoulWallTorch => 10,
-            BlockId::RedstoneTorch => 7,
-            BlockId::JackOLantern => 10,
+            BlockId::RedstoneTorch | BlockId::RedstoneWallTorch => 7,
+            BlockId::JackOLantern => 15,
             BlockId::Lava => 15,
             BlockId::RedstoneLamp => 15,
             BlockId::Furnace => 13,
+            BlockId::MagmaBlock => 3,
+            BlockId::AmethystCluster => 5,
+            BlockId::GlowLichen => 7,
             _ => 0,
         }
     }
@@ -776,19 +1107,94 @@ pub const FACES: [BlockFace; 6] = [
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Block {
     pub id: BlockId,
+    /// Compact registry-local state ordinal. `data` remains the compatibility
+    /// representation for the legacy fluid/slab/stair paths while they migrate.
+    pub state: u16,
     pub data: u8,
 }
 
 impl Block {
     pub const fn new(id: BlockId) -> Self {
-        Block { id, data: 0 }
+        Block {
+            id,
+            state: 0,
+            data: 0,
+        }
+    }
+
+    pub fn with_legacy_data(id: BlockId, data: u8) -> Self {
+        let state = match id {
+            BlockId::Water | BlockId::Lava => crate::world::block_registry::registry()
+                .state_for_properties(id, [("level", if data > 15 { "15" } else { match data {
+                    0 => "0", 1 => "1", 2 => "2", 3 => "3", 4 => "4", 5 => "5", 6 => "6", 7 => "7",
+                    8 => "8", 9 => "9", 10 => "10", 11 => "11", 12 => "12", 13 => "13", 14 => "14", _ => "15",
+                }}), ("falling", "false")])
+                .unwrap_or(0),
+            BlockId::StoneSlab | BlockId::OakSlab => {
+                let slab_type = if data == 1 { "top" } else { "bottom" };
+                crate::world::block_registry::registry()
+                    .state_for_properties(id, [("type", slab_type)])
+                    .unwrap_or(0)
+            }
+            BlockId::StoneStairs | BlockId::OakStairs => {
+                let facing = ["south", "west", "north", "east"][(data & 0x03) as usize];
+                let half = if data & 0x04 == 0 { "bottom" } else { "top" };
+                crate::world::block_registry::registry()
+                    .state_for_properties(id, [("facing", facing), ("half", half), ("shape", "straight")])
+                    .unwrap_or(0)
+            }
+            _ => 0,
+        };
+        Block { id, state, data }
+    }
+
+    pub fn with_properties<'a>(
+        id: BlockId,
+        properties: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Option<Self> {
+        let state = crate::world::block_registry::registry().state_for_properties(id, properties)?;
+        Some(Block { id, state, data: 0 })
     }
 
     pub const fn air() -> Self {
-        Block { id: BlockId::Air, data: 0 }
+        Block {
+            id: BlockId::Air,
+            state: 0,
+            data: 0,
+        }
     }
 
     pub fn is_air(&self) -> bool {
         matches!(self.id, BlockId::Air)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_state_round_trips_registry_properties() {
+        let block = Block::with_properties(BlockId::StoneStairs, [("facing", "west"), ("half", "top"), ("shape", "straight")])
+            .expect("supported stair properties must resolve");
+        let properties = crate::world::block_registry::registry()
+            .properties_for_state(BlockId::StoneStairs, block.state)
+            .expect("resolved state must decode");
+        assert_eq!(properties, vec![("facing", "west"), ("half", "top"), ("shape", "straight")]);
+    }
+
+    #[test]
+    fn invalid_block_discriminant_is_rejected() {
+        assert_eq!(BlockId::from_repr(414), None);
+        assert_eq!(BlockId::from_repr(BlockId::Torch as u16), Some(BlockId::Torch));
+    }
+
+    #[test]
+    fn legacy_stair_data_migrates_to_registry_state() {
+        let block = Block::with_legacy_data(BlockId::StoneStairs, 0b110);
+        let properties = crate::world::block_registry::registry()
+            .properties_for_state(block.id, block.state)
+            .unwrap();
+        assert_eq!(properties, vec![("facing", "north"), ("half", "top"), ("shape", "straight")]);
     }
 }

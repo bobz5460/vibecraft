@@ -1,19 +1,31 @@
-use std::collections::HashMap;
-use std::sync::OnceLock;
 use crate::world::block::{Block, BlockFace, BlockId, FACES};
 use crate::world::chunk::{Chunk, CHUNK_HEIGHT, CHUNK_SIZE};
+use crate::world::block_registry::{registry, CollisionShape};
+use crate::assets::BlockMeshAssets;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 type FaceTexMap = HashMap<(BlockId, BlockFace), u32>;
 type CrossedTexMap = HashMap<BlockId, u32>;
 static FACE_TEX: OnceLock<FaceTexMap> = OnceLock::new();
 static CROSSED_TEX: OnceLock<CrossedTexMap> = OnceLock::new();
+static MODEL_ASSETS: OnceLock<Arc<BlockMeshAssets>> = OnceLock::new();
 
 pub fn set_texture_lookups(face: FaceTexMap, crossed: CrossedTexMap) {
     let _ = FACE_TEX.set(face);
     let _ = CROSSED_TEX.set(crossed);
 }
 
-#[derive(Clone, Debug)]
+pub fn set_model_assets(assets: Arc<BlockMeshAssets>) {
+    let _ = MODEL_ASSETS.set(assets);
+}
+
+fn model_assets() -> Option<&'static BlockMeshAssets> {
+    MODEL_ASSETS.get().map(Arc::as_ref)
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MeshVertex {
     pub pos: [f32; 3],
     pub uv: [f32; 2],
@@ -42,43 +54,311 @@ fn get_face_normal(face: BlockFace) -> [f32; 3] {
 }
 
 fn get_texture_index(block: Block, face: BlockFace) -> u32 {
-    FACE_TEX.get()
-        .and_then(|m| m.get(&(block.id, face)))
-        .copied()
-        .unwrap_or(0)
+    let tile_index = get_face_tile(block.id, face);
+    tile_index | material_flags(block.id)
 }
 
-fn is_transparent(block: Block) -> bool {
-    block.id.is_transparent()
+pub fn get_face_tile(block_id: BlockId, face: BlockFace) -> u32 {
+    let tex = FACE_TEX
+        .get()
+        .and_then(|m| m.get(&(block_id, face)))
+        .copied()
+        .unwrap_or(u32::MAX);
+    if tex == u32::MAX {
+        log::warn!("Missing face texture for block {:?} face {:?}", block_id, face);
+    }
+    tex
+}
+
+// The shader must not infer a material from the atlas order: that order changes
+// whenever the block texture list changes.
+fn material_flags(block_id: BlockId) -> u32 {
+    const WATER: u32 = 1 << 31;
+    const LEAVES: u32 = 1 << 30;
+    const TRANSLUCENT: u32 = 1 << 29;
+    const CUTOUT: u32 = 1 << 28;
+
+    match block_id {
+        BlockId::Water => WATER,
+        BlockId::OakLeaves
+        | BlockId::OakLeaves2
+        | BlockId::SpruceLeaves
+        | BlockId::BirchLeaves
+        | BlockId::JungleLeaves
+        | BlockId::AcaciaLeaves
+        | BlockId::DarkOakLeaves
+        | BlockId::CherryLeaves
+        | BlockId::MangroveLeaves
+        | BlockId::AzaleaLeaves
+        | BlockId::FloweringAzaleaLeaves => LEAVES,
+        id if id.is_crossed() => CUTOUT,
+        id if uses_translucent_blend(Block::new(id)) => TRANSLUCENT,
+        _ => 0,
+    }
+}
+
+/// Vanilla's leaves and other cutout blocks write depth; only fluids and glass
+/// belong in the blended pass. Treating every transparent block as blended made
+/// overlapping leaf layers look pale and see-through.
+fn uses_translucent_blend(block: Block) -> bool {
+    matches!(
+        block.id,
+        BlockId::Water
+            | BlockId::Glass
+            | BlockId::Ice
+            | BlockId::TintedGlass
+            | BlockId::WhiteStainedGlass
+            | BlockId::OrangeStainedGlass
+            | BlockId::MagentaStainedGlass
+            | BlockId::LightBlueStainedGlass
+            | BlockId::YellowStainedGlass
+            | BlockId::LimeStainedGlass
+            | BlockId::PinkStainedGlass
+            | BlockId::GrayStainedGlass
+            | BlockId::LightGrayStainedGlass
+            | BlockId::CyanStainedGlass
+            | BlockId::PurpleStainedGlass
+            | BlockId::BlueStainedGlass
+            | BlockId::BrownStainedGlass
+            | BlockId::GreenStainedGlass
+            | BlockId::RedStainedGlass
+            | BlockId::BlackStainedGlass
+    )
 }
 
 fn can_see_face(block: Block, neighbor: Block) -> bool {
-    neighbor.is_air() || neighbor.id.is_transparent() || block.id.is_transparent()
+    if neighbor.is_air() {
+        return true;
+    }
+    if block.id.is_transparent() && neighbor.id.is_transparent() {
+        return block.id != neighbor.id;
+    }
+    if block.id.is_transparent() {
+        return true;
+    }
+    neighbor.id.is_transparent()
 }
 
-fn emit_quad(
-    verts: &mut Vec<MeshVertex>,
+fn rotate_point(mut point: [f32; 3], origin: [f32; 3], axis: &str, angle: i32) -> [f32; 3] {
+    let radians = (angle as f32).to_radians();
+    let (sin, cos) = radians.sin_cos();
+    for i in 0..3 { point[i] -= origin[i]; }
+    match axis {
+        "x" => {
+            let (y, z) = (point[1], point[2]);
+            point[1] = y * cos - z * sin;
+            point[2] = y * sin + z * cos;
+        }
+        "y" => {
+            let (x, z) = (point[0], point[2]);
+            point[0] = x * cos + z * sin;
+            point[2] = -x * sin + z * cos;
+        }
+        "z" => {
+            let (x, y) = (point[0], point[1]);
+            point[0] = x * cos - y * sin;
+            point[1] = x * sin + y * cos;
+        }
+        _ => {}
+    }
+    for i in 0..3 { point[i] += origin[i]; }
+    point
+}
+
+fn rotate_vector(mut vector: [f32; 3], axis: &str, angle: i32) -> [f32; 3] {
+    let radians = (angle as f32).to_radians();
+    let (sin, cos) = radians.sin_cos();
+    match axis {
+        "x" => {
+            let (y, z) = (vector[1], vector[2]);
+            vector[1] = y * cos - z * sin;
+            vector[2] = y * sin + z * cos;
+        }
+        "y" => {
+            let (x, z) = (vector[0], vector[2]);
+            vector[0] = x * cos + z * sin;
+            vector[2] = -x * sin + z * cos;
+        }
+        "z" => {
+            let (x, y) = (vector[0], vector[1]);
+            vector[0] = x * cos - y * sin;
+            vector[1] = x * sin + y * cos;
+        }
+        _ => {}
+    }
+    vector
+}
+
+fn model_face(direction: &str, from: [f32; 3], to: [f32; 3]) -> Option<([[f32; 3]; 4], [f32; 3])> {
+    Some(match direction {
+        "down" => ([[from[0], from[1], from[2]], [to[0], from[1], from[2]], [to[0], from[1], to[2]], [from[0], from[1], to[2]]], [0.0, -1.0, 0.0]),
+        "up" => ([[from[0], to[1], from[2]], [from[0], to[1], to[2]], [to[0], to[1], to[2]], [to[0], to[1], from[2]]], [0.0, 1.0, 0.0]),
+        "north" => ([[from[0], from[1], from[2]], [from[0], to[1], from[2]], [to[0], to[1], from[2]], [to[0], from[1], from[2]]], [0.0, 0.0, -1.0]),
+        "south" => ([[from[0], from[1], to[2]], [to[0], from[1], to[2]], [to[0], to[1], to[2]], [from[0], to[1], to[2]]], [0.0, 0.0, 1.0]),
+        "west" => ([[from[0], from[1], from[2]], [from[0], from[1], to[2]], [from[0], to[1], to[2]], [from[0], to[1], from[2]]], [-1.0, 0.0, 0.0]),
+        "east" => ([[to[0], from[1], from[2]], [to[0], to[1], from[2]], [to[0], to[1], to[2]], [to[0], from[1], to[2]]], [1.0, 0.0, 0.0]),
+        _ => return None,
+    })
+}
+
+fn emit_resolved_models<'a>(
+    chunk: &'a Chunk,
+    get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
+    block: Block,
+    local: (i32, i32, i32),
+    opaque: &mut Vec<MeshVertex>,
+    opaque_indices: &mut Vec<u32>,
+    transparent: &mut Vec<MeshVertex>,
+    transparent_indices: &mut Vec<u32>,
+) -> bool {
+    let Some(assets) = model_assets() else { return false; };
+    if !assets.has_model(block.id) { return false; }
+    let (x, y, z) = local;
+    let models = assets.resolve(block.id, block.state, (chunk.cx * CHUNK_SIZE as i32 + x, y, chunk.cz * CHUNK_SIZE as i32 + z));
+    if models.is_empty() { return false; }
+    let blended = uses_translucent_blend(block);
+    let (verts, indices) = if blended { (transparent, transparent_indices) } else { (opaque, opaque_indices) };
+    let light = get_light_data(chunk, get_neighbor, x, y, z);
+    let light_data = (block.id.light_level() as u32) << 12 | (3 << 8) | light;
+    for (model, transform) in models {
+        for element in &model.elements {
+            let from = [element.from[0] / 16.0, element.from[1] / 16.0, element.from[2] / 16.0];
+            let to = [element.to[0] / 16.0, element.to[1] / 16.0, element.to[2] / 16.0];
+            for face in &element.faces {
+                // A cullface only describes an element that reaches the block
+                // boundary. Never use it to hide partial geometry behind another
+                // partial model, which would create holes in fences and stairs.
+                if let Some(cullface) = face.cullface.as_deref() {
+                    let (dx, dy, dz) = match cullface {
+                        "down" => (0, -1, 0),
+                        "up" => (0, 1, 0),
+                        "north" => (0, 0, -1),
+                        "south" => (0, 0, 1),
+                        "west" => (-1, 0, 0),
+                        "east" => (1, 0, 0),
+                        _ => (0, 0, 0),
+                    };
+                    let neighbor = if dx != 0 || dy != 0 || dz != 0 {
+                        if y + dy < 0 || y + dy >= CHUNK_HEIGHT as i32 {
+                            Block::air()
+                        } else if x + dx >= 0 && x + dx < CHUNK_SIZE as i32 && z + dz >= 0 && z + dz < CHUNK_SIZE as i32 {
+                            chunk.get_block((x + dx) as usize, (y + dy) as usize, (z + dz) as usize)
+                        } else {
+                            let cx = chunk.cx + (x + dx).div_euclid(CHUNK_SIZE as i32);
+                            let cz = chunk.cz + (z + dz).div_euclid(CHUNK_SIZE as i32);
+                            get_neighbor(cx, cz).map_or(Block::air(), |chunk| chunk.get_block((x + dx).rem_euclid(CHUNK_SIZE as i32) as usize, (y + dy) as usize, (z + dz).rem_euclid(CHUNK_SIZE as i32) as usize))
+                        }
+                    } else {
+                        Block::air()
+                    };
+                    if registry().definition(neighbor.id).collision == CollisionShape::FullCube && !neighbor.id.is_transparent() {
+                        continue;
+                    }
+                }
+                let Some((mut corners, mut normal)) = model_face(&face.direction, from, to) else { continue; };
+                if let Some(rotation) = &element.rotation {
+                    let origin = [rotation.origin[0] / 16.0, rotation.origin[1] / 16.0, rotation.origin[2] / 16.0];
+                    for corner in &mut corners { *corner = rotate_point(*corner, origin, &rotation.axis, rotation.angle as i32); }
+                    normal = rotate_vector(normal, &rotation.axis, rotation.angle as i32);
+                }
+                for corner in &mut corners { *corner = rotate_point(*corner, [0.5, 0.5, 0.5], "x", transform.x); *corner = rotate_point(*corner, [0.5, 0.5, 0.5], "y", transform.y); }
+                normal = rotate_vector(rotate_vector(normal, "x", transform.x), "y", transform.y);
+                let Some(tile) = assets.texture_tile(&face.texture) else { log::warn!("missing generic-model atlas tile {}", face.texture); continue; };
+                let base = verts.len() as u32;
+                let [u0, v0, u1, v1] = face.uv.unwrap_or([0.0, 0.0, 16.0, 16.0]);
+                let mut uvs = [[u0 / 16.0, v0 / 16.0], [u1 / 16.0, v0 / 16.0], [u1 / 16.0, v1 / 16.0], [u0 / 16.0, v1 / 16.0]];
+                uvs.rotate_right((face.rotation.rem_euclid(360) / 90) as usize);
+                for (corner, uv) in corners.into_iter().zip(uvs) {
+                    verts.push(MeshVertex { pos: [corner[0] + chunk.cx as f32 * CHUNK_SIZE as f32 + x as f32, corner[1] + y as f32, corner[2] + chunk.cz as f32 * CHUNK_SIZE as f32 + z as f32], uv, normal, tex_index: tile | material_flags(block.id), light_data });
+                }
+                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+        }
+    }
+    true
+}
+
+fn fluid_height(block: Block) -> f32 {
+    if block.data == 0 || block.data >= 8 { 1.0 } else { (8 - block.data) as f32 / 8.0 }
+}
+
+fn emit_fluid<'a>(
+    chunk: &'a Chunk,
+    get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
+    get_block: &impl Fn(i32, i32, i32) -> Block,
+    block: Block,
+    local: (i32, i32, i32),
+    vertices: &mut Vec<MeshVertex>,
     indices: &mut Vec<u32>,
-    face: BlockFace,
-    x: f32, y: f32, z: f32,
-    w: f32, h: f32,
-    tex_index: u32,
-    u_axis: usize,
-    v_axis: usize,
-) {
-    emit_quad_light(verts, indices, face, x, y, z, w, h, tex_index, u_axis, v_axis, 0);
+) -> bool {
+    if !matches!(block.id, BlockId::Water | BlockId::Lava) { return false; }
+    let (x, y, z) = local;
+    let height = fluid_height(block);
+    let world_x = chunk.cx as f32 * CHUNK_SIZE as f32 + x as f32;
+    let world_z = chunk.cz as f32 * CHUNK_SIZE as f32 + z as f32;
+    let tex = get_texture_index(block, BlockFace::Top);
+    let light = get_light_data(chunk, get_neighbor, x, y, z);
+    let light_data = (block.id.light_level() as u32) << 12 | (3 << 8) | light;
+    let above = get_block(x, y + 1, z);
+    if above.id != block.id {
+        emit_quad_light(vertices, indices, BlockFace::Top, world_x, y as f32 + height, world_z, 1.0, 1.0, tex, 0, 2);
+        let start = vertices.len() - 4;
+        for vertex in &mut vertices[start..] { vertex.light_data = light_data; }
+    }
+    for (dx, dz, face) in [(0, -1, BlockFace::Back), (1, 0, BlockFace::Right), (0, 1, BlockFace::Front), (-1, 0, BlockFace::Left)] {
+        let neighbor = get_block(x + dx, y, z + dz);
+        let neighbor_height = if neighbor.id == block.id { fluid_height(neighbor) } else { 0.0 };
+        if neighbor.id != block.id || neighbor_height < height {
+            let (fx, fz, width) = match face {
+                BlockFace::Back => (world_x, world_z, 1.0),
+                BlockFace::Right => (world_x + 1.0, world_z, 1.0),
+                BlockFace::Front => (world_x, world_z + 1.0, 1.0),
+                BlockFace::Left => (world_x, world_z, 1.0),
+                _ => unreachable!(),
+            };
+            let (u_axis, v_axis) = match face {
+                BlockFace::Left | BlockFace::Right => (2, 1),
+                _ => (0, 1),
+            };
+            emit_quad_light(vertices, indices, face, fx, y as f32 + neighbor_height, fz, width, height - neighbor_height, tex, u_axis, v_axis);
+            let start = vertices.len() - 4;
+            for vertex in &mut vertices[start..] { vertex.light_data = light_data; }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    #[test]
+    fn model_face_has_outward_winding() {
+        let (corners, normal) = model_face("up", [0.0; 3], [1.0; 3]).unwrap();
+        let ab = [corners[1][0] - corners[0][0], corners[1][1] - corners[0][1], corners[1][2] - corners[0][2]];
+        let ac = [corners[2][0] - corners[0][0], corners[2][1] - corners[0][1], corners[2][2] - corners[0][2]];
+        let cross = [ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]];
+        assert!(cross[0] * normal[0] + cross[1] * normal[1] + cross[2] * normal[2] > 0.0);
+    }
+
+    #[test]
+    fn model_rotation_preserves_unit_axes() {
+        assert_eq!(rotate_vector([0.0, 0.0, -1.0], "y", 90).map(|value| value.round()), [-1.0, 0.0, 0.0]);
+    }
 }
 
 fn emit_quad_light(
     verts: &mut Vec<MeshVertex>,
     indices: &mut Vec<u32>,
     face: BlockFace,
-    x: f32, y: f32, z: f32,
-    w: f32, h: f32,
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+    h: f32,
     tex_index: u32,
     u_axis: usize,
     v_axis: usize,
-    light_data: u32,
 ) {
     let normal = get_face_normal(face);
     let base = verts.len() as u32;
@@ -109,26 +389,32 @@ fn emit_quad_light(
             uv: uvs[i],
             normal,
             tex_index,
-            light_data,
+            light_data: 0,
         });
     }
 
     if reversed {
-        indices.extend_from_slice(&[
-            base, base + 2, base + 1,
-            base, base + 3, base + 2,
-        ]);
+        indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
     } else {
-        indices.extend_from_slice(&[
-            base, base + 1, base + 2,
-            base, base + 2, base + 3,
-        ]);
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 }
 
-/// Check if a block at chunk-local coords is solid (opaque).
-fn is_solid_block<'a>(chunk: &'a Chunk, get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>, bx: i32, by: i32, bz: i32) -> bool {
-    let block = if bx >= 0 && bx < CHUNK_SIZE as i32 && by >= 0 && by < CHUNK_HEIGHT as i32 && bz >= 0 && bz < CHUNK_SIZE as i32 {
+/// Check if a block at chunk-local coords blocks AO (opaque or full-cube transparent).
+fn is_solid_block<'a>(
+    chunk: &'a Chunk,
+    get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
+    bx: i32,
+    by: i32,
+    bz: i32,
+) -> bool {
+    let block = if bx >= 0
+        && bx < CHUNK_SIZE as i32
+        && by >= 0
+        && by < CHUNK_HEIGHT as i32
+        && bz >= 0
+        && bz < CHUNK_SIZE as i32
+    {
         chunk.get_block(bx as usize, by as usize, bz as usize)
     } else {
         let cx = chunk.cx + bx.div_euclid(CHUNK_SIZE as i32);
@@ -144,127 +430,252 @@ fn is_solid_block<'a>(chunk: &'a Chunk, get_neighbor: &impl Fn(i32, i32) -> Opti
             Block::air()
         }
     };
-    !block.is_air() && !block.id.is_transparent()
+    if block.is_air() {
+        return false;
+    }
+    if block.id.is_solid() {
+        return true;
+    }
+    // Full-cube transparent blocks (glass, leaves, ice) still darken corners for AO.
+    // Exclude partial blocks (crossed, slab, stair) and fluids.
+    if block.id.is_crossed() || block.id.is_slab() || block.id.is_stair() {
+        return false;
+    }
+    match block.id {
+        BlockId::Water | BlockId::Lava => false,
+        _ => block.id.is_transparent(),
+    }
 }
 
-/// Apply per-vertex AO + per-vertex light to the last 4 vertices emitted by emit_quad_light.
-/// Uses the vertex world positions to compute corner AO and sample light at each corner.
+/// Apply per-vertex AO to the last 4 vertices emitted by emit_quad_light.
+/// Uses the vanilla Minecraft AO formula: if both side edges are solid → AO=0,
+/// otherwise AO = 3 - (side1 + side2 + corner). Each vertex also samples
+/// the light at its own corner position (per-vertex light).
 fn apply_vertex_lighting<'a>(
     verts: &mut Vec<MeshVertex>,
     chunk: &'a Chunk,
     get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
-    _face: BlockFace,
+    face: BlockFace,
     u_axis: usize,
     v_axis: usize,
+    emissive: u8,
 ) {
     let n = verts.len();
-    if n < 4 { return; }
+    if n < 4 {
+        return;
+    }
     let base = n - 4;
 
-    // AO check directions for each of the 4 vertices.
-    // For each vertex, two directions go "behind" the vertex along the face edges.
-    // du goes in u_axis direction, dv goes in v_axis direction.
-    // v0=origin, v1=+u, v2=+u+v, v3=+v
-    let ao_dirs: [[i32; 2]; 4] = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
-
     for i in 0..4 {
-        let pos = verts[base + i].pos;
-        let vx = pos[0].floor() as i32;
-        let vy = pos[1].floor() as i32;
-        let vz = pos[2].floor() as i32;
-
-        // Per-vertex light: sample at the vertex position
-        let lx = vx - chunk.cx * CHUNK_SIZE as i32;
-        let lz = vz - chunk.cz * CHUNK_SIZE as i32;
-        let base_light = get_light_data(chunk, get_neighbor, lx, vy, lz);
-
-        // AO: check 3 blocks at the vertex corner
-        let d = ao_dirs[i];
-        let mut off_a = [0i32; 3];
-        let mut off_b = [0i32; 3];
-        off_a[u_axis] = d[0];
-        off_b[v_axis] = d[1];
-
-        let ax = vx + off_a[0]; let ay = vy + off_a[1]; let az = vz + off_a[2];
-        let bx = vx + off_b[0]; let by = vy + off_b[1]; let bz = vz + off_b[2];
-        let cx = vx + off_a[0] + off_b[0]; let cy = vy + off_a[1] + off_b[1]; let cz = vz + off_a[2] + off_b[2];
-
-        let la = ax - chunk.cx * CHUNK_SIZE as i32; let lla = az - chunk.cz * CHUNK_SIZE as i32;
-        let lb = bx - chunk.cx * CHUNK_SIZE as i32; let llb = bz - chunk.cz * CHUNK_SIZE as i32;
-        let lc = cx - chunk.cx * CHUNK_SIZE as i32; let llc = cz - chunk.cz * CHUNK_SIZE as i32;
-
-        let s1 = is_solid_block(chunk, get_neighbor, la, ay, lla) as u32;
-        let s2 = is_solid_block(chunk, get_neighbor, lb, by, llb) as u32;
-        let s3 = is_solid_block(chunk, get_neighbor, lc, cy, llc) as u32;
-
-        let ao = match s1 + s2 + s3 {
-            0 => 15,
-            1 => 11,
-            2 => 6,
-            _ => 0,
-        };
-
-        // Pack: bits 0-3 = block_light, 4-7 = sky_light, 8-11 = ao
-        let sky = (base_light >> 4) & 0xF;
-        let block = base_light & 0xF;
-        verts[base + i].light_data = (ao << 8) | (sky << 4) | block;
+        verts[base + i].light_data = vertex_light_data(
+            chunk,
+            get_neighbor,
+            face,
+            u_axis,
+            v_axis,
+            emissive,
+            verts[base + i].pos,
+            i,
+        );
     }
 }
 
+fn vertex_light_data<'a>(
+    chunk: &'a Chunk,
+    get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
+    face: BlockFace,
+    u_axis: usize,
+    v_axis: usize,
+    emissive: u8,
+    pos: [f32; 3],
+    corner: usize,
+) -> u32 {
+    let vx = pos[0].floor() as i32;
+    let vy = pos[1].floor() as i32;
+    let vz = pos[2].floor() as i32;
+    let (sx, sy, sz) = match face {
+        BlockFace::Bottom => (vx, vy - 1, vz),
+        BlockFace::Left => (vx - 1, vy, vz),
+        BlockFace::Back => (vx, vy, vz - 1),
+        _ => (vx, vy, vz),
+    };
+    let ao_dirs: [[i32; 2]; 4] = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+    let d = ao_dirs[corner];
+
+    // Both light and AO sample the air plane immediately outside the face.
+    let mut base = [sx, sy, sz];
+    if d[0] > 0 {
+        base[u_axis] -= 1;
+    }
+    if d[1] > 0 {
+        base[v_axis] -= 1;
+    }
+
+    let mut off_a = [0i32; 3];
+    let mut off_b = [0i32; 3];
+    off_a[u_axis] = d[0];
+    off_b[v_axis] = d[1];
+
+    let solid = |offset: [i32; 3]| {
+        is_solid_block(
+            chunk,
+            get_neighbor,
+            base[0] + offset[0] - chunk.cx * CHUNK_SIZE as i32,
+            base[1] + offset[1],
+            base[2] + offset[2] - chunk.cz * CHUNK_SIZE as i32,
+        ) as u32
+    };
+    let s1 = solid(off_a);
+    let s2 = solid(off_b);
+    let s3 = solid([
+        off_a[0] + off_b[0],
+        off_a[1] + off_b[1],
+        off_a[2] + off_b[2],
+    ]);
+    let ao = if s1 == 1 && s2 == 1 {
+        0
+    } else {
+        3 - (s1 + s2 + s3)
+    };
+    let sample_light = |offset: [i32; 3]| {
+        get_light_data(
+            chunk,
+            get_neighbor,
+            base[0] + offset[0] - chunk.cx * CHUNK_SIZE as i32,
+            base[1] + offset[1],
+            base[2] + offset[2] - chunk.cz * CHUNK_SIZE as i32,
+        )
+    };
+    // Solid side cells store zero light. Preserve the brightest value in each
+    // channel so one solid cell cannot turn an otherwise exposed corner black.
+    let light_samples = [
+        sample_light([0, 0, 0]),
+        sample_light(off_a),
+        sample_light(off_b),
+        sample_light([
+            off_a[0] + off_b[0],
+            off_a[1] + off_b[1],
+            off_a[2] + off_b[2],
+        ]),
+    ];
+    let sky = light_samples
+        .iter()
+        .map(|light| (light >> 4) & 0xF)
+        .max()
+        .unwrap_or(0);
+    let block = light_samples
+        .iter()
+        .map(|light| light & 0xF)
+        .max()
+        .unwrap_or(0);
+    (emissive as u32) << 12 | (ao << 8) | (sky << 4) | block
+}
+
 /// Get packed light data at a world block position, reading from chunk or neighbor.
-fn get_light_data<'a>(chunk: &'a Chunk, get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>, bx: i32, by: i32, bz: i32) -> u32 {
-    if bx >= 0 && bx < CHUNK_SIZE as i32 && by >= 0 && by < CHUNK_HEIGHT as i32 && bz >= 0 && bz < CHUNK_SIZE as i32 {
+fn get_light_data<'a>(
+    chunk: &'a Chunk,
+    get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
+    bx: i32,
+    by: i32,
+    bz: i32,
+) -> u32 {
+    if bx >= 0
+        && bx < CHUNK_SIZE as i32
+        && by >= 0
+        && by < CHUNK_HEIGHT as i32
+        && bz >= 0
+        && bz < CHUNK_SIZE as i32
+    {
         let (sky, block) = chunk.get_light_at(bx, by, bz);
         Chunk::pack_light(sky, block)
     } else {
+        if by < 0 {
+            return Chunk::pack_light(0, 0);
+        }
+        if by >= CHUNK_HEIGHT as i32 {
+            return Chunk::pack_light(15, 0);
+        }
         let cx = chunk.cx + bx.div_euclid(CHUNK_SIZE as i32);
         let cz = chunk.cz + bz.div_euclid(CHUNK_SIZE as i32);
         let lx = bx.rem_euclid(CHUNK_SIZE as i32);
         let lz = bz.rem_euclid(CHUNK_SIZE as i32);
-        if by >= 0 && by < CHUNK_HEIGHT as i32 {
-            match get_neighbor(cx, cz) {
-                Some(nc) => {
-                    let (sky, block) = nc.get_light_at(lx, by, lz);
-                    Chunk::pack_light(sky, block)
-                }
-                None => Chunk::pack_light(15, 0),
+        match get_neighbor(cx, cz) {
+            Some(nc) => {
+                let (sky, block) = nc.get_light_at(lx, by, lz);
+                Chunk::pack_light(sky, block)
             }
-        } else {
-            Chunk::pack_light(15, 0)
+            // Missing horizontal neighbors are rendered as open air, so their
+            // light fallback must match instead of producing black frontier faces.
+            None => Chunk::pack_light(15, 0),
         }
     }
 }
 
 /// Get light at the neighbor position adjacent to a face.
-fn get_face_center_light<'a>(chunk: &'a Chunk, get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
-    face: BlockFace, bx: i32, by: i32, bz: i32, rect_w: i32, rect_h: i32) -> u32 {
-    let half_w = rect_w as f32 / 2.0;
-    let half_h = rect_h as f32 / 2.0;
-    let (cx, cy, cz) = match face {
-        BlockFace::Top => (bx as f32 + half_w, (by + 1) as f32, bz as f32 + half_h),
-        BlockFace::Bottom => (bx as f32 + half_w, (by - 1) as f32, bz as f32 + half_h),
-        BlockFace::Left => ((bx - 1) as f32, by as f32 + half_h, bz as f32 + half_w),
-        BlockFace::Right => ((bx + 1) as f32, by as f32 + half_h, bz as f32 + half_w),
-        BlockFace::Front => (bx as f32 + half_w, by as f32 + half_h, (bz + 1) as f32),
-        BlockFace::Back => (bx as f32 + half_w, by as f32 + half_h, (bz - 1) as f32),
+fn face_light_signature<'a>(
+    chunk: &'a Chunk,
+    get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
+    face: BlockFace,
+    bx: i32,
+    by: i32,
+    bz: i32,
+) -> [u32; 4] {
+    let (x, y, z, u_axis, v_axis) = match face {
+        BlockFace::Top => (bx as f32, by as f32 + 1.0, bz as f32, 0, 2),
+        BlockFace::Bottom => (bx as f32, by as f32, bz as f32, 0, 2),
+        BlockFace::Left => (bx as f32, by as f32, bz as f32, 2, 1),
+        BlockFace::Right => (bx as f32 + 1.0, by as f32, bz as f32, 2, 1),
+        BlockFace::Front => (bx as f32, by as f32, bz as f32 + 1.0, 0, 1),
+        BlockFace::Back => (bx as f32, by as f32, bz as f32, 0, 1),
     };
-    let lx = cx.floor() as i32;
-    let ly = cy.floor() as i32;
-    let lz = cz.floor() as i32;
-    get_light_data(chunk, get_neighbor, lx, ly, lz)
+    let mut corners = [[x, y, z]; 4];
+    corners[1][u_axis] += 1.0;
+    corners[2][u_axis] += 1.0;
+    corners[2][v_axis] += 1.0;
+    corners[3][v_axis] += 1.0;
+    let emissive = chunk.get_block(bx as usize, by as usize, bz as usize).id.light_level();
+    [
+        vertex_light_data(chunk, get_neighbor, face, u_axis, v_axis, emissive, [
+            corners[0][0] + chunk.cx as f32 * CHUNK_SIZE as f32,
+            corners[0][1],
+            corners[0][2] + chunk.cz as f32 * CHUNK_SIZE as f32,
+        ], 0),
+        vertex_light_data(chunk, get_neighbor, face, u_axis, v_axis, emissive, [
+            corners[1][0] + chunk.cx as f32 * CHUNK_SIZE as f32,
+            corners[1][1],
+            corners[1][2] + chunk.cz as f32 * CHUNK_SIZE as f32,
+        ], 1),
+        vertex_light_data(chunk, get_neighbor, face, u_axis, v_axis, emissive, [
+            corners[2][0] + chunk.cx as f32 * CHUNK_SIZE as f32,
+            corners[2][1],
+            corners[2][2] + chunk.cz as f32 * CHUNK_SIZE as f32,
+        ], 2),
+        vertex_light_data(chunk, get_neighbor, face, u_axis, v_axis, emissive, [
+            corners[3][0] + chunk.cx as f32 * CHUNK_SIZE as f32,
+            corners[3][1],
+            corners[3][2] + chunk.cz as f32 * CHUNK_SIZE as f32,
+        ], 3),
+    ]
 }
 
 pub fn build_chunk_mesh<'a>(
     chunk: &'a Chunk,
     get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
 ) -> ChunkMesh {
-    let mut vertices = Vec::with_capacity(16384);
-    let mut indices = Vec::with_capacity(32768);
-    let mut transparent_vertices = Vec::with_capacity(4096);
-    let mut transparent_indices = Vec::with_capacity(8192);
+    // Avoid retaining megabytes of mostly-unused capacity for every loaded chunk.
+    let mut vertices = Vec::with_capacity(1024);
+    let mut indices = Vec::with_capacity(1536);
+    let mut transparent_vertices = Vec::with_capacity(256);
+    let mut transparent_indices = Vec::with_capacity(384);
 
     let get_block_fn = |x: i32, y: i32, z: i32| -> Block {
-        if x >= 0 && x < CHUNK_SIZE as i32 && y >= 0 && y < CHUNK_HEIGHT as i32 && z >= 0 && z < CHUNK_SIZE as i32 {
+        if x >= 0
+            && x < CHUNK_SIZE as i32
+            && y >= 0
+            && y < CHUNK_HEIGHT as i32
+            && z >= 0
+            && z < CHUNK_SIZE as i32
+        {
             chunk.get_block(x as usize, y as usize, z as usize)
         } else {
             let cx = chunk.cx + x.div_euclid(CHUNK_SIZE as i32);
@@ -282,21 +693,52 @@ pub fn build_chunk_mesh<'a>(
         }
     };
 
+    let wox = chunk.cx as f32 * CHUNK_SIZE as f32;
+    let woz = chunk.cz as f32 * CHUNK_SIZE as f32;
+
+    let max_mask_size = (CHUNK_SIZE as i32 * CHUNK_HEIGHT as i32) as usize;
+    let mut mask: Vec<u64> = Vec::with_capacity((max_mask_size + 63) / 64);
+    let mut processed: Vec<u64> = Vec::with_capacity((max_mask_size + 63) / 64);
+
     for &face in &FACES {
         let (_u_axis, _v_axis, _w_axis, w_start, w_end, w_step, u_size, v_size) = match face {
-            BlockFace::Top | BlockFace::Bottom => {
-                (0, 2, 1, 0, CHUNK_HEIGHT as i32, 1, CHUNK_SIZE as i32, CHUNK_SIZE as i32)
-            }
-            BlockFace::Left | BlockFace::Right => {
-                (2, 1, 0, 0, CHUNK_SIZE as i32, 1, CHUNK_SIZE as i32, CHUNK_HEIGHT as i32)
-            }
-            BlockFace::Front | BlockFace::Back => {
-                (0, 1, 2, 0, CHUNK_SIZE as i32, 1, CHUNK_SIZE as i32, CHUNK_HEIGHT as i32)
-            }
+            BlockFace::Top | BlockFace::Bottom => (
+                0,
+                2,
+                1,
+                0,
+                CHUNK_HEIGHT as i32,
+                1,
+                CHUNK_SIZE as i32,
+                CHUNK_SIZE as i32,
+            ),
+            BlockFace::Left | BlockFace::Right => (
+                2,
+                1,
+                0,
+                0,
+                CHUNK_SIZE as i32,
+                1,
+                CHUNK_SIZE as i32,
+                CHUNK_HEIGHT as i32,
+            ),
+            BlockFace::Front | BlockFace::Back => (
+                0,
+                1,
+                2,
+                0,
+                CHUNK_SIZE as i32,
+                1,
+                CHUNK_SIZE as i32,
+                CHUNK_HEIGHT as i32,
+            ),
         };
 
         for w in (w_start..w_end).step_by(w_step as usize) {
-            let mut mask: Vec<bool> = vec![false; (u_size * v_size) as usize];
+            let size = (u_size * v_size) as usize;
+            let u64_len = (size + 63) / 64;
+            mask.clear();
+            mask.resize(u64_len, 0);
 
             for u in 0..u_size {
                 for v in 0..v_size {
@@ -310,36 +752,51 @@ pub fn build_chunk_mesh<'a>(
                     };
 
                     let block = get_block_fn(bx, by, bz);
-                    if block.is_air() || block.id.is_crossed() || block.id.is_stair() {
+                    if block.is_air()
+                        || block.id.is_crossed()
+                        || matches!(block.id, BlockId::Water | BlockId::Lava)
+                        || block.id.is_stair()
+                        || block.id.is_slab()
+                        || model_assets().is_some_and(|assets| assets.has_model(block.id))
+                    {
                         continue;
                     }
 
                     let neighbor = get_block_fn(nx, ny, nz);
                     if can_see_face(block, neighbor) {
-                        mask[(v * u_size + u) as usize] = true;
+                        let mi = (v * u_size + u) as usize;
+                        mask[mi >> 6] |= 1u64 << (mi & 63);
                     }
                 }
             }
 
-            if !mask.iter().any(|&m| m) {
+            if !mask.iter().any(|&m| m != 0) {
                 continue;
             }
 
-            let mut processed: Vec<bool> = vec![false; (u_size * v_size) as usize];
+            processed.clear();
+            processed.resize(u64_len, 0);
 
-            let same_block = |ux: i32, vy: i32, start_id: BlockId| -> bool {
+            let same_block = |ux: i32,
+                              vy: i32,
+                              start_id: BlockId,
+                              start_state: u16,
+                              start_data: u8| -> bool {
                 let (cbx, cby, cbz) = match face {
                     BlockFace::Top | BlockFace::Bottom => (ux, w, vy),
                     BlockFace::Left | BlockFace::Right => (w, vy, ux),
                     BlockFace::Front | BlockFace::Back => (ux, vy, w),
                 };
-                get_block_fn(cbx, cby, cbz).id == start_id
+                let b = get_block_fn(cbx, cby, cbz);
+                b.id == start_id && b.state == start_state && b.data == start_data
             };
 
             for y in 0..v_size {
                 for x in 0..u_size {
                     let idx = (y * u_size + x) as usize;
-                    if !mask[idx] || processed[idx] {
+                    if (mask[idx >> 6] >> (idx & 63)) & 1 == 0
+                        || (processed[idx >> 6] >> (idx & 63)) & 1 != 0
+                    {
                         continue;
                     }
 
@@ -348,14 +805,38 @@ pub fn build_chunk_mesh<'a>(
                         BlockFace::Left | BlockFace::Right => (w, y as i32, x as i32),
                         BlockFace::Front | BlockFace::Back => (x as i32, y as i32, w),
                     };
-                    let start_id = get_block_fn(sbx, sby, sbz).id;
+                    let start_block = get_block_fn(sbx, sby, sbz);
+                    let start_id = start_block.id;
+                    let start_state = start_block.state;
+                    let start_data = start_block.data;
+                    let start_light =
+                        face_light_signature(chunk, get_neighbor, face, sbx, sby, sbz);
 
                     let mut rect_w = 1;
-                    while x + rect_w < u_size
-                        && mask[(y * u_size + x + rect_w) as usize]
-                        && !processed[(y * u_size + x + rect_w) as usize]
-                        && same_block(x as i32 + rect_w, y as i32, start_id)
-                    {
+                    while x + rect_w < u_size {
+                        let ri = (y * u_size + x + rect_w) as usize;
+                        if (mask[ri >> 6] >> (ri & 63)) & 1 == 0
+                            || (processed[ri >> 6] >> (ri & 63)) & 1 != 0
+                            || !same_block(
+                                x as i32 + rect_w,
+                                y as i32,
+                                start_id,
+                                start_state,
+                                start_data,
+                            )
+                        {
+                            break;
+                        }
+                        let (cbx, cby, cbz) = match face {
+                            BlockFace::Top | BlockFace::Bottom => (x as i32 + rect_w, w, y as i32),
+                            BlockFace::Left | BlockFace::Right => (w, y as i32, x as i32 + rect_w),
+                            BlockFace::Front | BlockFace::Back => (x as i32 + rect_w, y as i32, w),
+                        };
+                        if face_light_signature(chunk, get_neighbor, face, cbx, cby, cbz)
+                            != start_light
+                        {
+                            break;
+                        }
                         rect_w += 1;
                     }
 
@@ -363,7 +844,26 @@ pub fn build_chunk_mesh<'a>(
                     'outer: while y + rect_h < v_size {
                         for cx in x..x + rect_w {
                             let ci = ((y + rect_h) * u_size + cx) as usize;
-                            if !mask[ci] || processed[ci] || !same_block(cx as i32, y as i32 + rect_h, start_id) {
+                            if (mask[ci >> 6] >> (ci & 63)) & 1 == 0
+                                || (processed[ci >> 6] >> (ci & 63)) & 1 != 0
+                                || !same_block(
+                                    cx as i32,
+                                    y as i32 + rect_h,
+                                    start_id,
+                                    start_state,
+                                    start_data,
+                                )
+                            {
+                                break 'outer;
+                            }
+                            let (cbx, cby, cbz) = match face {
+                                BlockFace::Top | BlockFace::Bottom => (cx as i32, w, y as i32 + rect_h),
+                                BlockFace::Left | BlockFace::Right => (w, y as i32 + rect_h, cx as i32),
+                                BlockFace::Front | BlockFace::Back => (cx as i32, y as i32 + rect_h, w),
+                            };
+                            if face_light_signature(chunk, get_neighbor, face, cbx, cby, cbz)
+                                != start_light
+                            {
                                 break 'outer;
                             }
                         }
@@ -373,7 +873,7 @@ pub fn build_chunk_mesh<'a>(
                     for dy in 0..rect_h {
                         for dx in 0..rect_w {
                             let pi = ((y + dy) * u_size + (x + dx)) as usize;
-                            processed[pi] = true;
+                            processed[pi >> 6] |= 1u64 << (pi & 63);
                         }
                     }
 
@@ -388,117 +888,211 @@ pub fn build_chunk_mesh<'a>(
                     let block = get_block_fn(bx, by, bz);
                     let face_tex = get_texture_index(block, face);
 
-                    let is_transp = is_transparent(block);
+                    let is_transp = uses_translucent_blend(block);
 
-                    let verts = if is_transp { &mut transparent_vertices } else { &mut vertices };
-                    let inds = if is_transp { &mut transparent_indices } else { &mut indices };
+                    let verts = if is_transp {
+                        &mut transparent_vertices
+                    } else {
+                        &mut vertices
+                    };
+                    let inds = if is_transp {
+                        &mut transparent_indices
+                    } else {
+                        &mut indices
+                    };
 
                     let (fx, fy, fz) = match face {
-                        BlockFace::Top    => (bx as f32, by as f32 + 1.0, bz as f32),
+                        BlockFace::Top => (bx as f32, by as f32 + 1.0, bz as f32),
                         BlockFace::Bottom => (bx as f32, by as f32, bz as f32),
-                        BlockFace::Left   => (bx as f32, by as f32, bz as f32),
-                        BlockFace::Right  => (bx as f32 + 1.0, by as f32, bz as f32),
-                        BlockFace::Front  => (bx as f32, by as f32, bz as f32 + 1.0),
-                        BlockFace::Back   => (bx as f32, by as f32, bz as f32),
+                        BlockFace::Left => (bx as f32, by as f32, bz as f32),
+                        BlockFace::Right => (bx as f32 + 1.0, by as f32, bz as f32),
+                        BlockFace::Front => (bx as f32, by as f32, bz as f32 + 1.0),
+                        BlockFace::Back => (bx as f32, by as f32, bz as f32),
                     };
-                    let wox = chunk.cx as f32 * CHUNK_SIZE as f32;
-                    let woz = chunk.cz as f32 * CHUNK_SIZE as f32;
                     let (u_axis, v_axis) = match face {
                         BlockFace::Top | BlockFace::Bottom => (0usize, 2usize),
                         BlockFace::Left | BlockFace::Right => (2usize, 1usize),
                         BlockFace::Front | BlockFace::Back => (0usize, 1usize),
                     };
-                    let light = get_face_center_light(chunk, get_neighbor, face, bx, by, bz, rect_w, rect_h);
                     emit_quad_light(
-                        verts, inds, face,
-                        wox + fx, fy, woz + fz,
-                        rect_w as f32, rect_h as f32,
+                        verts,
+                        inds,
+                        face,
+                        wox + fx,
+                        fy,
+                        woz + fz,
+                        rect_w as f32,
+                        rect_h as f32,
                         face_tex,
-                        u_axis, v_axis,
-                        light,
+                        u_axis,
+                        v_axis,
                     );
-                    apply_vertex_lighting(verts, chunk, get_neighbor, face, u_axis, v_axis);
+                    apply_vertex_lighting(
+                        verts,
+                        chunk,
+                        get_neighbor,
+                        face,
+                        u_axis,
+                        v_axis,
+                        block.id.light_level(),
+                    );
                 }
             }
         }
     }
 
-    let wox = chunk.cx as f32 * CHUNK_SIZE as f32;
-    let woz = chunk.cz as f32 * CHUNK_SIZE as f32;
     for x in 0..CHUNK_SIZE {
         for z in 0..CHUNK_SIZE {
             for y in 0..CHUNK_HEIGHT {
                 let block = chunk.get_block(x, y, z);
-                if block.id.is_crossed() {
+                if emit_fluid(
+                    chunk,
+                    get_neighbor,
+                    &get_block_fn,
+                    block,
+                    (x as i32, y as i32, z as i32),
+                    &mut transparent_vertices,
+                    &mut transparent_indices,
+                ) {
+                    continue;
+                } else if emit_resolved_models(
+                    chunk,
+                    get_neighbor,
+                    block,
+                    (x as i32, y as i32, z as i32),
+                    &mut vertices,
+                    &mut indices,
+                    &mut transparent_vertices,
+                    &mut transparent_indices,
+                ) {
+                    continue;
+                } else if block.id.is_crossed() {
                     let tex = get_crossed_texture(block);
                     let light = get_light_data(chunk, get_neighbor, x as i32, y as i32, z as i32);
+                    let emissive = block.id.light_level();
                     emit_crossed_quad_light(
-                        &mut transparent_vertices, &mut transparent_indices,
-                        wox + x as f32, y as f32 + 0.5, woz + z as f32,
-                        tex, light,
+                        &mut vertices,
+                        &mut indices,
+                        wox + x as f32 + 0.5,
+                        y as f32 + 0.5,
+                        woz + z as f32 + 0.5,
+                        tex,
+                        light,
+                        emissive,
+                        chunk,
+                        get_neighbor,
+                        x as i32,
+                        y as i32,
+                        z as i32,
                     );
-                }
-            }
-        }
-    }
-
-    for x in 0..CHUNK_SIZE {
-        for z in 0..CHUNK_SIZE {
-            for y in 0..CHUNK_HEIGHT {
-                let block = chunk.get_block(x, y, z);
-                if !block.id.is_slab() { continue; }
-                let is_top = block.data == 1;
-                let tex = get_texture_index(block, BlockFace::Top);
-                let wx = wox + x as f32;
-                let wz = woz + z as f32;
-                let (y0, y1) = if is_top { (y as f32 + 0.5, y as f32 + 1.0) } else { (y as f32, y as f32 + 0.5) };
-
-                let slab_top_light = get_light_data(chunk, get_neighbor, x as i32, y as i32 + 1, z as i32);
-                let slab_bot_light = get_light_data(chunk, get_neighbor, x as i32, y as i32 - 1, z as i32);
-
-                if y + 1 >= CHUNK_HEIGHT || chunk.get_block(x, y + 1, z).is_air() || chunk.get_block(x, y + 1, z).id.is_transparent() {
-                    emit_quad_light(&mut vertices, &mut indices, BlockFace::Top, wx, y1, wz, 1.0, 1.0, tex, 0, 2, slab_top_light);
-                    apply_vertex_lighting(&mut vertices, chunk, get_neighbor, BlockFace::Top, 0, 2);
-                }
-                if y == 0 || chunk.get_block(x, y - 1, z).is_air() || chunk.get_block(x, y - 1, z).id.is_transparent() {
-                    emit_quad_light(&mut vertices, &mut indices, BlockFace::Bottom, wx, y0, wz, 1.0, 1.0, tex, 0, 2, slab_bot_light);
-                    apply_vertex_lighting(&mut vertices, chunk, get_neighbor, BlockFace::Bottom, 0, 2);
-                }
-                let side_checks: &[(i32,i32,BlockFace,i32,i32)] = &[(1,0,BlockFace::Right,2,1), (-1,0,BlockFace::Left,2,1), (0,1,BlockFace::Front,0,1), (0,-1,BlockFace::Back,0,1)];
-                for &(dx, dz, sface, u_ax, v_ax) in side_checks {
-                    let nx = x as i32 + dx;
-                    let nz = z as i32 + dz;
-                    let neighbor_air = if nx < 0 || nx >= CHUNK_SIZE as i32 || nz < 0 || nz >= CHUNK_SIZE as i32 {
-                        true
+                } else if block.id.is_slab() {
+                    let is_top = block.data == 1;
+                    let tex = get_texture_index(block, BlockFace::Top);
+                    let wx = wox + x as f32;
+                    let wz = woz + z as f32;
+                    let (y0, y1) = if is_top {
+                        (y as f32 + 0.5, y as f32 + 1.0)
                     } else {
-                        chunk.get_block(nx as usize, y, nz as usize).is_air()
-                            || chunk.get_block(nx as usize, y, nz as usize).id.is_transparent()
+                        (y as f32, y as f32 + 0.5)
                     };
-                    if neighbor_air {
-                        let side_tex = get_texture_index(block, sface);
-                        let (sx, sy, sz) = match sface {
-                            BlockFace::Right => (wx + 1.0, y0, wz),
-                            BlockFace::Left => (wx, y0, wz),
-                            BlockFace::Front => (wx, y0, wz + 1.0),
-                            BlockFace::Back => (wx, y0, wz),
-                            _ => (wx, y0, wz),
-                        };
-                        let slab_side_light = get_light_data(chunk, get_neighbor, x as i32 + dx, y as i32, z as i32 + dz);
-                        emit_quad_light(&mut vertices, &mut indices, sface, sx, sy, sz, 1.0, 0.5, side_tex, u_ax as usize, v_ax as usize, slab_side_light);
-                        apply_vertex_lighting(&mut vertices, chunk, get_neighbor, sface, u_ax as usize, v_ax as usize);
+
+                    let slab_emissive = block.id.light_level();
+                    let above = get_block_fn(x as i32, y as i32 + 1, z as i32);
+                    if above.is_air() || above.id.is_transparent() {
+                        emit_quad_light(
+                            &mut vertices,
+                            &mut indices,
+                            BlockFace::Top,
+                            wx,
+                            y1,
+                            wz,
+                            1.0,
+                            1.0,
+                            tex,
+                            0,
+                            2,
+                        );
+                        apply_vertex_lighting(
+                            &mut vertices,
+                            chunk,
+                            get_neighbor,
+                            BlockFace::Top,
+                            0,
+                            2,
+                            slab_emissive,
+                        );
                     }
-                }
-            }
-        }
-    }
-
-    // Stair post-processing pass
-    for x in 0..CHUNK_SIZE {
-        for z in 0..CHUNK_SIZE {
-            for y in 0..CHUNK_HEIGHT {
-                let block = chunk.get_block(x, y, z);
-                if !block.id.is_stair() { continue; }
-
+                    let below = get_block_fn(x as i32, y as i32 - 1, z as i32);
+                    if below.is_air() || below.id.is_transparent() {
+                        emit_quad_light(
+                            &mut vertices,
+                            &mut indices,
+                            BlockFace::Bottom,
+                            wx,
+                            y0,
+                            wz,
+                            1.0,
+                            1.0,
+                            tex,
+                            0,
+                            2,
+                        );
+                        apply_vertex_lighting(
+                            &mut vertices,
+                            chunk,
+                            get_neighbor,
+                            BlockFace::Bottom,
+                            0,
+                            2,
+                            slab_emissive,
+                        );
+                    }
+                    let side_checks: &[(i32, i32, BlockFace, i32, i32)] = &[
+                        (1, 0, BlockFace::Right, 2, 1),
+                        (-1, 0, BlockFace::Left, 2, 1),
+                        (0, 1, BlockFace::Front, 0, 1),
+                        (0, -1, BlockFace::Back, 0, 1),
+                    ];
+                    for &(dx, dz, sface, u_ax, v_ax) in side_checks {
+                        let nx = x as i32 + dx;
+                        let nz = z as i32 + dz;
+                        let neighbor_block = get_block_fn(nx, y as i32, nz);
+                        let neighbor_air =
+                            neighbor_block.is_air() || neighbor_block.id.is_transparent();
+                        if neighbor_air {
+                            let side_tex = get_texture_index(block, sface);
+                            let (sx, sy, sz) = match sface {
+                                BlockFace::Right => (wx + 1.0, y0, wz),
+                                BlockFace::Left => (wx, y0, wz),
+                                BlockFace::Front => (wx, y0, wz + 1.0),
+                                BlockFace::Back => (wx, y0, wz),
+                                _ => (wx, y0, wz),
+                            };
+                            emit_quad_light(
+                                &mut vertices,
+                                &mut indices,
+                                sface,
+                                sx,
+                                sy,
+                                sz,
+                                1.0,
+                                0.5,
+                                side_tex,
+                                u_ax as usize,
+                                v_ax as usize,
+                            );
+                            apply_vertex_lighting(
+                                &mut vertices,
+                                chunk,
+                                get_neighbor,
+                                sface,
+                                u_ax as usize,
+                                v_ax as usize,
+                                slab_emissive,
+                            );
+                        }
+                    }
+                } else if block.id.is_stair() {
                 let facing = block.data & 0x03;
                 let is_top = (block.data & 0x04) != 0;
                 let tex = get_texture_index(block, BlockFace::Top);
@@ -511,10 +1105,10 @@ pub fn build_chunk_mesh<'a>(
                 // back_fx, back_fz = direction of the full-height back portion
                 // step_fx, step_fz = direction of the step front portion
                 let (back_fx, back_fz, step_fx, step_fz) = match facing {
-                    0 => (0, -1, 0, 1),  // South: back=North(-Z), step=South(+Z)
-                    1 => (-1, 0, 1, 0),  // West: back=East(+X), step=West(-X)
-                    2 => (0, 1, 0, -1),  // North: back=South(+Z), step=North(-Z)
-                    _ => (1, 0, -1, 0),  // East: back=West(-X), step=East(+X)
+                    0 => (0, -1, 0, 1), // South: back=North(-Z), step=South(+Z)
+                    1 => (-1, 0, 1, 0), // West: back=East(+X), step=West(-X)
+                    2 => (0, 1, 0, -1), // North: back=South(+Z), step=North(-Z)
+                    _ => (1, 0, -1, 0), // East: back=West(-X), step=East(+X)
                 };
 
                 // Stair structure:
@@ -525,31 +1119,35 @@ pub fn build_chunk_mesh<'a>(
 
                 // Helper to check if a neighboring block is air/transparent
                 let is_open = |nx: i32, ny: i32, nz: i32| -> bool {
-                    if nx < 0 || nx >= CHUNK_SIZE as i32 || nz < 0 || nz >= CHUNK_SIZE as i32 { return true; }
-                    if ny < 0 || ny >= CHUNK_HEIGHT as i32 { return true; }
-                    let b = chunk.get_block(nx as usize, ny as usize, nz as usize);
+                    let b = get_block_fn(nx, ny, nz);
                     b.is_air() || b.id.is_transparent()
                 };
 
                 // Helper to emit a face (u_axis, v_axis based on face)
-                let emit = |verts: &mut Vec<MeshVertex>, inds: &mut Vec<u32>,
-                           face: BlockFace, fx: f32, fy: f32, fz: f32, w: f32, h: f32, tex: u32| {
-                    let (lx, ly, lz) = match face {
-                        BlockFace::Top => (x as i32, y as i32 + 1, z as i32),
-                        BlockFace::Bottom => (x as i32, y as i32 - 1, z as i32),
-                        BlockFace::Left => (x as i32 - 1, y as i32, z as i32),
-                        BlockFace::Right => (x as i32 + 1, y as i32, z as i32),
-                        BlockFace::Front => (x as i32, y as i32, z as i32 + 1),
-                        BlockFace::Back => (x as i32, y as i32, z as i32 - 1),
-                    };
-                    let light = get_light_data(chunk, get_neighbor, lx, ly, lz);
+                let emit = |verts: &mut Vec<MeshVertex>,
+                            inds: &mut Vec<u32>,
+                            face: BlockFace,
+                            fx: f32,
+                            fy: f32,
+                            fz: f32,
+                            w: f32,
+                            h: f32,
+                            tex: u32| {
                     let (u_ax, v_ax) = match face {
                         BlockFace::Top | BlockFace::Bottom => (0usize, 2usize),
                         BlockFace::Left | BlockFace::Right => (2usize, 1usize),
                         BlockFace::Front | BlockFace::Back => (0usize, 1usize),
                     };
-                    emit_quad_light(verts, inds, face, fx, fy, fz, w, h, tex, u_ax, v_ax, light);
-                    apply_vertex_lighting(verts, chunk, get_neighbor, face, u_ax, v_ax);
+                    emit_quad_light(verts, inds, face, fx, fy, fz, w, h, tex, u_ax, v_ax);
+                    apply_vertex_lighting(
+                        verts,
+                        chunk,
+                        get_neighbor,
+                        face,
+                        u_ax,
+                        v_ax,
+                        block.id.light_level(),
+                    );
                 };
 
                 if !is_top {
@@ -560,103 +1158,186 @@ pub fn build_chunk_mesh<'a>(
                     // Bottom face: full (check block below)
                     if y == 0 || is_open(x as i32, y as i32 - 1, z as i32) {
                         let bot_tex = get_texture_index(block, BlockFace::Bottom);
-                        emit(&mut vertices, &mut indices, BlockFace::Bottom, wx, by, wz, 1.0, 1.0, bot_tex);
+                        emit(
+                            &mut vertices,
+                            &mut indices,
+                            BlockFace::Bottom,
+                            wx,
+                            by,
+                            wz,
+                            1.0,
+                            1.0,
+                            bot_tex,
+                        );
                     }
 
                     // Top face of back (full height) portion: at y+1, back half
                     if y + 1 >= CHUNK_HEIGHT || is_open(x as i32, y as i32 + 1, z as i32) {
                         let (top_x, top_z, top_w, top_h) = match facing {
-                            0 => (wx, wz, 1.0, 0.5),      // South: z..z+0.5
+                            0 => (wx, wz, 1.0, 0.5),       // South: z..z+0.5
                             2 => (wx, wz + 0.5, 1.0, 0.5), // North: z+0.5..z+1
-                            1 => (wx, wz, 0.5, 1.0),      // West: x..x+0.5
+                            1 => (wx, wz, 0.5, 1.0),       // West: x..x+0.5
                             _ => (wx + 0.5, wz, 0.5, 1.0), // East: x+0.5..x+1
                         };
-                        emit(&mut vertices, &mut indices, BlockFace::Top, top_x, by + 1.0, top_z, top_w, top_h, tex);
+                        emit(
+                            &mut vertices,
+                            &mut indices,
+                            BlockFace::Top,
+                            top_x,
+                            by + 1.0,
+                            top_z,
+                            top_w,
+                            top_h,
+                            tex,
+                        );
                     }
 
                     // Step top: at y+0.5, front half
                     let (step_x, step_z, step_w, step_h) = match facing {
-                        0 => (wx, wz + 0.5, 1.0, 0.5),      // South: z+0.5..z+1
-                        2 => (wx, wz, 1.0, 0.5),            // North: z..z+0.5
-                        1 => (wx + 0.5, wz, 0.5, 1.0),      // West: x+0.5..x+1
-                        _ => (wx, wz, 0.5, 1.0),            // East: x..x+0.5
+                        0 => (wx, wz + 0.5, 1.0, 0.5), // South: z+0.5..z+1
+                        2 => (wx, wz, 1.0, 0.5),       // North: z..z+0.5
+                        1 => (wx + 0.5, wz, 0.5, 1.0), // West: x+0.5..x+1
+                        _ => (wx, wz, 0.5, 1.0),       // East: x..x+0.5
                     };
                     // Only emit step top if the block above at the front half is open
-                    let step_cx = (x as i32 + step_fx).max(0).min(CHUNK_SIZE as i32 - 1);
-                    let step_cz = (z as i32 + step_fz).max(0).min(CHUNK_SIZE as i32 - 1);
-                    let above = chunk.get_block(step_cx as usize, y + 1, step_cz as usize);
-                    if y + 1 >= CHUNK_HEIGHT || above.is_air() || above.id.is_transparent() || above.id.is_stair() {
+                    let above = get_block_fn(x as i32 + step_fx, y as i32 + 1, z as i32 + step_fz);
+                    if above.is_air() || above.id.is_transparent() || above.id.is_stair() {
                         let step_tex = get_texture_index(block, BlockFace::Top);
-                        emit(&mut vertices, &mut indices, BlockFace::Top, step_x, by + 0.5, step_z, step_w, step_h, step_tex);
+                        emit(
+                            &mut vertices,
+                            &mut indices,
+                            BlockFace::Top,
+                            step_x,
+                            by + 0.5,
+                            step_z,
+                            step_w,
+                            step_h,
+                            step_tex,
+                        );
                     }
 
                     // Back face: full height, at the back edge (opposite the facing direction)
                     let (back_face, back_ox, back_oz) = match facing {
-                        0 => (BlockFace::Back,  wx,        wz),  // South: back at z (north)
-                        2 => (BlockFace::Front, wx,        wz + 1.0),  // North: back at z+1 (south)
-                        1 => (BlockFace::Right, wx + 1.0,  wz),  // West: back at x+1 (east)
-                        _ => (BlockFace::Left,  wx,        wz),  // East: back at x (west)
+                        0 => (BlockFace::Back, wx, wz),        // South: back at z (north)
+                        2 => (BlockFace::Front, wx, wz + 1.0), // North: back at z+1 (south)
+                        1 => (BlockFace::Right, wx + 1.0, wz), // West: back at x+1 (east)
+                        _ => (BlockFace::Left, wx, wz),        // East: back at x (west)
                     };
                     let back_side = x as i32 + back_fx;
                     let back_sz = z as i32 + back_fz;
                     if is_open(back_side, y as i32, back_sz) {
                         let back_tex = match back_face {
-                            BlockFace::Back | BlockFace::Front => get_texture_index(block, BlockFace::Front),
-                            BlockFace::Left | BlockFace::Right => get_texture_index(block, BlockFace::Left),
+                            BlockFace::Back | BlockFace::Front => {
+                                get_texture_index(block, BlockFace::Front)
+                            }
+                            BlockFace::Left | BlockFace::Right => {
+                                get_texture_index(block, BlockFace::Left)
+                            }
                             _ => tex,
                         };
-                        emit(&mut vertices, &mut indices, back_face, back_ox, by, back_oz, 1.0, 1.0, back_tex);
+                        emit(
+                            &mut vertices,
+                            &mut indices,
+                            back_face,
+                            back_ox,
+                            by,
+                            back_oz,
+                            1.0,
+                            1.0,
+                            back_tex,
+                        );
                     }
 
                     // Front (step) face: half height, at the front edge
                     let (front_face, front_ox, front_oz) = match facing {
-                        0 => (BlockFace::Front, wx,        wz + 1.0),  // South: front at z+1
-                        2 => (BlockFace::Back,  wx,        wz),        // North: front at z
-                        1 => (BlockFace::Left,  wx,        wz),        // West: front at x
-                        _ => (BlockFace::Right, wx + 1.0,  wz),        // East: front at x+1
+                        0 => (BlockFace::Front, wx, wz + 1.0), // South: front at z+1
+                        2 => (BlockFace::Back, wx, wz),        // North: front at z
+                        1 => (BlockFace::Left, wx, wz),        // West: front at x
+                        _ => (BlockFace::Right, wx + 1.0, wz), // East: front at x+1
                     };
                     let front_side = x as i32 + step_fx;
                     let front_sz = z as i32 + step_fz;
                     if is_open(front_side, y as i32, front_sz) {
                         let front_tex = match front_face {
-                            BlockFace::Front | BlockFace::Back => get_texture_index(block, BlockFace::Front),
-                            BlockFace::Left | BlockFace::Right => get_texture_index(block, BlockFace::Left),
+                            BlockFace::Front | BlockFace::Back => {
+                                get_texture_index(block, BlockFace::Front)
+                            }
+                            BlockFace::Left | BlockFace::Right => {
+                                get_texture_index(block, BlockFace::Left)
+                            }
                             _ => tex,
                         };
-                        emit(&mut vertices, &mut indices, front_face, front_ox, by, front_oz, 1.0, 0.5, front_tex);
+                        emit(
+                            &mut vertices,
+                            &mut indices,
+                            front_face,
+                            front_ox,
+                            by,
+                            front_oz,
+                            1.0,
+                            0.5,
+                            front_tex,
+                        );
                     }
 
-                    // Left/Right sides: each has 2 quads (bottom half full depth, top half back depth)
-                    let side_pairs: &[(i32, i32, BlockFace, BlockFace)] = &[
-                        (0, -1, BlockFace::Left, BlockFace::Right),  // Left face (-X)
-                        (0, 1, BlockFace::Right, BlockFace::Left),   // Right face (+X) -- swapped for axis alignment
-                    ];
+                    // Side faces lie on X for north/south stairs and on Z for
+                    // east/west stairs. Their neighbor checks must use the same axis.
+                    let side_pairs: &[(i32, i32, BlockFace)] = match facing {
+                        0 | 2 => &[(-1, 0, BlockFace::Left), (1, 0, BlockFace::Right)],
+                        _ => &[(0, -1, BlockFace::Back), (0, 1, BlockFace::Front)],
+                    };
 
-                    for &(sdx, sdz, side_face, opp_face) in side_pairs {
+                    for &(sdx, sdz, side_face) in side_pairs {
                         let sx = x as i32 + sdx;
                         let sz = z as i32 + sdz;
                         if is_open(sx, y as i32, sz) {
-                            let side_tex = get_texture_index(block, opp_face);
+                            let side_tex = get_texture_index(block, side_face);
                             // Bottom half of side: full depth, half height
                             let (sx_pos, sy_pos, sz_pos) = match side_face {
                                 BlockFace::Left => (wx, by, wz),
                                 BlockFace::Right => (wx + 1.0, by, wz),
+                                BlockFace::Back => (wx, by, wz),
+                                BlockFace::Front => (wx, by, wz + 1.0),
                                 _ => unreachable!(),
                             };
-                            emit(&mut vertices, &mut indices, side_face, sx_pos, sy_pos, sz_pos, 1.0, 0.5, side_tex);
+                            emit(
+                                &mut vertices,
+                                &mut indices,
+                                side_face,
+                                sx_pos,
+                                sy_pos,
+                                sz_pos,
+                                1.0,
+                                0.5,
+                                side_tex,
+                            );
                             // Top half of side: only back half depth
                             let (back_depth_w, back_depth_h, back_ox_s, back_oz_s) = match facing {
-                                0 => (0.5, 0.5, 0.0, 0.0),    // South: back half in z [z..z+0.5]
-                                2 => (0.5, 0.5, 0.0, 0.5),    // North: back half in z [z+0.5..z+1]
-                                1 => (0.5, 0.5, 0.0, 0.0),    // West: back half in x [x..x+0.5]
-                                _ => (0.5, 0.5, 0.5, 0.0),    // East: back half in x [x+0.5..x+1]
+                                0 => (0.5, 0.5, 0.0, 0.0), // South: back half in z [z..z+0.5]
+                                2 => (0.5, 0.5, 0.0, 0.5), // North: back half in z [z+0.5..z+1]
+                                1 => (0.5, 0.5, 0.0, 0.0), // West: back half in x [x..x+0.5]
+                                _ => (0.5, 0.5, 0.5, 0.0), // East: back half in x [x+0.5..x+1]
                             };
                             let (sx2, sy2, sz2) = match side_face {
                                 BlockFace::Left => (wx + back_ox_s, by + 0.5, wz + back_oz_s),
-                                BlockFace::Right => (wx + 1.0 + back_ox_s, by + 0.5, wz + back_oz_s),
+                                BlockFace::Right => {
+                                    (wx + 1.0 + back_ox_s, by + 0.5, wz + back_oz_s)
+                                }
+                                BlockFace::Back => (wx + back_ox_s, by + 0.5, wz),
+                                BlockFace::Front => (wx + back_ox_s, by + 0.5, wz + 1.0),
                                 _ => unreachable!(),
                             };
-                            emit(&mut vertices, &mut indices, side_face, sx2, sy2, sz2, back_depth_w, back_depth_h, side_tex);
+                            emit(
+                                &mut vertices,
+                                &mut indices,
+                                side_face,
+                                sx2,
+                                sy2,
+                                sz2,
+                                back_depth_w,
+                                back_depth_h,
+                                side_tex,
+                            );
                         }
                     }
                 } else {
@@ -667,7 +1348,17 @@ pub fn build_chunk_mesh<'a>(
                     // Top face: full (check block above)
                     if y + 1 >= CHUNK_HEIGHT || is_open(x as i32, y as i32 + 1, z as i32) {
                         let top_tex = get_texture_index(block, BlockFace::Top);
-                        emit(&mut vertices, &mut indices, BlockFace::Top, wx, by + 1.0, wz, 1.0, 1.0, top_tex);
+                        emit(
+                            &mut vertices,
+                            &mut indices,
+                            BlockFace::Top,
+                            wx,
+                            by + 1.0,
+                            wz,
+                            1.0,
+                            1.0,
+                            top_tex,
+                        );
                     }
 
                     // Bottom face: only back half (at y)
@@ -679,7 +1370,17 @@ pub fn build_chunk_mesh<'a>(
                     };
                     if y == 0 || is_open(x as i32, y as i32 - 1, z as i32) {
                         let bot_tex = get_texture_index(block, BlockFace::Bottom);
-                        emit(&mut vertices, &mut indices, BlockFace::Bottom, bot_x, by, bot_z, bot_w, bot_h, bot_tex);
+                        emit(
+                            &mut vertices,
+                            &mut indices,
+                            BlockFace::Bottom,
+                            bot_x,
+                            by,
+                            bot_z,
+                            bot_w,
+                            bot_h,
+                            bot_tex,
+                        );
                     }
 
                     // Step ceiling (bottom of the upper full slab visible from below): at y+0.5, front half
@@ -691,57 +1392,95 @@ pub fn build_chunk_mesh<'a>(
                     };
                     if y == 0 || is_open(x as i32, y as i32 - 1, z as i32) {
                         let ceil_tex = get_texture_index(block, BlockFace::Bottom);
-                        emit(&mut vertices, &mut indices, BlockFace::Bottom, ceil_x, by + 0.5, ceil_z, ceil_w, ceil_h, ceil_tex);
+                        emit(
+                            &mut vertices,
+                            &mut indices,
+                            BlockFace::Bottom,
+                            ceil_x,
+                            by + 0.5,
+                            ceil_z,
+                            ceil_w,
+                            ceil_h,
+                            ceil_tex,
+                        );
                     }
 
                     // Back face: full height
                     let (back_face, back_ox, back_oz) = match facing {
-                        0 => (BlockFace::Back,  wx,        wz),
-                        2 => (BlockFace::Front, wx,        wz + 1.0),
-                        1 => (BlockFace::Right, wx + 1.0,  wz),
-                        _ => (BlockFace::Left,  wx,        wz),
+                        0 => (BlockFace::Back, wx, wz),
+                        2 => (BlockFace::Front, wx, wz + 1.0),
+                        1 => (BlockFace::Right, wx + 1.0, wz),
+                        _ => (BlockFace::Left, wx, wz),
                     };
                     let back_side = x as i32 + back_fx;
                     let back_sz = z as i32 + back_fz;
                     if is_open(back_side, y as i32, back_sz) {
                         let back_tex = match back_face {
-                            BlockFace::Back | BlockFace::Front => get_texture_index(block, BlockFace::Front),
-                            BlockFace::Left | BlockFace::Right => get_texture_index(block, BlockFace::Left),
+                            BlockFace::Back | BlockFace::Front => {
+                                get_texture_index(block, BlockFace::Front)
+                            }
+                            BlockFace::Left | BlockFace::Right => {
+                                get_texture_index(block, BlockFace::Left)
+                            }
                             _ => tex,
                         };
-                        emit(&mut vertices, &mut indices, back_face, back_ox, by, back_oz, 1.0, 1.0, back_tex);
+                        emit(
+                            &mut vertices,
+                            &mut indices,
+                            back_face,
+                            back_ox,
+                            by,
+                            back_oz,
+                            1.0,
+                            1.0,
+                            back_tex,
+                        );
                     }
 
                     // Front (step) face: top half only at the front edge
                     let (front_face, front_ox, front_oz) = match facing {
-                        0 => (BlockFace::Front, wx,        wz + 1.0),
-                        2 => (BlockFace::Back,  wx,        wz),
-                        1 => (BlockFace::Left,  wx,        wz),
-                        _ => (BlockFace::Right, wx + 1.0,  wz),
+                        0 => (BlockFace::Front, wx, wz + 1.0),
+                        2 => (BlockFace::Back, wx, wz),
+                        1 => (BlockFace::Left, wx, wz),
+                        _ => (BlockFace::Right, wx + 1.0, wz),
                     };
                     let front_side = x as i32 + step_fx;
                     let front_sz = z as i32 + step_fz;
                     if is_open(front_side, y as i32, front_sz) {
                         let front_tex = match front_face {
-                            BlockFace::Front | BlockFace::Back => get_texture_index(block, BlockFace::Front),
-                            BlockFace::Left | BlockFace::Right => get_texture_index(block, BlockFace::Left),
+                            BlockFace::Front | BlockFace::Back => {
+                                get_texture_index(block, BlockFace::Front)
+                            }
+                            BlockFace::Left | BlockFace::Right => {
+                                get_texture_index(block, BlockFace::Left)
+                            }
                             _ => tex,
                         };
-                        emit(&mut vertices, &mut indices, front_face, front_ox, by + 0.5, front_oz, 1.0, 0.5, front_tex);
+                        emit(
+                            &mut vertices,
+                            &mut indices,
+                            front_face,
+                            front_ox,
+                            by + 0.5,
+                            front_oz,
+                            1.0,
+                            0.5,
+                            front_tex,
+                        );
                     }
 
                     // Side faces for top stair
                     // Bottom half of side: only back half depth
                     // Top half of side: full depth
-                    let side_pairs: &[(i32, i32, BlockFace, BlockFace)] = &[
-                        (0, -1, BlockFace::Left, BlockFace::Right),
-                        (0, 1, BlockFace::Right, BlockFace::Left),
-                    ];
-                    for &(sdx, sdz, side_face, opp_face) in side_pairs {
+                    let side_pairs: &[(i32, i32, BlockFace)] = match facing {
+                        0 | 2 => &[(-1, 0, BlockFace::Left), (1, 0, BlockFace::Right)],
+                        _ => &[(0, -1, BlockFace::Back), (0, 1, BlockFace::Front)],
+                    };
+                    for &(sdx, sdz, side_face) in side_pairs {
                         let sx = x as i32 + sdx;
                         let sz = z as i32 + sdz;
                         if is_open(sx, y as i32, sz) {
-                            let side_tex = get_texture_index(block, opp_face);
+                            let side_tex = get_texture_index(block, side_face);
                             // Bottom half: only back depth
                             let (back_ox_s, back_oz_s) = match facing {
                                 0 => (0.0, 0.0),
@@ -757,19 +1496,44 @@ pub fn build_chunk_mesh<'a>(
                             let (bsx, bsy, bsz) = match side_face {
                                 BlockFace::Left => (wx + back_ox_s, by, wz + back_oz_s),
                                 BlockFace::Right => (wx + 1.0 + back_ox_s, by, wz + back_oz_s),
+                                BlockFace::Back => (wx + back_ox_s, by, wz),
+                                BlockFace::Front => (wx + back_ox_s, by, wz + 1.0),
                                 _ => unreachable!(),
                             };
-                            emit(&mut vertices, &mut indices, side_face, bsx, bsy, bsz, 1.0, 0.5, side_tex);
+                            emit(
+                                &mut vertices,
+                                &mut indices,
+                                side_face,
+                                bsx,
+                                bsy,
+                                bsz,
+                                1.0,
+                                0.5,
+                                side_tex,
+                            );
 
                             // Top half: full depth
                             let (tsx, tsy, tsz) = match side_face {
                                 BlockFace::Left => (wx, by + 0.5, wz),
                                 BlockFace::Right => (wx + 1.0, by + 0.5, wz),
+                                BlockFace::Back => (wx, by + 0.5, wz),
+                                BlockFace::Front => (wx, by + 0.5, wz + 1.0),
                                 _ => unreachable!(),
                             };
-                            emit(&mut vertices, &mut indices, side_face, tsx, tsy, tsz, 1.0, 0.5, side_tex);
+                            emit(
+                                &mut vertices,
+                                &mut indices,
+                                side_face,
+                                tsx,
+                                tsy,
+                                tsz,
+                                1.0,
+                                0.5,
+                                side_tex,
+                            );
                         }
                     }
+                }
                 }
             }
         }
@@ -784,41 +1548,73 @@ pub fn build_chunk_mesh<'a>(
 }
 
 fn get_crossed_texture(block: Block) -> u32 {
-    CROSSED_TEX.get()
+    let tex = CROSSED_TEX
+        .get()
         .and_then(|m| m.get(&block.id))
         .copied()
-        .unwrap_or(0)
+        .unwrap_or(u32::MAX);
+    if tex == u32::MAX {
+        log::warn!("Missing crossed texture for block {:?}", block.id);
+    }
+    tex | material_flags(block.id)
 }
 
-fn emit_crossed_quad_light(
+fn emit_crossed_quad_light<'a>(
     verts: &mut Vec<MeshVertex>,
     indices: &mut Vec<u32>,
-    x: f32, y: f32, z: f32,
+    x: f32,
+    y: f32,
+    z: f32,
     tex_index: u32,
-    light_data: u32,
+    _light_data: u32,
+    emissive: u8,
+    chunk: &'a Chunk,
+    get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
+    bx: i32,
+    by: i32,
+    bz: i32,
 ) {
     let h = 0.5;
-    let normal = [0.0, 1.0, 0.0];
     let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let light = get_light_data(chunk, get_neighbor, bx, by, bz);
+    let sky = (light >> 4) & 0xF;
+    let block = light & 0xF;
+    let packed = ((emissive as u32) << 12) | (3 << 8) | (sky << 4) | block;
+    let planes = [
+        (
+            [
+                [x - h, y - h, z - h],
+                [x + h, y - h, z + h],
+                [x + h, y + h, z + h],
+                [x - h, y + h, z - h],
+            ],
+            [-0.707, 0.0, 0.707],
+        ),
+        (
+            [
+                [x - h, y - h, z + h],
+                [x + h, y - h, z - h],
+                [x + h, y + h, z - h],
+                [x - h, y + h, z + h],
+            ],
+            [0.707, 0.0, 0.707],
+        ),
+    ];
 
-    for plane_verts in [
-        [[x - h, y - h, z - h], [x + h, y - h, z + h], [x + h, y + h, z + h], [x - h, y + h, z - h]],
-        [[x + h, y - h, z - h], [x - h, y - h, z + h], [x - h, y + h, z + h], [x + h, y + h, z - h]],
-    ] {
+    for (positions, normal) in planes {
         let base = verts.len() as u32;
         for i in 0..4 {
             verts.push(MeshVertex {
-                pos: plane_verts[i],
+                pos: positions[i],
                 uv: uvs[i],
                 normal,
                 tex_index,
-                light_data,
+                light_data: packed,
             });
         }
-        indices.extend_from_slice(&[
-            base, base + 1, base + 2,
-            base, base + 2, base + 3,
-        ]);
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        // Cutout plants use double-sided intersecting planes in vanilla.
+        indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
     }
 }
 
@@ -829,23 +1625,35 @@ pub fn build_item_cube_mesh(items: &[(f32, f32, f32, BlockId)]) -> ChunkMesh {
     for &(x, y, z, block_id) in items {
         let h = 0.2;
         let block = Block::new(block_id);
+
         for &face in &FACES {
             let tex = get_texture_index(block, face);
             let (ox, oy, oz, u_axis, v_axis) = match face {
                 BlockFace::Top => (x - h, y + h, z - h, 0, 2),
                 BlockFace::Bottom => (x - h, y - h, z - h, 0, 2),
                 BlockFace::Left => (x - h, y - h, z - h, 2, 1),
-                BlockFace::Right => (x - h, y - h, z - h, 2, 1),
+                BlockFace::Right => (x + h, y - h, z - h, 2, 1),
                 BlockFace::Front => (x - h, y - h, z + h, 0, 1),
                 BlockFace::Back => (x - h, y - h, z - h, 0, 1),
             };
-            emit_quad(
-                &mut vertices, &mut indices, face,
-                ox, oy, oz,
-                2.0 * h, 2.0 * h,
+            let vert_start = vertices.len();
+            emit_quad_light(
+                &mut vertices,
+                &mut indices,
+                face,
+                ox,
+                oy,
+                oz,
+                2.0 * h,
+                2.0 * h,
                 tex,
-                u_axis, v_axis,
+                u_axis,
+                v_axis,
             );
+            let light_data = (15u32 << 8) | (15u32 << 4) | 15;
+            for v in &mut vertices[vert_start..] {
+                v.light_data = light_data;
+            }
         }
     }
 

@@ -1,0 +1,19 @@
+{
+  "seed": 1592639710,
+  "world_dir": "worlds/render-check",
+  "render_distance": 6,
+  "graphics": "regular",
+  "keybindings": {
+    "forward": "KeyW",
+    "back": "KeyS",
+    "left": "KeyA",
+    "right": "KeyD",
+    "jump": "Space",
+    "sneak": "ShiftLeft",
+    "sprint": "ControlLeft",
+    "inventory": "KeyE",
+    "drop_item": "KeyQ",
+    "chat": "KeyT",
+    "command": "Slash"
+  }
+}

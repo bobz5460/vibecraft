@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use crate::world::block::{BlockId, BlockFace, FACES};
 use crate::assets::blockstate::resolve_blockstate_model;
 use crate::assets::model::resolve_face_textures;
+use crate::assets::reader::AssetReader;
 
 #[derive(Clone, Debug)]
 pub struct TextureTile {
@@ -12,7 +12,7 @@ pub struct TextureTile {
 
 #[derive(Clone, Debug)]
 pub struct BlockTextureMapping {
-    asset_path: PathBuf,
+    reader: AssetReader,
     entries: Vec<(BlockId, [String; 6])>,
 }
 
@@ -37,6 +37,9 @@ fn minecraft_name(id: BlockId) -> Option<&'static str> {
         CraftingTable => Some("crafting_table"),
         Furnace => Some("furnace"),
         Chest => Some("chest"),
+        OakDoor => Some("oak_door"),
+        OakFence => Some("oak_planks"),
+        RedstoneDust => Some("redstone_dust_dot"),
         Torch | WallTorch => Some("torch"),
         Snow | Snow2 => Some("snow"),
         Ice => Some("ice"),
@@ -83,7 +86,8 @@ fn minecraft_name(id: BlockId) -> Option<&'static str> {
         EmeraldOre => Some("emerald_ore"),
         DiamondOre => Some("diamond_ore"),
         Lava => Some("lava_still"),
-        Fire | SoulFire => Some("fire_0"),
+        Fire => Some("fire_0"),
+        SoulFire => Some("soul_fire_0"),
         SoulTorch | SoulWallTorch => Some("soul_torch"),
         RedstoneTorch | RedstoneWallTorch => Some("redstone_torch"),
         RedstoneLamp => Some("redstone_lamp"),
@@ -275,16 +279,13 @@ fn minecraft_name(id: BlockId) -> Option<&'static str> {
     }
 }
 
-fn face_textures_for_block(asset_path: &Path, id: BlockId) -> Option<[String; 6]> {
+fn face_textures_for_block(reader: &AssetReader, id: BlockId) -> Option<[String; 6]> {
     let name = minecraft_name(id)?;
 
-    let blockstate_dir = asset_path.join("blockstates");
-    let model_dir = asset_path.join("models").join("block");
-
-    let model_name = resolve_blockstate_model(&blockstate_dir, name);
+    let model_name = resolve_blockstate_model(reader, name);
 
     let resolved = if let Some(ref mn) = model_name {
-        resolve_face_textures(&model_dir, mn)
+        resolve_face_textures(reader, mn)
     } else {
         None
     };
@@ -304,8 +305,7 @@ fn face_textures_for_block(asset_path: &Path, id: BlockId) -> Option<[String; 6]
     } else if name == "fire_0" || name == "soul_fire_0" {
         Some(core::array::from_fn(|_| name.to_string()))
     } else {
-        let direct = asset_path.join("textures").join("block").join(format!("{}.png", name));
-        if direct.exists() {
+        if reader.exists(&format!("textures/block/{name}.png")) {
             Some(core::array::from_fn(|_| name.to_string()))
         } else {
             None
@@ -338,6 +338,9 @@ fn collect_all_block_ids() -> Vec<(BlockId, &'static str)> {
     push!(CraftingTable, "crafting_table");
     push!(Furnace, "furnace");
     push!(Chest, "chest");
+    push!(OakDoor, "oak_door");
+    push!(OakFence, "oak_fence");
+    push!(RedstoneDust, "redstone_dust_dot");
     push!(Snow, "snow");
     push!(Ice, "ice");
     push!(Glowstone, "glowstone");
@@ -611,26 +614,25 @@ fn collect_all_block_ids() -> Vec<(BlockId, &'static str)> {
     all
 }
 
-pub fn build_texture_mapping(asset_path: &str) -> BlockTextureMapping {
-    let path = PathBuf::from(asset_path).join("assets").join("minecraft");
+pub fn build_texture_mapping(reader: &AssetReader) -> BlockTextureMapping {
     let mut entries = Vec::new();
     let all_blocks = collect_all_block_ids();
 
     for &(block_id, name) in &all_blocks {
-        let faces = face_textures_for_block(&path, block_id)
+        let faces = face_textures_for_block(reader, block_id)
             .unwrap_or_else(|| core::array::from_fn(|_| name.to_string()));
         entries.push((block_id, faces));
     }
 
     entries.sort_by_key(|e| e.0 as u32);
     BlockTextureMapping {
-        asset_path: path,
+        reader: reader.clone(),
         entries,
     }
 }
 
 impl BlockTextureMapping {
-    pub fn build_tile_list(&self) -> Vec<TextureTile> {
+    pub fn build_tile_list(&self, extra_textures: &[String]) -> Vec<TextureTile> {
         let mut seen = std::collections::HashSet::new();
         let mut tiles = Vec::new();
 
@@ -668,6 +670,15 @@ impl BlockTextureMapping {
             }
         }
 
+        for tex in extra_textures {
+            if seen.insert(tex.clone()) {
+                tiles.push(TextureTile {
+                    path: tex.clone(),
+                    tile_index: tiles.len() as u32,
+                });
+            }
+        }
+
         tiles
     }
 
@@ -689,6 +700,17 @@ impl BlockTextureMapping {
         result
     }
 
+    /// Compute grass/foliage biome tint from temperature and humidity using a
+    /// simplified approximation of the vanilla Minecraft formula.
+    /// Falls back to the default tint if temp/humidity are not available.
+    pub fn compute_biome_tint(temp: f32, humidity: f32) -> [u8; 3] {
+        use std::f32::consts::PI;
+        let r = (85.0 + 20.0 * (temp * PI).cos()).round().clamp(0.0, 255.0) as u8;
+        let g = (140.0 + 30.0 * (humidity * PI / 2.0).sin()).round().clamp(0.0, 255.0) as u8;
+        let b = (40.0 + 20.0 * (temp * PI).cos()).round().clamp(0.0, 255.0) as u8;
+        [r, g, b]
+    }
+
     fn apply_tint(pixels: &mut Vec<u8>, tint_r: f32, tint_g: f32, tint_b: f32) {
         for i in (0..pixels.len()).step_by(4) {
             let r = pixels[i] as f32;
@@ -701,38 +723,46 @@ impl BlockTextureMapping {
     }
 
     pub fn load_all_pngs(&self, tiles: &[TextureTile]) -> Vec<Vec<u8>> {
-        let tex_dir = self.asset_path.join("textures").join("block");
         let mut images = Vec::with_capacity(tiles.len());
 
         for tile in tiles {
-            let png_path = tex_dir.join(format!("{}.png", tile.path));
-            let mut pixels = if png_path.exists() {
-                match image::open(&png_path) {
-                    Ok(img) => {
+            let png_path = format!("textures/block/{}.png", tile.path);
+            let mut pixels = if self.reader.exists(&png_path) {
+                match self.reader.read_image(&png_path) {
+                    Some(img) => {
                         let rgba = img.into_rgba8();
                         let (w, h) = rgba.dimensions();
                         if w == 16 && h == 16 {
                             rgba.into_raw()
+                        } else if w == 16 && h >= 16 && h % 16 == 0 {
+                            image::imageops::crop_imm(&rgba, 0, 0, 16, 16).to_image().into_raw()
                         } else {
                             let resized = image::imageops::resize(&rgba, 16, 16, image::imageops::FilterType::Nearest);
                             resized.into_raw()
                         }
                     }
-                    Err(_) => generate_fallback(&tile.path),
+                    None => {
+                        log::warn!("failed to decode texture {png_path}; using diagnostic fallback");
+                        generate_fallback(&tile.path)
+                    }
                 }
             } else {
+                log::warn!("missing texture {png_path}; using diagnostic fallback");
                 generate_fallback(&tile.path)
             };
 
-            // Apply biome-style tints to greyscale Minecraft textures
+            // Apply biome-style tints to greyscale Minecraft textures.
+            // These static tints approximate the default plains biome.
+            // For per-vertex biome-colored tinting, call compute_biome_tint()
+            // at runtime with temperature and humidity data.
             match tile.path.as_str() {
-                "grass_block_top" => Self::apply_tint(&mut pixels, 0.5, 1.0, 0.35),
+                "grass_block_top" => Self::apply_tint(&mut pixels, 0.36, 0.60, 0.18),
                 "fern" | "short_grass" | "tall_grass_top" | "tall_grass_bottom"
-                | "large_fern_top" | "large_fern_bottom" => Self::apply_tint(&mut pixels, 0.4, 0.9, 0.3),
-                "vine" | "glow_lichen" => Self::apply_tint(&mut pixels, 0.4, 0.8, 0.3),
-                "lily_pad" => Self::apply_tint(&mut pixels, 0.3, 0.7, 0.25),
-                "water_still" | "water_flow" => Self::apply_tint(&mut pixels, 0.25, 0.5, 0.9),
-                n if n.ends_with("leaves") => Self::apply_tint(&mut pixels, 0.35, 0.7, 0.25),
+                | "large_fern_top" | "large_fern_bottom" => Self::apply_tint(&mut pixels, 0.36, 0.60, 0.18),
+                "vine" | "glow_lichen" => Self::apply_tint(&mut pixels, 0.36, 0.60, 0.18),
+                "lily_pad" => Self::apply_tint(&mut pixels, 0.24, 0.52, 0.16),
+                "water_still" | "water_flow" => Self::apply_tint(&mut pixels, 0.20, 0.42, 0.82),
+                n if n.ends_with("leaves") => Self::apply_tint(&mut pixels, 0.27, 0.54, 0.16),
                 _ => {}
             }
 
@@ -812,7 +842,7 @@ fn generate_fallback(name: &str) -> Vec<u8> {
     for py in 0..16u32 {
         for px in 0..16u32 {
             let i = ((py * 16 + px) * 4) as usize;
-            let noise = ((px * 7 + py * 13 + hash as u32 * 11) % 30) as u8;
+            let noise = ((px.wrapping_mul(7) + py.wrapping_mul(13) + hash.wrapping_mul(11)) % 30) as u8;
             pixels[i] = r.saturating_sub(noise);
             pixels[i + 1] = g.saturating_sub(noise / 2);
             pixels[i + 2] = b.saturating_sub(noise / 2);

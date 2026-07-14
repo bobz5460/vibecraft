@@ -1,168 +1,309 @@
-use crate::world::block::{Block, BlockId};
+//! Immutable 1.21.1 block metadata and compact property-state definitions.
+//!
+//! Chunk storage keeps a `BlockId` plus a registry-local state ordinal.  This
+//! keeps the existing world format cheap while allowing each block family to
+//! define independent property domains instead of sharing the legacy data byte.
 
-#[derive(Clone)]
-pub struct BlockProperties {
-    pub id: BlockId,
-    pub name: &'static str,
-    pub solid: bool,
-    pub transparent: bool,
-    pub emissive: bool,
-    pub light_level: u8,
-    pub hardiness: f32,
-    pub tool: ToolRequirement,
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use super::block::BlockId;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollisionShape {
+    Empty,
+    FullCube,
+    Crossed,
+    Custom,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum ToolRequirement {
-    None,
-    Pickaxe,
-    Axe,
-    Shovel,
-    Hoe,
-    Shears,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderMaterial {
+    Opaque,
+    Cutout,
+    Translucent,
+    Fluid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoundGroup {
+    Stone,
+    Grass,
+    Wood,
+    Glass,
+    Metal,
+    Sand,
+    Wool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockTags(u16);
+
+impl BlockTags {
+    pub const SOLID: Self = Self(1 << 0);
+    pub const TRANSPARENT: Self = Self(1 << 1);
+    pub const CROSSED: Self = Self(1 << 2);
+    pub const CLIMBABLE: Self = Self(1 << 3);
+    pub const FLUID: Self = Self(1 << 4);
+
+    pub const fn contains(self, tag: Self) -> bool {
+        self.0 & tag.0 != 0
+    }
+
+    const fn insert(&mut self, tag: Self) {
+        self.0 |= tag.0;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PropertyDefinition {
+    pub name: &'static str,
+    pub values: &'static [&'static str],
+}
+
+#[derive(Clone, Debug)]
+pub struct BlockDefinition {
+    pub id: BlockId,
+    pub name: &'static str,
+    pub tags: BlockTags,
+    pub hardness: f32,
+    pub collision: CollisionShape,
+    pub light_opacity: u8,
+    pub light_emission: u8,
+    pub drop: BlockId,
+    pub sound: SoundGroup,
+    pub material: RenderMaterial,
+    pub properties: &'static [PropertyDefinition],
+    pub state_count: u16,
 }
 
 pub struct BlockRegistry {
-    pub blocks: Vec<BlockProperties>,
+    definitions: Vec<BlockDefinition>,
+}
+
+const LEVEL_VALUES: [&str; 16] = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+];
+const BOOL_VALUES: [&str; 2] = ["false", "true"];
+// Preserve the pre-registry placement default: legacy stair data 0 faces south.
+const HORIZONTAL_FACING: [&str; 4] = ["south", "west", "north", "east"];
+const SLAB_TYPE: [&str; 3] = ["bottom", "top", "double"];
+const STAIR_HALF: [&str; 2] = ["bottom", "top"];
+const STAIR_SHAPE: [&str; 5] = ["straight", "inner_left", "inner_right", "outer_left", "outer_right"];
+const CHEST_TYPE: [&str; 3] = ["single", "left", "right"];
+
+const FLUID_PROPERTIES: [PropertyDefinition; 2] = [
+    PropertyDefinition { name: "level", values: &LEVEL_VALUES },
+    PropertyDefinition { name: "falling", values: &BOOL_VALUES },
+];
+const SLAB_PROPERTIES: [PropertyDefinition; 1] = [PropertyDefinition { name: "type", values: &SLAB_TYPE }];
+const STAIR_PROPERTIES: [PropertyDefinition; 3] = [
+    PropertyDefinition { name: "facing", values: &HORIZONTAL_FACING },
+    PropertyDefinition { name: "half", values: &STAIR_HALF },
+    PropertyDefinition { name: "shape", values: &STAIR_SHAPE },
+];
+const FURNACE_PROPERTIES: [PropertyDefinition; 2] = [
+    PropertyDefinition { name: "facing", values: &HORIZONTAL_FACING },
+    PropertyDefinition { name: "lit", values: &BOOL_VALUES },
+];
+const CHEST_PROPERTIES: [PropertyDefinition; 2] = [
+    PropertyDefinition { name: "facing", values: &HORIZONTAL_FACING },
+    PropertyDefinition { name: "type", values: &CHEST_TYPE },
+];
+const TORCH_PROPERTIES: [PropertyDefinition; 1] = [PropertyDefinition { name: "facing", values: &HORIZONTAL_FACING }];
+const DOOR_HALF: [&str; 2] = ["lower", "upper"];
+const DOOR_HINGE: [&str; 2] = ["left", "right"];
+const CONNECTION: [&str; 3] = ["none", "side", "up"];
+const DOOR_PROPERTIES: [PropertyDefinition; 5] = [
+    PropertyDefinition { name: "facing", values: &HORIZONTAL_FACING },
+    PropertyDefinition { name: "half", values: &DOOR_HALF },
+    PropertyDefinition { name: "hinge", values: &DOOR_HINGE },
+    PropertyDefinition { name: "open", values: &BOOL_VALUES },
+    PropertyDefinition { name: "powered", values: &BOOL_VALUES },
+];
+const FENCE_PROPERTIES: [PropertyDefinition; 5] = [
+    PropertyDefinition { name: "north", values: &BOOL_VALUES },
+    PropertyDefinition { name: "east", values: &BOOL_VALUES },
+    PropertyDefinition { name: "south", values: &BOOL_VALUES },
+    PropertyDefinition { name: "west", values: &BOOL_VALUES },
+    PropertyDefinition { name: "waterlogged", values: &BOOL_VALUES },
+];
+const REDSTONE_PROPERTIES: [PropertyDefinition; 5] = [
+    PropertyDefinition { name: "north", values: &CONNECTION },
+    PropertyDefinition { name: "east", values: &CONNECTION },
+    PropertyDefinition { name: "south", values: &CONNECTION },
+    PropertyDefinition { name: "west", values: &CONNECTION },
+    PropertyDefinition { name: "power", values: &LEVEL_VALUES },
+];
+
+pub fn registry() -> &'static BlockRegistry {
+    static REGISTRY: OnceLock<BlockRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(BlockRegistry::new)
 }
 
 impl BlockRegistry {
-    pub fn new() -> Self {
-        let mut blocks = Vec::with_capacity(512);
+    fn new() -> Self {
+        let mut definitions = Vec::with_capacity(414);
+        for raw_id in 0..=413 {
+            let id = BlockId::from_repr(raw_id).expect("BlockId discriminants must remain contiguous");
+            let mut tags = BlockTags(0);
+            if id.is_solid() {
+                tags.insert(BlockTags::SOLID);
+            }
+            if id.is_transparent() {
+                tags.insert(BlockTags::TRANSPARENT);
+            }
+            if id.is_crossed() {
+                tags.insert(BlockTags::CROSSED);
+            }
+            if id.is_climbable() {
+                tags.insert(BlockTags::CLIMBABLE);
+            }
+            if matches!(id, BlockId::Water | BlockId::Lava) {
+                tags.insert(BlockTags::FLUID);
+            }
 
-        for i in 0u16..512u16 {
-            let id: BlockId = unsafe { std::mem::transmute(i) };
-            let props = get_properties(id);
-            blocks.push(props);
+            let properties = properties_for(id);
+            let state_count = properties.iter().fold(1u16, |count, property| {
+                count.checked_mul(property.values.len() as u16).expect("block state domain exceeds u16")
+            });
+            let material = if tags.contains(BlockTags::FLUID) {
+                RenderMaterial::Fluid
+            } else if tags.contains(BlockTags::CROSSED) {
+                RenderMaterial::Cutout
+            } else if tags.contains(BlockTags::TRANSPARENT) {
+                RenderMaterial::Translucent
+            } else {
+                RenderMaterial::Opaque
+            };
+            let collision = if id == BlockId::Air || tags.contains(BlockTags::FLUID) {
+                CollisionShape::Empty
+            } else if tags.contains(BlockTags::CROSSED) {
+                CollisionShape::Crossed
+            } else if id.is_slab() || id.is_stair() || matches!(id, BlockId::OakDoor | BlockId::OakFence | BlockId::RedstoneDust) || tags.contains(BlockTags::CLIMBABLE) {
+                CollisionShape::Custom
+            } else {
+                CollisionShape::FullCube
+            };
+            definitions.push(BlockDefinition {
+                id,
+                name: id.name(),
+                tags,
+                hardness: hardness_for(id),
+                collision,
+                light_opacity: if id.is_transparent() { 0 } else { 15 },
+                light_emission: id.light_level(),
+                drop: id,
+                sound: sound_for(id),
+                material,
+                properties,
+                state_count,
+            });
         }
-
-        BlockRegistry { blocks }
+        Self { definitions }
     }
 
-    pub fn get(&self, id: BlockId) -> &BlockProperties {
-        &self.blocks[id as u16 as usize]
+    pub fn definition(&self, id: BlockId) -> &BlockDefinition {
+        &self.definitions[id as usize]
     }
 
-    pub fn get_block(&self, block: Block) -> &BlockProperties {
-        &self.blocks[block.id as u16 as usize]
+    pub fn state_for_properties<'a>(
+        &self,
+        id: BlockId,
+        properties: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Option<u16> {
+        let definition = self.definition(id);
+        let supplied: HashMap<_, _> = properties.into_iter().collect();
+        if supplied.len() != definition.properties.len() {
+            return None;
+        }
+        let mut state = 0u16;
+        for property in definition.properties {
+            let value = supplied.get(property.name)?;
+            let value_index = property.values.iter().position(|candidate| candidate == value)? as u16;
+            state = state * property.values.len() as u16 + value_index;
+        }
+        Some(state)
+    }
+
+    pub fn properties_for_state(&self, id: BlockId, state: u16) -> Option<Vec<(&'static str, &'static str)>> {
+        let definition = self.definition(id);
+        if state >= definition.state_count {
+            return None;
+        }
+        let mut remaining = state;
+        let mut out = Vec::with_capacity(definition.properties.len());
+        for property in definition.properties.iter().rev() {
+            let index = (remaining % property.values.len() as u16) as usize;
+            remaining /= property.values.len() as u16;
+            out.push((property.name, property.values[index]));
+        }
+        out.reverse();
+        Some(out)
     }
 }
 
-fn get_properties(id: BlockId) -> BlockProperties {
+fn properties_for(id: BlockId) -> &'static [PropertyDefinition] {
     match id {
-        BlockId::Air => BlockProperties {
-            id, name: "Air", solid: false, transparent: true, emissive: false, light_level: 0, hardiness: 0.0, tool: ToolRequirement::None,
-        },
-        BlockId::Stone => BlockProperties {
-            id, name: "Stone", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 1.5, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::GrassBlock => BlockProperties {
-            id, name: "Grass Block", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 0.6, tool: ToolRequirement::Shovel,
-        },
-        BlockId::Dirt => BlockProperties {
-            id, name: "Dirt", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 0.5, tool: ToolRequirement::Shovel,
-        },
-        BlockId::Cobblestone => BlockProperties {
-            id, name: "Cobblestone", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 2.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::OakPlanks => BlockProperties {
-            id, name: "Oak Planks", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 2.0, tool: ToolRequirement::Axe,
-        },
-        BlockId::Bedrock => BlockProperties {
-            id, name: "Bedrock", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: -1.0, tool: ToolRequirement::None,
-        },
-        BlockId::Water => BlockProperties {
-            id, name: "Water", solid: false, transparent: true, emissive: false, light_level: 1, hardiness: 100.0, tool: ToolRequirement::None,
-        },
-        BlockId::Sand => BlockProperties {
-            id, name: "Sand", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 0.5, tool: ToolRequirement::Shovel,
-        },
-        BlockId::Gravel => BlockProperties {
-            id, name: "Gravel", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 0.6, tool: ToolRequirement::Shovel,
-        },
-        BlockId::GoldOre => BlockProperties {
-            id, name: "Gold Ore", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 3.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::IronOre => BlockProperties {
-            id, name: "Iron Ore", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 3.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::CoalOre => BlockProperties {
-            id, name: "Coal Ore", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 3.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::OakLog => BlockProperties {
-            id, name: "Oak Log", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 2.0, tool: ToolRequirement::Axe,
-        },
-        BlockId::OakLeaves => BlockProperties {
-            id, name: "Oak Leaves", solid: true, transparent: true, emissive: false, light_level: 0, hardiness: 0.2, tool: ToolRequirement::Hoe,
-        },
-        BlockId::Glass => BlockProperties {
-            id, name: "Glass", solid: true, transparent: true, emissive: false, light_level: 0, hardiness: 0.3, tool: ToolRequirement::None,
-        },
-        BlockId::CraftingTable => BlockProperties {
-            id, name: "Crafting Table", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 2.5, tool: ToolRequirement::Axe,
-        },
-        BlockId::Furnace => BlockProperties {
-            id, name: "Furnace", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 3.5, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::Chest => BlockProperties {
-            id, name: "Chest", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 2.5, tool: ToolRequirement::Axe,
-        },
-        BlockId::Torch => BlockProperties {
-            id, name: "Torch", solid: false, transparent: true, emissive: true, light_level: 14, hardiness: 0.0, tool: ToolRequirement::None,
-        },
-        BlockId::Snow => BlockProperties {
-            id, name: "Snow", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 0.1, tool: ToolRequirement::Shovel,
-        },
-        BlockId::Ice => BlockProperties {
-            id, name: "Ice", solid: true, transparent: true, emissive: false, light_level: 0, hardiness: 0.5, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::Glowstone => BlockProperties {
-            id, name: "Glowstone", solid: true, transparent: true, emissive: true, light_level: 15, hardiness: 0.3, tool: ToolRequirement::None,
-        },
-        BlockId::Netherrack => BlockProperties {
-            id, name: "Netherrack", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 0.4, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::SoulSand => BlockProperties {
-            id, name: "Soul Sand", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 0.5, tool: ToolRequirement::Shovel,
-        },
-        BlockId::Deepslate => BlockProperties {
-            id, name: "Deepslate", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 3.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::Obsidian => BlockProperties {
-            id, name: "Obsidian", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 50.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::NetheriteBlock => BlockProperties {
-            id, name: "Block of Netherite", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 50.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::AncientDebris => BlockProperties {
-            id, name: "Ancient Debris", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 30.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::Bricks => BlockProperties {
-            id, name: "Bricks", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 2.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::Bookshelf => BlockProperties {
-            id, name: "Bookshelf", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 1.5, tool: ToolRequirement::Axe,
-        },
-        BlockId::DiamondBlock => BlockProperties {
-            id, name: "Diamond Block", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 5.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::IronBlock => BlockProperties {
-            id, name: "Iron Block", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 5.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::GoldBlock => BlockProperties {
-            id, name: "Gold Block", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 3.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::EmeraldBlock => BlockProperties {
-            id, name: "Emerald Block", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 5.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::LapisBlock => BlockProperties {
-            id, name: "Lapis Lazuli Block", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 3.0, tool: ToolRequirement::Pickaxe,
-        },
-        BlockId::RedstoneBlock => BlockProperties {
-            id, name: "Block of Redstone", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 5.0, tool: ToolRequirement::Pickaxe,
-        },
-        _ => BlockProperties {
-            id, name: "Unknown", solid: true, transparent: false, emissive: false, light_level: 0, hardiness: 1.0, tool: ToolRequirement::None,
-        },
+        BlockId::Water | BlockId::Lava => &FLUID_PROPERTIES,
+        BlockId::StoneSlab | BlockId::OakSlab => &SLAB_PROPERTIES,
+        BlockId::StoneStairs | BlockId::OakStairs => &STAIR_PROPERTIES,
+        BlockId::Furnace => &FURNACE_PROPERTIES,
+        BlockId::Chest => &CHEST_PROPERTIES,
+        BlockId::Torch | BlockId::WallTorch | BlockId::SoulTorch | BlockId::SoulWallTorch => &TORCH_PROPERTIES,
+        BlockId::OakDoor => &DOOR_PROPERTIES,
+        BlockId::OakFence => &FENCE_PROPERTIES,
+        BlockId::RedstoneDust => &REDSTONE_PROPERTIES,
+        _ => &[],
+    }
+}
+
+fn hardness_for(id: BlockId) -> f32 {
+    match id {
+        BlockId::Air | BlockId::Water | BlockId::Lava | BlockId::Fire | BlockId::SoulFire => 0.0,
+        BlockId::Bedrock => -1.0,
+        BlockId::Obsidian => 50.0,
+        BlockId::OakLeaves | BlockId::OakLeaves2 => 0.2,
+        BlockId::Glass => 0.3,
+        BlockId::Dirt | BlockId::GrassBlock | BlockId::Sand | BlockId::Gravel => 0.5,
+        BlockId::OakLog | BlockId::OakPlanks | BlockId::OakPlanks2 => 2.0,
+        _ => 1.5,
+    }
+}
+
+fn sound_for(id: BlockId) -> SoundGroup {
+    match id {
+        BlockId::GrassBlock | BlockId::Dirt | BlockId::Gravel => SoundGroup::Grass,
+        BlockId::OakLog | BlockId::OakPlanks | BlockId::OakPlanks2 | BlockId::Chest => SoundGroup::Wood,
+        BlockId::Glass | BlockId::Ice | BlockId::PackedIce | BlockId::BlueIce => SoundGroup::Glass,
+        BlockId::IronBlock | BlockId::GoldBlock | BlockId::CopperBlock => SoundGroup::Metal,
+        BlockId::WhiteWool | BlockId::BlackWool | BlockId::RedWool | BlockId::BlueWool => SoundGroup::Wool,
+        BlockId::Sand | BlockId::RedSand => SoundGroup::Sand,
+        _ => SoundGroup::Stone,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_properties_round_trip() {
+        let registry = registry();
+        let state = registry
+            .state_for_properties(BlockId::StoneStairs, [("facing", "west"), ("half", "top"), ("shape", "outer_right")])
+            .unwrap();
+        assert_eq!(registry.properties_for_state(BlockId::StoneStairs, state).unwrap(), vec![
+            ("facing", "west"),
+            ("half", "top"),
+            ("shape", "outer_right"),
+        ]);
+    }
+
+    #[test]
+    fn state_rejects_missing_or_invalid_property() {
+        let registry = registry();
+        assert!(registry.state_for_properties(BlockId::Water, [("level", "0")]).is_none());
+        assert!(registry.state_for_properties(BlockId::Water, [("level", "16"), ("falling", "false")]).is_none());
     }
 }

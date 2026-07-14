@@ -90,11 +90,6 @@ impl Difficulty {
         !matches!(self, Difficulty::Hard)
     }
 
-    /// Whether starvation damage can occur.
-    pub const fn starvation_enabled(&self) -> bool {
-        !matches!(self, Difficulty::Peaceful)
-    }
-
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "peaceful" | "p" | "0" => Some(Difficulty::Peaceful),

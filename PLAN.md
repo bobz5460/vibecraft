@@ -1,582 +1,381 @@
-# Vibecraft — Minecraft Replica in Rust
+# Vibecraft Roadmap
 
-> Feature plan mapped from [MINECRAFT.md](MINECRAFT.md). `[x]` = done, `[~]` = partial, `[ ]` = not started.
+Vibecraft is a native Rust reimplementation of **Minecraft: Java Edition**. The immediate product goal is a playable native multiplayer demo; behavioral and visual parity for a pinned modern Java Edition data version remains the long-term goal.
 
-## Architecture Overview
-- **Engine**: Custom voxel engine built in Rust
-- **Rendering**: wgpu (Vulkan/Metal/DX12 backend)
-- **Windowing**: winit
-- **Textures**: Real Minecraft PNG loading via blockstate/model JSON parsing
+## How To Use This Plan
 
-## Phase 1: Core Engine Foundation
-- [x] Rust project setup with wgpu, winit, nalgebra
-- [x] Window management and event loop
-- [x] Chunk system (16×384×16 columns)
-- [x] Greedy meshing with face culling
-- [x] Texture atlas: real Minecraft PNG textures loaded from blockstate + model JSON, built at startup
-- [x] Block registry (~400 BlockId variants with properties)
-- [x] Camera: free-fly WASD + mouse look (yaw/pitch)
-- [ ] Frustum culling (implemented but removed — always renders all loaded chunks)
-- [x] DDA raycast for block targeting (max 10 blocks)
-- [x] Block highlight wireframe
-- [x] Block break (left click) / place selected block (right click)
-- [x] Chunk buffer cache (skip GPU re-upload for unchanged chunks)
-- [x] Multi-texture blocks: per-face textures for grass, logs, furnace, chest, etc.
-- [x] Transparent sorting: transparent chunks back-to-front per frame
-- [x] Depth of chunk re-mesh: only re-mesh on actual block changes
-- [x] Async chunk generation: thread pool (CPU-count workers), non-blocking polling
-- [x] Block selection hotbar (scroll wheel + number keys 1-9)
-- [x] F3 debug overlay: FPS, XYZ, block, biome, facing, game time
-- [x] Fast movement (Ctrl = 5× speed)
+- This is the authoritative roadmap and active-work log. Keep it current when starting or completing a meaningful feature.
+- `Foundation` means code exists and is exercised in-game. It does **not** mean vanilla-parity complete.
+- `Partial` means an end-to-end path exists but has documented gaps. Do not mark work complete merely because types, commands, or placeholder rendering exist.
+- `Not started` means no usable implementation exists.
+- Work in dependency order. Do not add a consumer before its data model, simulation rules, and persistence path exist.
+- Before opening a broad task, define the target Java Edition version and use its data and behavior as the reference. Current content mentions 1.21 features, but the exact target data version still needs to be pinned.
+- For gameplay or rendering changes, verify with `cargo build && timeout 15 cargo run --release`. There is currently no automated test suite; add focused tests whenever logic can be tested without a GPU.
+- Keep implementation constraints and architectural gotchas in `AGENTS.md`; keep roadmap status and next work here.
+- Until the multiplayer demo exit criteria are met, prioritize end-to-end multiplayer capabilities over parity, breadth, presentation polish, and isolated singleplayer-only features. New features must either be part of the demo slice or be explicitly deferred.
 
-### Game Modes
-- [x] **Creative mode**: instant break, F toggles flight, no damage, infinite blocks (default on spawn)
-- [x] **Survival mode**: gravity, hold-to-break, health/fall damage, natural regen
-- [x] **Adventure mode**: no block breaking/placing, gravity enabled
-- [x] **Spectator mode**: noclip (fly through blocks), no block interaction, always flying
-- [x] **Switch via command**: `/gamemode <name>` or `/gm <mode>`, numbers supported (0-3)
-- [x] Hardcore: survival locked to Hard, permanent death (/hardcore command)
-- [x] Difficulty levels: Peaceful, Easy, Normal, Hard with scaling damage, regen control, /difficulty command
+## Agent Operating Procedure
 
-## Phase 2: World Generation & Terrain
+Use this procedure for every implementation task. It is intentionally explicit so an agent can make progress without relying on unstated project conventions.
 
-### Terrain Shape
-- [x] Simplex noise height map with biome blending
-- [x] Base terrain + detail octave for micro-variation
-- [x] 9 biomes: Plains, Forest, Desert, Savanna, Taiga, SnowyTundra, Mountains, Swamp, Jungle
-- [x] **River carving**: continuous river noise cuts channels into terrain, water fills to sea level
-- [x] **Beach transition**: sand at water's edge where grass meets sea level
-- [x] **Cave carvers**: winding spaghetti tunnels carved post-generation, 1-3 branches per chunk, varying radius 1.5-4 blocks
-- [x] **Ore vein shapes**: blob-shaped 3D ellipsoid veins (coal, iron, copper, gold, redstone, lapis, diamond, emerald) with deepslate variants
-- [x] **Deepslate transition**: smooth gradient from stone→deepslate across y=0..16 (uses noise with depth-based probability)
-- [x] **Aquifers**: water source regions underground that carve out lakes when exposed
-- [x] **Tree proximity check**: 5-block minimum distance prevents trees from spawning overlapping
+1. Read `AGENTS.md`, this roadmap's active queue, and the relevant milestone before proposing or changing code.
+2. Inspect `git status --short`. The worktree is often shared and dirty. Preserve unrelated work and never reset, checkout, or reformat files outside the task.
+3. State the work item in one sentence: subsystem, supported behavior, non-goals, and the observable acceptance check. If it spans more than one milestone, split it before coding.
+4. Trace the existing path from input/data source through simulation, rendering, persistence, and UI. Search call sites before changing public structs, `ChunkManager`, shader uniforms, or registries.
+5. Implement the smallest vertical slice that is usable from normal gameplay. Do not add a command-only implementation and call the feature complete.
+6. Verify the affected layer first, then run the project baseline. For example, test a pure block-state function before running a graphical block placement check.
+7. Update this file only when priority, scope, dependency, or status changes. Record durable architecture rules in `AGENTS.md`; record bugs and investigations in `ISSUES.md`.
 
-### Surface Features
-- [x] Trees: Oak, Spruce, Jungle, Acacia with correct log/leaf shapes
-- [x] **Fallen trees**: sideways logs on forest floor
-- [x] **Birch trees**: 30% chance in forests (instead of oak)
-- [x] **Dark oak trees**: 2×2 trunk, large rounded canopy, DarkForest biome with podzol surface, vines, mushrooms
-- [x] **Giant mushrooms**: 2% chance in swamps, stem + 3-layer cap (MushroomStem, RedMushroomBlock, BrownMushroomBlock)
-- [x] **Cacti**: 2% chance in deserts, 1-3 tall, requires air around
-- [x] **Sugar cane**: 5% chance near water in warm biomes, 1-3 tall
-- [x] **Pumpkins**: scattered in plains
-- [x] **Melons**: scattered in jungles
-- [x] **Flowers**: per biome: dandelion, poppy, blue orchid, tulips, daisies, cornflower
-- [x] **Tall grass/ferns**: random patches on grass blocks
-- [x] **Dead bushes**: 3% chance in deserts on sand
-- [x] **Vines**: hanging from trees in jungle/swamp
-- [x] **Lily pads**: 10% chance on water surface in swamps
-- [ ] **Coral reefs**: in warm ocean biomes (needs ocean biome implementation)
-- [x] **Desert wells**: small 2×2 water pool with stone brick rim in deserts (0.3%)
-- [x] **Igloos**: small snow dome (5×5 base, 3×3 mid, 1 top) with carpet, furnace in snowy biomes (0.1%)
-- [x] **Swamp huts**: stilted 3×3 oak plank hut with mushroom in swamps (0.2%)
-- [x] **Ocean ruins**: small stone brick platforms with partial walls near coasts (0.1%)
+### Task Sizing Rules
 
-### Water & Fluids
-- [x] Static water fill: below sea level in terrain generation
-- [x] **Flowing water**: horizontal spread (7 levels), tick-based flow down and spread, source blocks (level 0) maintained
-- [ ] **Bubble columns**: soul sand (upward) / magma block (downward) in water (post-phase-2)
-- [x] **Lava flow**: 3-block horizontal spread, tick-based (every 8 frames), flows down, interacts with water → stone
-- [x] **Surface lava pools**: small 2-4 block pools in plains/forest/savanna (0.5%), surrounded by stone
-- [x] **Water + lava interaction**: water source→obsidian, flowing water→cobblestone, lava+water→stone
-- [ ] **Sponges**: water absorption, drying in Nether (post-phase-2)
+- A small task changes one behavior inside one subsystem and has one clear acceptance check.
+- A medium task may cross a data type and its consumers, but must preserve existing behavior and include migration/call-site updates.
+- A large task changes a shared abstraction such as block state, persistence, ticking, entities, or rendering data. Before coding, add an active work entry with scope, non-goals, and a staged delivery order.
+- Stop and ask for a decision when the task needs a target-version choice, data-format commitment, public compatibility promise, or a rewrite of an existing shared system.
+- Do not use a broad feature name such as "add redstone" or "add mobs" as a task. Name the required platform capability and one vertical slice instead.
 
-### Structures
-- [ ] **Villages**: buildings (houses, farms, wells, blacksmith) with path generation, per biome style (future)
-- [ ] **Desert temples**: with TNT trap and chest room (future)
-- [ ] **Jungle temples**: with arrow trap and lever puzzle (future)
-- [x] **Igloos**: 5×5 snow dome with carpet/furnace/red wool bed in snowy biomes (0.1%)
-- [x] **Swamp huts**: stilted 3×3 oak plank hut with mushroom pot in swamps (0.2%)
-- [ ] **Pillager outposts**: watchtower with allay cage (future)
-- [x] **Ruined portals**: broken nether portal frames (obsidian, missing blocks, stone bricks base, vines)
-- [x] **Debug commands**: press `/` to open console, vanilla syntax: `/<name>`, `/summon <name>`, `/place <name>`
-  - Structures: `dungeon`, `portal`, `lava`, `mushroom`, `tree`, `igloo`, `swamp_hut`, `well`, `ruin`
-  - Single-char aliases: `/d`, `/p`, `/l`, `/m`, `/t`, `/i`, `/sh`, `/w`, `/r`
-  - `/help` lists all commands
-- [ ] **Shipwrecks**: in ocean/ocean biomes (future)
-- [x] **Ocean ruins**: small stone brick platforms with partial corner walls near coasts (0.1%)
-- [ ] **Strongholds**: branching corridors, libraries, portal room with end portal frame (future)
-- [ ] **Mineshafts**: branching tunnels with rails, spider webs, minecarts with chests (future)
-- [x] **Dungeons**: 7×6×7 cobblestone/mossy rooms with spawner center, 1-2 chests, 0.5% chance per chunk y=10-55
-- [x] **Desert wells**: 2×2 water pool with stone brick rim in deserts (0.3%)
+### Evidence To Record
 
-## Phase 3: Block & Texture Detail
+When completing a work item, report all applicable evidence:
 
-### Missing Block Types
-- [x] **Slabs**: stone + oak, bottom/top via data field, half-height mesh (emit_quad with y-offset), hotbar slots
-- [x] **Stairs**: stone + oak with correct shape, 4-facing direction, top/bottom, side face culling
-- [ ] **Fences & walls**: with connected post/bar shapes, collision shape
-- [ ] **Fence gates**: open/close animation
-- [ ] **Doors**: wood and iron, open/close animation, double doors
-- [ ] **Trapdoors**: wood and iron, open/close rendering
-- [ ] **Pressure plates**: wood (player only) and stone (any entity)
-- [ ] **Buttons**: stone and wood, wall-mounted
-- [ ] **Levers**: wall-mounted with on/off state
-- [ ] **Ladders**: climbable by player
-- [ ] **Vines**: climbable, grows down
-- [ ] **Snow layers**: 1-8 layers tall, thinner collision
-- [ ] **Farms**: tilled soil (hydrated/dry states), crops (wheat, carrots, potatoes, beetroot, nether wart)
-- [ ] **Stems**: pumpkin/melon stems, attached vs mature state
-- [ ] **Cocoa beans**: on jungle logs, 3 growth stages
-- [ ] **Cake**: 6 bite states, collision shape shrinks
-- [ ] **Beds**: 16 colors, placed as double-block, set spawn point
-- [ ] **Anvils**: 3 damage states, falling block entity, chiseled/corner collision
-- [ ] **Grindstone**: wall/floor mounted with attached item frame
-- [ ] **Stonecutter**: used for stone cutting recipes
-- [ ] **Smithing table**: upgrade diamond→netherite
-- [ ] **Cartography table**: map cloning/zooming
-- [ ] **Barrel**: chest alternative, easier to open with block above
-- [ ] **Composter**: 8 fill levels, produces bone meal
-- [ ] **Lectern**: holds books, emits redstone signal
-- [ ] **Jukebox**: plays music discs
-- [ ] **Bell**: ring animation, glows when struck
-- [ ] **Campfire**: with/without food, emits light and smoke particles
-- [ ] **Lantern**: hanging light source
-- [ ] **Chain**: hanging decoration
-- [ ] **Amethyst geode**: budding amethyst, cluster growth stages
-- [ ] **Pointed dripstone**: stalactite/stalagmite shapes
-- [ ] **Sculk**: sculk catalyst, shrieker, sensor (vibration detection)
-- [ ] **Deep dark biome**: ancient cities with sculk
+- Build command and result.
+- Runtime scenario: seed, coordinates, input sequence, command, or fixture used.
+- Behavior before and after, including intentional deviations from the reference.
+- Files or systems that must remain synchronized.
+- Follow-up work that is now unblocked, or a reason the item remains partial.
 
-### Lighting
-- [x] Skylight: column-based vertical propagation via per-chunk `sky_light` array
-- [x] Daylight cycle: night_factor uniform, 20-min cycle, sky color transitions
-- [x] **Block light propagation**: flood-fill BFS from light-emitting blocks (torch=14, glowstone=15, lava=15, etc.), stored in per-chunk `block_light`, combined with skylight in mesh vertex light
-- [x] **Per-vertex lighting**: each vertex samples its own light value, interpolated across faces
-- [x] **Ambient Occlusion**: per-vertex corner darkening (3-block check), smooth AO 0-15 encoded in light_data
-- [x] **Light updates**: re-compute on block change via rebuild_dirty_meshes
-- [ ] **Internal light**: max(skylight, blocklight) for gameplay (mob spawn, plant growth)
-- [x] **Night-time darkness**: sky light dims at night via `night_factor` uniform, block light unaffected
-- [ ] **Ambient occlusion**: per-face AO darkens corners and crevices (checks 3 adjacent blocks for solid neighbors)
-- [x] **Sky color tint**: top faces subtly tinted with sky blue at day, warm orange at sunset
-- [ ] **Sun/moon billboards**: sun (yellow circle) and moon (pale circle) rendered in sky, follow day/night cycle, hidden when below horizon
-- [x] **Improved shader lighting**: shadow mapping (2048 depth), directional sunlight with warm/cool tint, sky ambient bounce, tone mapping (1.1 contrast), leaves backlight transmission, per-vertex AO
-- [ ] **Mob spawning light check**: hostile ≤7, passive ≥9, slime ≤7
+## Definition Of Done
 
-### Texture System
-- [x] **Real Minecraft textures**: loads actual PNGs from minecraft-assets via blockstate/model JSON → face texture paths → atlas
-- [x] **Biome tinting (hardcoded)**: greyscale textures tinted at load time (grass green, leaves green, water blue); overlay elements skipped
-- [ ] **Animated textures**: water, lava, nether portal, prismarine, etc. (frame-based)
-- [ ] **Connected textures**: glass panes, iron bars, stone walls connect to neighbors
-- [ ] **Random textures**: grass, dirt get slight rotation/hue offset for variety
-- [ ] **CTM (connected textures)**: for glass, bookshelves, etc. where edges blend
+A parity item is complete only when all applicable conditions hold:
 
-## Phase 4: Player & Physics
+1. Its rules match the pinned Java Edition reference, including state transitions and edge cases.
+2. It works through normal gameplay, not only through debug commands or manually constructed state.
+3. It renders and sounds correct enough for its supported assets and participates in lighting, collision, drops, saving, and networking where relevant.
+4. It is deterministic where the reference is deterministic and does not introduce panics, stale async results, or unbounded work.
+5. It has a regression test, reproducible in-game check, or explicit manual acceptance steps recorded in the implementing PR/commit.
 
-### Movement
-- [x] **Player AABB**: 0.6×1.8×0.6 standing, per-axis collision (slides along walls)
-- [x] **Collision detection**: against world blocks on X/Y/Z independently
-- [x] **Gravity**: downward acceleration (~25 m/s² in game units)
-- [ ] **Walking**: 4.317 blocks/sec on ground
-- [x] **Sprinting**: Ctrl = 1.3× speed boost (no hunger cost yet)
-- [ ] **Sneaking**: 1.295 blocks/sec, reduces height, prevents falling off edges
-- [x] **Auto-jump**: holding space while on ground jumps on every landing
-- [ ] **Jumping**: initial velocity 0.42 blocks/tick upward, variable height when held
-- [ ] **Falling**: terminal velocity 3.92 blocks/tick
-- [x] **Fly mode**: creative flight (F key toggle, Ctrl = 5× speed)
-- [ ] **Swimming**: 3D movement in water, slower when not on surface
-- [ ] **Dolphin's grace**: increased swim speed near dolphins
-- [ ] **Elytra gliding**: forward motion with pitch-based lift
-- [ ] **Climbing**: ladders, vines, scaffolding
+## Current Baseline
 
-### Survival
-- [x] **Health**: 20 HP (10 hearts), natural regen 0.5 HP/s
-- [ ] **Hunger**: 20 food points, depletes from sprinting/jumping/damage
-- [ ] **Saturation**: hidden value, determines how quickly hunger depletes
-- [ ] **Oxygen**: 15 seconds underwater, bubble meter, damage after depletion
-- [x] **Fall damage**: 1 HP per 3 blocks fallen above 3 blocks
-- [ ] **Drowning damage**: 2 HP per second after oxygen depletes
-- [ ] **Fire/lava damage**: 1 HP per half-second in fire, 4 HP in lava
-- [ ] **Suffocation damage**: 1 HP per half-second inside solid blocks
-- [ ] **Starvation damage**: 1 HP per 4 seconds at 0 hunger (hard)
-- [ ] **Cactus damage**: 1 HP per half-second touching cactus
-- [ ] **Berry bush damage**: 0.5 HP per half-second in sweet berry bush
-- [x] **Death + respawn**: respawn at (0,100,0), flight toggle on death
-- [x] **Experience orbs**: from ores + item pickup, within 2 blocks
+| Area | Status | What exists | Main gap |
+|---|---|---|---|
+| Engine and terrain renderer | Foundation | wgpu/winit loop, chunk GPU cache, frustum culling, shadows, fog, sky, post-processing | no occlusion culling/LOD or configurable settings |
+| Overworld terrain | Partial | seeded terrain, biomes, caves, ores, decorations, async generation | not data-version-faithful; no natural structures or cave biomes |
+| Blocks and lighting | Partial | registry/state and resolved-model foundations, chunk lighting, greedy cube/crossed/slab/stair meshes | metadata does not yet drive all gameplay/rendering; no generic model-element or block-entity system |
+| Player survival | Partial | movement, collision, modes, health/hunger, effects, basic fluids | formulas and interactions are incomplete; no entity combat |
+| Items and inventory | Partial | item registry, stacks, hotbar, basic inventory interaction, drops | no durability, equipment, crafting, containers, or item models |
+| UI and audio | Partial | text, basic HUD/inventory data, commands, block sounds | graphical vanilla screens/HUD, chat, settings, positional audio |
+| Simulation content | Not started | dropped items, XP, and specialized fluid updates | no general entity or block-tick framework, mobs, projectiles, or redstone |
+| Persistence and dimensions | Partial | versioned native Overworld level/player/chunk persistence with atomic saves | no dimensions, block-entity/general-entity persistence, or scheduled-event persistence |
+| Multiplayer | Partial | versioned native protocol, bounded TCP sessions, headless 20 TPS server, atomic level/chunk persistence, handshake and keep-alive validation | windowed client is still singleplayer; no player/chunk/block/inventory replication, reconnect flow, or two-client release scenario |
 
-### Combat & Weapons
-- [ ] **Attack cooldown**: JE-style cooldown bar, 84.8% threshold for crits/sweep
-- [ ] **Weapon damage**: sword (7), axe (9-10), trident (9), mace, bow, crossbow
-- [ ] **Critical hits**: player falling + cooldown ≥84.8% → 150% damage
-- [ ] **Sweep attack** (JE): sword AoE on grounded horizontal targets
-- [ ] **Sprint-knockback**: sprint + attack = extra knockback
-- [ ] **Shield**: blocks 100% melee damage, durability loss on >2 HP hits
-- [ ] **Axe vs shield**: 100% disable shield for 5 seconds
-- [ ] **Armor damage reduction**: `damage × (1 − min(20, max(armor/5, ...))/25)`
-- [ ] **Armor toughness**: diamond (8), netherite (12) — reduces high-damage effectiveness
-- [ ] **Mace smash**: bonus damage based on fall distance
-- [ ] **Spear combat**: jab/charge mechanics
-- [ ] **Damage sources**: drowning, suffocation, starvation, fire, lava, cactus, berry bush, lightning, void
-- [ ] **Natural regen formula**: requires hunger ≥18, 1 HP per 4s
-- [ ] **Saturation regen (JE)**: at full hunger, consumes 1.5 sat per 1 HP per 0.5s
+## Multiplayer Demo Contract
 
-### Status Effects
-- [ ] **Positive effects**: Speed, Haste, Strength, Jump Boost, Regeneration, Resistance, Fire Resistance, Water Breathing, Night Vision, Invisibility, Absorption, Slow Falling, Conduit Power, Dolphin's Grace, Luck, Health Boost, Saturation, Hero of the Village
-- [ ] **Negative effects**: Slowness, Mining Fatigue, Weakness, Poison, Wither, Hunger, Blindness, Nausea, Levitation, Darkness, Bad Omen, Infested, Oozing, Weaving, Wind Charged, Instant Damage
-- [ ] **Effect application**: potions, beacons, suspicious stew, mob attacks, environment
-- [ ] **Effect removal**: milk bucket (all), honey bottle (poison), death
-- [ ] **Undead immunity**: immune to Poison, Regeneration
+**Goal:** ship a native, server-authoritative demo quickly. Two or more local or remote clients can join the same persistent Overworld, see one another, move, chat, place and break supported blocks, and reconnect without losing authoritative player or world changes.
 
-## Phase 5: Items & Inventory
+**Demo scope:** headless dedicated server; custom versioned native protocol; LAN/direct-address connection; authoritative 20 TPS simulation; player/chunk/block/inventory replication; basic player visuals; text chat; connect/disconnect feedback; save-on-disconnect and clean server shutdown; bounded and observable networking failures.
 
-### Core Inventory
-- [ ] **Item ID registry**: all ~1100 items (blocks, tools, food, materials, etc.)
-- [x] **Basic hotbar**: 26 block types, scroll wheel + number keys 1-9, right-click places selected block
-- [ ] **Inventory model**: 36 main slots + 9 hotbar slots + 4 armor + offhand
-- [ ] **Creative inventory**: 12 tabs (building blocks, decoration, redstone, transport, misc, food, tools, combat, materials, spawn eggs, operator utilities, enchanting)
-- [ ] **Survival inventory**: only items player has collected
-- [ ] **Inventory screen**: render with wgpu (quad-based GUI)
-- [ ] **Hotbar HUD**: 9 slots at screen bottom, selected slot highlighted
-- [ ] **Item stacking**: up to 64 (16 for eggs, signs, buckets; 1 for tools/armor)
-- [ ] **Item durability**: tools/armor degrade with use, break at 0
-- [ ] **Off-hand**: shield, map, torch, etc.
-- [ ] **Drag-and-drop**: click to pick up, click to place, shift-click to move
-- [ ] **Number keys**: 1-9 select hotbar slots, Q drops item
-- [ ] **Item cooldown**: visual overlay for weapon/ender pearl
+**Demo non-goals:** Java protocol/account compatibility, matchmaking, public server browser, encryption/authentication beyond an explicit demo policy, client prediction, combat/mobs, complete inventories/containers, dimensions, redstone, broad block parity, graphical menus, moderation tooling, and packet-loss optimization. These are follow-up work, not blockers for the demo.
 
-### Dropped Items
-- [x] **Item dropping on break**: block drops as physics-enabled `DroppedItem` (gravity, bounce, friction, 300s despawn)
-- [x] **Item pickup**: within 2 blocks of player → experience +1, item removed
-- [x] **Block break particles**: 6 directional `DroppedItem` cubes with random velocity, 0.5–1.3s lifetime
-- [ ] **Item rendering**: held item in first-person view
-- [ ] **Item frames**: displayed item on wall
+**Release bar:** verify one server plus at least two independently launched clients: both clients join, occupy the same world, observe movement and block edits across chunk boundaries, exchange chat, disconnect/reconnect, and retain changes after a server restart. No client may authoritatively mutate the world or inventory.
 
-### Tool System
-- [ ] **5 tiers**: wood, stone, iron, gold, diamond, netherite
-- [ ] **Tool types**: pickaxe, axe, shovel, hoe, sword
-- [ ] **Mining speed**: correct base speed per tool (e.g. diamond pick 8.0 vs wood pick 2.0)
-- [ ] **Block hardness**: correct values for all blocks (e.g. stone 1.5, obsidian 50)
-- [ ] **Tool multiplier**: correct material multiplier (e.g. diamond 3×, wood 2×)
-- [ ] **Mining time formula**: `ceil(hardness × 1.5 / speed)` for correct tool, 5× slower for wrong tool
-- [ ] **Instant break**: tools with `speed × multiplier >= hardness × 30`
-- [ ] **Enchantments**: Efficiency, Fortune, Silk Touch, Unbreaking, etc.
-- [ ] **Correct drops**: silk touch returns block itself, fortune multiplies drops
-- [ ] **Tool breaking animation**: screen shake/wobble
+## Active Queue
 
-### Armor System
-- [ ] **5 tiers**: leather, chain, iron, gold, diamond, netherite
-- [ ] **4 slots**: helmet, chestplate, leggings, boots
-- [ ] **Armor points**: protection value per piece (e.g. diamond chestplate 8 points)
-- [ ] **Armor toughness**: reduces high-damage effectiveness (diamond/netherite)
-- [ ] **Knockback resistance**: from netherite armor
-- [ ] **Armor durability**: degrades with damage taken
-- [ ] **Enchantments**: Protection, Fire Protection, Blast Protection, Projectile Protection, Feather Falling, Thorns, etc.
+Do not start more than one large cross-cutting item at once. Update this list while work is active.
 
-### Crafting
-- [ ] **2×2 grid** (player inventory): all basic recipes
-- [ ] **3×3 grid** (crafting table): advanced recipes
-- [ ] **Shaped recipes**: exact pattern match with wildcards
-- [ ] **Shapeless recipes**: ingredient set without pattern
-- [ ] **Recipe book**: searchable, shows all possible recipes
-- [ ] **Vanilla recipe mappings**: all ~350+ recipes
-- [ ] **Smelting**: furnace, blast furnace (ores), smoker (food)
-- [ ] **Fuel system**: burn times (coal 80s, lava bucket 1000s, etc.)
-- [ ] **Experience from smelting**: ores give XP
-- [ ] **Cooking**: campfire cooking without fuel
+| Priority | Status | Work item | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| P0 | complete | Define the native multiplayer demo protocol and authority boundary | M2 fixed tick/persistence | Versioned handshake, message limits, ownership rules, disconnect behavior, and reject/error paths are documented and covered by serialization tests. |
+| P0 | complete | Extract and run a headless authoritative server | native simulation and persistence | A server owns the 20 TPS world, accepts a connection, saves safely, and runs without winit/wgpu. |
+| P0 | in progress | Deliver two-client join, spawn, chunk, movement, and block-edit replication | server, protocol | Server-side sessions, authoritative movement, initial player/inventory/chunk messages, multi-player-centered chunk retention, and stale/reach-checked block requests work; chunk-boundary release validation remains. |
+| P0 | in progress | Deliver demo chat, inventory synchronization, reconnect, and manual release scenario | session lifecycle and replication | Chat, hotbar/cursor inventory synchronization, automatic reconnect, and native player persistence exist; container actions, reconnect edge cases, and the two-client release bar remain. |
+| P1 | pending | Add client interpolation, prediction, reconciliation, and packet-loss handling | authoritative replication telemetry | Movement remains responsive and converges under controlled latency/loss without client-authoritative mutations. |
+| P1 | in progress | Complete graphical HUD, inventory, chat, and pause/settings screens | GUI atlas and input | Normal play no longer relies on debug/text fallback for supported screens. |
+| P2 | pending | Generalize block-state/model rendering and fluid simulation | asset pipeline, block-state representation | Expanded world content replicates with deterministic state and stable rendering. |
 
-### Food System
-- [ ] **All food items**: bread, steak, cooked porkchop, golden apple, etc.
-- [ ] **Hunger/food point mapping**: correct restoration per item
-- [ ] **Saturation mapping**: correct saturation per item
-- [ ] **Eating animation**: crouch, arm raise, bite sounds
-- [ ] **Effects**: golden apple (absorption+regeneration), suspicious stew (random effect)
-- [ ] **Saturation priority**: saturation consumed before hunger
+### Priority And Dependency Rules
 
-### Enchanting
-- [ ] **Enchanting table**: GUI with 3 slot book, lapis input, enchant buttons
-- [ ] **Enchantment registry**: all ~40 enchantments with effects
-- [ ] **Level cost**: based on item, enchantment, and random seed
-- [ ] **Anvil**: combine items, repair, rename, apply enchanted books
-- [ ] **Anvil cost**: prior work penalty (exponential cost per rename)
-- [ ] **Grindstone**: disenchant, repair combined items
-- [ ] **Experience bar**: 0-139 levels, grows linearly in XP needed per level
+- P0 is the multiplayer-demo critical path. Do not start parity, rendering, content, or UI expansion that does not directly unblock a P0 demo acceptance criterion.
+- P1 improves the demo after the release bar is met. A graphical placeholder is acceptable during development but is not a roadmap completion.
+- P2 resumes deferred breadth and parity work once it can consume the multiplayer foundation it needs.
+- Work from top to bottom within a milestone unless the task explicitly has no dependency on earlier bullets.
+- A later milestone can receive research, small isolated bug fixes, or test fixtures, but not production feature work that would force a new foundation.
+- If a feature exposes missing data, add the data-pipeline work to the earliest applicable milestone rather than hiding it in renderer or UI special cases.
 
-### Brewing
-- [ ] **Brewing stand**: GUI with ingredient slot, 3 potion slots, blaze powder fuel
-- [ ] **Base potions**: awkward potion (nether wart → water bottle)
-- [ ] **Effect potions**: 13 primary effects (speed, strength, healing, etc.)
-- [ ] **Modifiers**: redstone (extend duration), glowstone (amplify), gunpowder (splash)
-- [ ] **Potions rendering**: bottle with colored liquid + particles
+### Cross-Cutting Change Matrix
 
-## Phase 6: Mobs & Entities
+Use this matrix before editing. A change usually needs every listed layer, not just the first file that compiles.
 
-### Entity System
-- [ ] **ECS architecture**: position, velocity, health, AI components
-- [ ] **Entity types**: mobs, dropped items, XP orbs, projectiles, minecarts, boats
-- [ ] **Spatial index**: grid-based entity lookup for collision/AI
-- [ ] **Entity networking**: sync state for multiplayer
-- [ ] **Hitbox system**: per-entity AABB, attack cooldown
-- [ ] **Entity rendering**: textured quads (billboards for some, 3D model for others)
-- [ ] **Entity animation**: keyframe-based limb movement
+| Change | Inspect and update as needed |
+|---|---|
+| Block behavior/state | `world/block.rs`, chunk storage, `ChunkManager` mutation/lighting, mesh classification, texture mapping, drops, collision, inventory item mapping, worldgen, UI/debug names |
+| Block appearance | blockstate/model loader, texture atlas, mesh vertex data/material flags, Rust uniform layout, WGSL shader, opaque/translucent pass selection |
+| Chunk or lighting data | `Chunk`, `ChunkManager`, async task snapshots/revisions, mesh invalidation, GPU render cache, chunk-boundary behavior |
+| Item/inventory rule | `inventory/item.rs`, `inventory/mod.rs`, main input/UI integration, dropped-item behavior, player mechanics, serialization design |
+| Player mechanic | `player/`, camera/input integration, collision and world queries, HUD feedback, gamemode and difficulty behavior |
+| GUI/input change | `engine/input.rs`, `main.rs` event handling, GUI atlas/renderer/text, cursor grab/release, window resize and focus-loss paths |
+| GPU/shader change | Rust `#[repr(C)]` data layout, bind groups/pipelines, WGSL struct layout, all passes using the data, resize/recreate paths |
+| Asset change | `assets/`, `VIBECRAFT_ASSETS` layout, fallback/error path, atlas capacity, shader atlas constants, real asset smoke test |
 
-### Passive Mobs
-- [ ] **Sheep**: 16 wool colors, shearing, eat grass to regrow wool
-- [ ] **Cow**: milk with bucket, drops leather + beef
-- [ ] **Pig**: drops porkchop, saddled for riding
-- [ ] **Chicken**: lays eggs, drops feather + chicken, falls slowly
-- [ ] **Rabbit**: 3 skin variants, drops rabbit hide + foot (rare)
-- [ ] **Horse**: 6 colors, 4 patterns, speed/jump stats, tame and ride
-- [ ] **Donkey + Mule**: carry chest, can be saddled
-- [ ] **Wolf**: tame with bones, attack mobs, follow player
-- [ ] **Cat**: ocelot or stray, scare creepers, gift items
-- [ ] **Fox**: sleep in shade, attack chickens, hold items in mouth
-- [ ] **Axolotl**: fight underwater mobs, play dead
-- [ ] **Frog**: eat small slime, produce froglight
-- [ ] **Turtle**: lay eggs on beach, hatch into baby turtles
-- [ ] **Fish**: cod, salmon, pufferfish, tropical fish (3000+ variants)
-- [ ] **Squid + Glow Squid**: ink particles when hit
+## Milestones
 
-### Neutral Mobs
-- [ ] **Zombified Piglin**: spawn in nether, neutral unless hit, group aggro
-- [ ] **Wolf**: neutral until attacked, pack attack
-- [ ] **Polar Bear**: neutral unless cubs near by
-- [ ] **Spider**: neutral in light, hostile in dark
-- [ ] **Enderman**: neutral when stared at, teleports, picks up blocks
-- [ ] **Llama**: spit attack, follow caravans
-- [ ] **Bee**: pollinate flowers, sting once then dies, honey production
+### M0: Product Contract And Engineering Guardrails
 
-### Hostile Mobs
-- [ ] **Zombie**: burns in sunlight, breaks doors, variants (husk, drowned)
-- [ ] **Skeleton**: strafes, shoots arrows, burns in sunlight
-- [ ] **Creeper**: hisses, explodes, charged (lightning) = stronger
-- [ ] **Spider**: climbs walls, jumps, leaves webs in abandoned mineshafts
-- [ ] **Witch**: throws splash potions (poison, slowness, weakness, harming, healing)
-- [ ] **Slime**: splits into smaller sizes, spawns in swamps/slime chunks
-- [ ] **Phantom**: spawns after 3+ days without sleep, diving attack
-- [ ] **Guardian + Elder Guardian**: laser attack, guardians in ocean monuments
-- [ ] **Ravager**: village raid mob, destroys crops
-- [ ] **Pillager + Vindicator + Evoker**: raid mobs, allay stealing
-- [ ] **Ghast**: floats in nether, shoots fireballs
-- [ ] **Magma Cube**: nether slime, splits, fire resistant
-- [ ] **Blaze**: spawns in nether fortresses, shoots fireballs
-- [ ] **Wither Skeleton**: drops wither skulls, inflicts wither effect
-- [ ] **Hoglin + Zoglin**: nether mobs, hoglin drops porkchop, zoglin attacks everything
-- [ ] **Piglin + Brute**: gold armor/tools, bartering system, brute is stronger
+**Purpose:** make later work measurable and prevent incompatible one-off systems.
 
-### Boss Mobs
-- [ ] **Ender Dragon**: 200 HP, perches on portal, destroys blocks, end crystals heal
-- [ ] **Wither**: 300 HP (java) / 600 HP (bedrock), wither effect, drops nether star
-- [ ] **Elder Guardian**: guardian with mining fatigue, in ocean monuments
+- [x] Pin a Java Edition target version and document whether Java save/protocol compatibility is a goal or only gameplay compatibility. Target: Java Edition 1.21.1 assets and gameplay behavior. Java save/protocol compatibility is not a goal; persistence and networking formats remain native and versioned.
+- [x] Add CLI/config support for seed, world directory, render distance, graphics settings, and keybindings. `vibecraft.json` and command-line overrides are validated at startup; the world directory is created now and reserved for M2 persistence.
+- [x] Split reusable simulation logic from the executable entry point so it can be tested without window/GPU setup. `src/lib.rs` exports the simulation and configuration modules; `main.rs` is the windowed application shell.
+- [x] Add deterministic unit tests for block state, inventory, raycast, lighting, world generation, and player damage/movement rules. Tests run through the library target without window or GPU setup.
+- [x] Add crash-resistant error paths for assets, GPU setup, worker failures, and corrupt save data. Startup validates configuration, asset root, window/event-loop, surface, adapter, device, and surface formats; worker panics become logged retriable failures. Save data remains an M2 feature, so the currently applicable corrupt on-disk input is JSON configuration.
+- [x] Create a reproducible screenshot/manual-check scene for renderer regressions. `RENDER_CHECK.md` fixes the seed, settings, launch command, capture timing, and comparison baseline.
 
-### Mob AI Systems
-- [ ] **A* pathfinding**: 3D grid-based, with jump nodes
-- [ ] **Sensing**: follow range (16 default), retaliate range
-- [ ] **Spawn mechanics**: light level ≤ 7 for hostile, biome + block constraints
-- [ ] **Despawning**: 128 blocks radius despawn for hostile, 32 for passive
-- [ ] **Day/night cycle**: hostile mobs burn in sunlight (except spiders in light)
-- [ ] **Equipment**: zombies/skeletons can hold items, wear armor
-- [ ] **Riding**: skeletons on spiders, baby zombies on adults, etc.
-- [ ] **Village raids**: waves of pillagers, bad omen effect
+**Exit criteria:** a world can be reproduced by seed and settings; core rules have tests; failures are reported rather than hidden by silent fallback or panic.
 
-### Trading & Economy
-- [ ] **Villager professions**: 13+ jobs (armorer, butcher, cleric, farmer, etc.)
-- [ ] **Career levels**: Novice→Apprentice→Journeyman→Expert→Master (XP-based unlocks)
-- [ ] **Trading GUI**: input/output slots, emerald currency, locked/unlocked trades
-- [ ] **Restocking**: 2×/day when working at job site block
-- [ ] **Pricing**: demand, reputation, Hero of the Village discounts
-- [ ] **Wandering Trader**: random trades, llama escorts
-- [ ] **Piglin bartering**: gold ingot → random items in Nether
-- [ ] **Zombie villager curing**: permanent discount
+**Recommended delivery order:** pin the reference version and asset source; make seed/config reproducible; extract pure logic into testable modules; add fixture tests; then define persistence boundaries. Avoid choosing a final save format while block state and item representations are still unstable.
 
-## Phase 7: Redstone & Technical
+### M1: Data-Driven World Representation And Rendering
 
-### Wire & Gates
-- [ ] **Redstone dust**: 15-level power, connects to adjacent components, updates in topological order
-- [ ] **Redstone torch**: inverted signal, burn-out on rapid toggle
-- [ ] **Repeater**: 1-4 tick delay, diode behavior, lockable by side repeater
-- [ ] **Comparator**: subtract/mode compare, read container fullness
-- [ ] **Redstone block**: always-powered block
-- [ ] **Redstone lamp**: on/off based on power
-- [ ] **Target block**: emits signal strength based on projectile hit position
-- [ ] **Observer**: detects block state change, emits 1-tick pulse
+**Purpose:** replace special cases with the data needed to support vanilla blocks correctly.
 
-### Pistons
-- [ ] **Piston**: pushes up to 12 blocks, extended/retracted state as block model
-- [ ] **Sticky piston**: pushes and pulls, slime-based sticking
-- [ ] **Piston physics**: block pushing rules (cannot push certain blocks)
-- [ ] **Piston animation**: gradual extension/retraction rendering
-- [ ] **Block dropping**: pushed blocks become items if they would break
+### 2026-07-13: M1 stateful placement and connected-model completion
+- Owner: OpenCode
+- Scope: Add the missing stateful placement, neighbor-state recomputation, generic model families, fluid surface mesh, tint data, texture animation/mip chain, and transparent ordering foundations. Block-entity persistence, gameplay interaction, and scheduled simulation remain M2/M3/M6 work.
+- Depends on: M1 registry and resolved-model foundation
+- Acceptance: Representative stateful blocks place through normal input, resolve to generic model geometry, and rebuild correctly at chunk boundaries; renderer consumes tint and texture-animation data without asset I/O in workers.
+- Status: in progress
 
-### Storage & Transport
-- [ ] **Chest**: 27 slots, double chest (54 slots) when adjacent
-- [ ] **Trapped chest**: emits redstone signal based on open state
-- [ ] **Barrel**: 27 slots, easier to open with block above
-- [ ] **Shulker box**: 27 slots, retains inventory when broken, colored variants
-- [ ] **Hopper**: 5 slots, pulls items from container above, pushes to container below/adjacent
-- [ ] **Dropper**: 9 slots, ejects item on pulse
-- [ ] **Dispenser**: 9 slots, activates item on pulse (arrows, eggs, water, etc.)
-- [ ] **Water + lava**: flow mechanics (spread, source blocks, currents)
-- [ ] **Bubble column**: soul sand (upward) / magma block (downward) in water
+### 2026-07-12: M1 registry and resolved-model foundation
+- Owner: OpenCode
+- Scope: Introduce registry-backed block definitions and compact property states, then extend deterministic blockstate/model resolution. Existing cube/crossed/slab/stair rendering remains as a compatibility path; fluids, biome tint, texture animation, and generic geometry follow this foundation.
+- Depends on: Java Edition 1.21.1 target policy
+- Acceptance: Normal placement retains default state behavior; registry state schemas round-trip for supported families; resolver tests cover deterministic variants, weighted selection, rotations, multipart conditions, and multi-element metadata.
+- Status: partial
+- Notes: Native save/protocol formats are explicitly not Java-compatible. Parent inheritance, texture variables, UV/tint metadata, and all model elements are represented by the resolver. Startup now caches resolved slab/stair model assets and their textures for worker-safe generic element emission; the terrain mesher retains legacy cube/crossed/fluid and unsupported-family paths. Fluids, tint propagation, texture animation, mipmaps, block entities, and generic connected models remain required for M1 exit.
 
-### Advanced Mechanics
-- [ ] **Piston block dropping**: pushed blocks break if they can't be placed (torch, sugar cane, etc.)
-- [ ] **Update order**: redstone updates in specific order per tick
-- [ ] **0-tick pulses**: pistons can extend/retract in 0 ticks with specific setups
-- [ ] **Quasi-connectivity**: pistons can be powered by block above them (Java Edition feature)
-- [ ] **Bud switch**: block update detector using quasi-connectivity
-- [ ] **Chunk loading**: spawn chunks always loaded, portal chunk loading
+- [ ] Replace enum-only block behavior with a registry-backed block definition, state schema, tags, hardness, collision shape, light opacity/emission, drops, and sound group.
+- [ ] Represent arbitrary block properties rather than overloading one data byte for unrelated states.
+- [ ] Load blockstates/models deterministically, including weighted variants, rotations, multipart conditions, parent inheritance, texture variables, tint indices, and all model elements.
+- [ ] Mesh cube, crossed, fluid, and arbitrary model-element geometry from resolved block state and neighbor state.
+- [ ] Carry biome color data to vertices/fragments for grass, foliage, water, fog, and sky instead of baking a plains tint into the atlas.
+- [ ] Implement texture animation metadata, mipmaps, cutout/translucent material rules, destroy stages, and robust translucent ordering.
+- [ ] Validate and extend frustum culling, add occlusion/LOD where justified, and profile generation, meshing, upload, and draw costs before raising render distance.
 
-### Transportation
-- [ ] **Minecart**: on rails, speed 8 m/s on powered rail
-- [ ] **Powered rail**: accelerates when powered, brakes when unpowered
-- [ ] **Detector rail**: emits redstone when minecart passes
-- [ ] **Activator rail**: activates TNT/hopper/command/furnace minecart functions
-- [ ] **Boat**: on water (8 m/s), on ice (40+ m/s depending on ice type)
-- [ ] **Horse riding**: taming, speed/jump stats, saddles
-- [ ] **Pig riding**: saddle + carrot on a stick for steering
-- [ ] **Elytra**: gliding with pitch control, firework boost
-- [ ] **Soul sand bubble column**: upward in water (14 m/s)
-- [ ] **Magma block bubble column**: downward in water (6 m/s)
-- [ ] **Ladder/Vine climbing**: 2.35 m/s upward
-- [ ] **Stairs**: faster vertical movement than jumping (3.2 m/s)
+**Exit criteria:** representative vanilla blocks (doors, fences, plants, fluids, redstone dust, chests, stairs, slabs, tinted blocks) can be described and rendered without adding a new meshing special case per block family.
 
-### Explosions
-- [ ] **Explosion causes**: creeper (power 3), TNT (power 4), bed/anchors (power 5), charged creeper (6), wither spawn (7), ghast fireball (1)
-- [ ] **Entity damage formula**: `7 × power × (impact² + impact) + 1`
-- [ ] **Block destruction**: power × random(0.7, 1.3) intensity, 1352 rays from center
-- [ ] **Blast resistance**: applies per block (obsidian 1200, stone 6, etc.)
-- [ ] **Fire from explosions**: 1/3 destroyed blocks ignite for fire-causing explosions
-- [ ] **Creeper charging**: lightning strike → charged creeper (power 6)
-- [ ] **TNT chain reaction**: adjacent TNT ignites from explosion
+**Recommended delivery order:** define registry/state data first; resolve blockstate/model data deterministically; make one generic model-element path; add material/tint data to vertices; then support fluid geometry and texture animation. Keep the current cube/crossed/slab/stair paths working until the generic path has visual regression coverage.
 
-## Phase 8: Dimensions
+### M2: Singleplayer Game Loop And Persistence
 
-### Nether
-- [ ] **Nether terrain**: 128-block height, ceiling, lava ocean at y=31
-- [ ] **Biomes**: Nether Wastes, Crimson Forest, Warped Forest, Soul Sand Valley, Basalt Deltas
-- [ ] **Nether generation**: large cave-like tunnels, exposed lava, glowstone clusters
-- [ ] **Nether fossils**: bone block structures in soul sand valleys
-- [ ] **Nether fortresses**: bridge/corridor structures with blaze spawners
-- [ ] **Bastion remnants**: piglin structures with treasure rooms, housing, bridges, hoglin stables
-- [ ] **Portal mechanics**: build 4×5 obsidian frame, light with flint+steel, player teleports to matching coords
-- [ ] **Nether scaling**: 1 block in nether = 8 blocks in overworld
+**Purpose:** make a world worth playing and safe to evolve.
 
-### The End
-- [ ] **End terrain**: floating islands with end stone, chorus plants
-- [ ] **End pillars**: obsidian pillars with end crystals on top (heal dragon)
-- [ ] **End gateway**: small exit portal after dragon death
-- [ ] **End city**: tower/gateway structures with shulker spawners, elytra
-- [ ] **Chorus plant**: grows on end stone, teleports player when broken
-- [ ] **End portal**: stronghold portal room, 12 eyes of ender required
-- [ ] **Exit portal**: spawns after dragon defeat, returns to overworld spawn
+### 2026-07-13: M2 native singleplayer foundation
+- Owner: OpenCode
+- Scope: Add a fixed simulation boundary, versioned native level/player/chunk persistence, atomic writes, chunk unload safety, persistent daylight rule, and world-spawn respawn. Beds, block entities, general entities, and scheduled-event persistence remain deferred because their runtime models do not exist.
+- Depends on: M0 persistence policy and current chunk lifecycle
+- Acceptance: A changed chunk, player inventory/position, world seed, time, and daylight rule survive a clean quit/reopen; corrupt data is reported without regeneration; simulation advances at 20 TPS independently of render frames.
+- Status: complete
+- Notes: Native JSON envelopes carry format/data versions and use atomic file replacement. Data version 2 migrates version-1 level saves without replacing corrupt data. Changed chunks save before stream unload and flush on autosave, `/save`, and `/quit`; `/quit` keeps the process alive when a save fails. Saved lighting, meshes, worker state, and GPU data are rebuilt rather than serialized. Fixed 20 TPS scheduling persists water/lava work and specialized dropped-item/XP state, while deferred unloaded work remains queued. World spawn selection and `doDaylightCycle` are persistent and command-backed. Beds, block entities, per-player spawn points, and general entities remain M3/M5/M6 prerequisites rather than hidden one-off systems.
 
-## Phase 9: Multiplayer
+- [x] Introduce a fixed 20 TPS simulation clock with clear client/render interpolation boundaries.
+- [ ] Define tick scheduling for blocks, fluids, random ticks, entities, and scheduled events with chunk-load safety.
+- [ ] Save/load level metadata, chunks, player data, inventories, block entities, scheduled ticks, and world seed.
+- [x] Implement autosave, explicit save/quit, atomic writes, corruption handling, and backward data-version migration.
+- [ ] Add spawn selection, beds/spawn points, death/respawn, gamerules, and command behavior backed by the simulation state.
+- [x] Add configurable render distance and safe chunk loading/unloading around the player.
 
-### Server Architecture
-- [ ] **Headless server**: no rendering, tick-based world simulation
-- [ ] **Client-server protocol**: custom protocol over TCP (QUIC later)
-- [ ] **Connection handshake**: version check, authentication (Yggdrasil or offline)
-- [ ] **Player authentication**: offline mode (local) or Mojang/Microsoft auth
-- [ ] **Chunk sync**: send chunk data to clients on load
-- [ ] **Entity sync**: player positions, mob positions, updates at 20 Hz
-- [ ] **Block updates**: broadcast block changes to all clients
-- [ ] **Inventory sync**: player inventory, container contents
-- [ ] **Keep-alive**: client-server heartbeat, timeout after 30 seconds
+**Exit criteria:** a changed singleplayer world can be quit, reopened, and continue identically without losing blocks, player state, inventories, or scheduled behavior.
 
-### Server Features
-- [ ] **Tick loop**: 20 ticks per second (50ms per tick)
-- [ ] **Mob spawning**: server-side spawning, sync to clients
-- [x] **Command system**: /gamemode, /time set, /give, /help, /summon (structures)
-- [ ] **Operator system**: op levels, permissions
-- [ ] **Whitelist/blacklist**: player access control
-- [ ] **Server properties**: view distance, max players, motd, etc.
-- [ ] **World saving**: region file format (anvil-compatible)
-- [ ] **Player data**: inventory, position, stats per player file
+**Recommended delivery order:** establish the fixed tick boundary; introduce serializable DTOs separate from runtime GPU/thread state; persist simple level/player/chunk data; add atomic write/recovery; finally persist scheduled ticks and block entities. Never serialize wgpu handles, channels, `Arc` worker state, or cache-only mesh data.
 
-### Commands
-- [x] **Core commands**: `/gamemode` (with aliases), `/time set <0-1200|day|night>`, `/give <block> [count]`
-- [x] **Structure commands**: `/summon dungeon|portal|lava|mushroom|tree|igloo|swamp_hut|well|ruin`
-- [ ] **World commands**: `/weather`, `/difficulty`, `/seed`
-- [ ] **Entity commands**: `/kill`, `/effect`, `/enchant`
-- [ ] **Player commands**: `/xp`, `/spawnpoint`, `/setworldspawn`
-- [ ] **Gamerule commands**: `/gamerule` (doDaylightCycle, keepInventory, fallDamage, etc.)
-- [ ] **Operator commands**: `/op`, `/deop`, `/ban`, `/whitelist`, `/stop`, `/save-all`
-- [ ] **Target selectors**: `@p`, `@a`, `@r`, `@e`, `@s`
-- [ ] **Advancement commands**: `/advancement grant/revoke`
-- [ ] **Data commands**: `/data get/merge/remove` for block/entity NBT
-- [ ] **Scoreboard**: `/scoreboard objectives/list/players` for tracking
+### M3: Player, Items, And Core Progression
 
-## Phase 10: Polish & Optimization
+**Purpose:** provide the survival loop before filling out content.
 
-### Audio
-- [ ] **Sound engine**: kira or rodio, 3D positional audio
-- [ ] **Block sounds**: per-block break, place, step, hit sounds
-- [ ] **Ambient sounds**: cave sounds, biome ambience, weather
-- [ ] **Music**: background music tracks, biome-specific
-- [ ] **Mob sounds**: idle, hurt, death per mob
-- [ ] **UI sounds**: click, pop, inventory open/close
-- [ ] **Weather sounds**: rain, thunder
+### 2026-07-13: M3 survival-loop implementation
+- Owner: OpenCode
+- Scope: Replace the unsafe shared block/item ID assumption; make item stacks, drops, equipment, mining, recipes, furnace processing, player crafting, and survival death state reusable and persisted. The user explicitly authorized prerequisite M5/M6/M8 platform work needed to complete M3 literally: entity/projectile lifecycle, redstone-facing container behavior, and first-person presentation. Full mob content, AI families, Java data-pack compatibility, and broad UI/accessibility work remain separately scoped after the required substrate.
+- Depends on: M2 fixed simulation and native persistence
+- Acceptance: Normal mouse/keyboard play supports gathering, crafting, smelting, equipping, block interaction, item pickup, death/respawn, and inventory-loss rules without debug commands; pure rules have regression tests.
+- Status: in progress
+- Notes: Item identity is now independent from block IDs; stacks carry durability and persist, dropped stacks merge/pick up without loss, and local/server mining use shared harvest, mapped-drop, quantity, and tool-damage rules. The inventory screen now exposes cursor-based 2x2 shaped crafting, preserves damaged stacks, and returns unfinished ingredients safely when closed. Player crafting and furnace rules, persisted chest/furnace entities, fixed-tick furnace processing, direct chest/furnace interaction, armor equipment with slot validation, and `keepInventory` persistence are present. A tested entity/projectile substrate, visible training dummy, basic melee path, and temporary first-person hand overlay exist. Graphical table/chest/furnace screens, held-item animation, broader recipe/loot coverage, automation/brewing blocks, entity persistence, shields/projectile input, and target-version parity remain required before checking any M3 item complete.
 
-### Weather
-- [ ] **Rain**: falling particles, sky light = 12, extinguishes fire
-- [ ] **Snow**: snow layer accumulation, cauldrons fill with powder snow
-- [ ] **Thunderstorm**: sky light = 10, mobs spawn daytime, lightning strikes
-- [ ] **Lightning**: 5 HP damage, transformations (creeper→charged, pig→zombified, villager→witch)
-- [ ] **Weather duration**: rain 10-20 min, thunder 3-13 min, random delays between
-- [ ] **Biome-dependent**: temperature/humidity determine rain vs snow
+### 2026-07-14: M3 survival interaction slice
+- Owner: OpenCode
+- Scope: Connect shaped player crafting, harvest-aware drops, server-side mining validation, durable inventory cursor movement, and armor-slot validation to normal mouse/keyboard play. Container-specific screens, broad recipe/loot data, projectile input, and entity persistence remain non-goals for this slice.
+- Depends on: M2 fixed simulation and native persistence; existing M3 progression and inventory foundations
+- Acceptance: A survival player can open the inventory, place ingredients in the rendered 2x2 grid, collect a valid shaped output, close without losing ingredients, mine stone/coal with correct mapped drops, and equip armor only in its matching slot; local and network block breaks reject unharvestable tools.
+- Status: complete
+- Notes: Added pure recipe/harvest regression tests and retained the parent M3 status as in progress because the remaining M3 gaps are still material.
 
-### Graphics
-- [x] **Fog**: distance fog, density=0.002, color matches sky
-- [x] **Sky rendering**: atmospheric fog color transitions, sun color warm at dawn/dusk, neutral at noon
-- [ ] **Clouds**: 3D cloud layer at y=192 (render as translucent quads)
-- [x] **Water rendering**: Fresnel reflection, sky reflection, depth-based color, animated shimmer
-- [ ] **Lava rendering**: static texture, no emissive glow or animation
-- [~] **Block break particles**: reuses DroppedItem system (6 directional cubes, 0.5–1.3s lifetime)
-- [ ] **Armor model**: player model with armor overlay
-- [ ] **Item rendering**: held item in first-person view
-- [ ] **Item frames**: displayed item on wall
-- [ ] **Painting**: random painting selection on wall
-- [ ] **Nametag rendering**: floating text above entities
-- [ ] **Block breaking animation**: crack overlay on block being mined
-- [x] **Chunk borders**: F3+G toggle, vertical corner lines + horizontal edges
+- [ ] Match player collision, stepping, crouching, swimming, climbing, fall damage, exhaustion, oxygen, and status-effect rules to the target version.
+- [ ] Render first-person hand and held items with use, swing, equip, hurt, and view-bob animations.
+- [ ] Implement canonical item stacks: max sizes, durability, damage, cooldowns, attributes, food effects, equipment, and offhand behavior.
+- [ ] Implement mining time, harvest requirements, tool effectiveness, drops, loot tables, and experience.
+- [ ] Implement 2x2 and 3x3 crafting, recipe data, furnace-family processing, fuel, and recipe-book foundations.
+- [ ] Implement reusable container and block-entity foundations, then the survival-loop blocks: chest, furnace, crafting table, hopper, dispenser/dropper, and brewing stand.
+- [ ] Implement combat primitives: melee, knockback, shields, projectiles, armor, enchantment hooks, and damage sources.
 
-### UI/UX
-- [ ] **Main menu**: title screen, singleplayer, multiplayer, settings, quit
-- [ ] **Pause menu**: ESC overlay with save, settings, disconnect
-- [ ] **Settings menu**: video (render distance, graphics quality, FOV), audio (volume sliders), controls (key bindings)
-- [x] **Debug screen**: F3 overlay with position, FPS, chunk stats, targeted block, biome, facing, game time
-- [x] **Command console**: `/` opens inline text input, vanilla syntax, feedback display
-- [ ] **Chat**: T to open, text input, command suggestions
-- [ ] **Advancements**: progress tracking with toast notifications
-- [ ] **Statistics**: per-player tracking of blocks mined, mobs killed, etc.
-- [ ] **Recipe book**: searchable, unlockable recipes
-- [ ] **Tooltips**: item name, lore, enchantments, attributes
-- [ ] **Crosshair**: dynamic, changes when targeting interactive block
-- [ ] **Boss bar**: dragon/wither health bar at top of screen
-- [ ] **Subtitle system**: accessibility text for sounds
+**Exit criteria:** a player can gather, craft, smelt, equip, fight, die, respawn, and retain or lose items according to configured gamerules without debug commands.
 
-### Performance
-- [x] **Multi-threaded chunk generation**: generate terrain on thread pool (CPU-count workers)
-- [ ] **Multi-threaded meshing**: build chunk meshes in parallel
-- [x] **Incremental meshing**: only re-mesh chunks whose blocks changed (dirty flag)
-- [ ] **LOD system**: render distant terrain at lower resolution
-- [ ] **Occlusion culling**: frustum culling removed, all loaded chunks rendered
-- [ ] **Visible face caching**: skip neighbor face checks for interior faces
-- [ ] **Texture atlas mipmaps**: better distant rendering
-- [x] **Buffer cache**: reuse GPU buffers across frames for unchanged chunks
-- [x] **Cached depth texture**: created once and reused per frame (not re-allocated each frame)
-- [ ] **Dynamic render distance**: adjust based on frame time
-- [ ] **Entity culling**: skip rendering entities behind camera or far away
-- [ ] **Model LOD**: lower-poly entity models at distance
+**Recommended delivery order:** correct item stack/equipment invariants; make mining and drops data-driven; add crafting/smelting; add containers; then implement combat/projectiles. Each step should work through mouse input and the inventory UI, not only `/give` or debug state.
 
-### World Persistence
-- [ ] **World save format**: Minecraft anvil format (region files, NBT data)
-- [ ] **Player save**: inventory, position, stats in player.dat
-- [ ] **Chunk compression**: zlib or Zstd compression
-- [ ] **Autosave**: periodic world save
-- [ ] **Level.dat**: world settings (seed, time, spawn, gamerules)
-- [ ] **Backup system**: incremental backups on save
-- [ ] **Resource pack loading**: load real Minecraft textures from .zip
-- [ ] **Data pack support**: load advancements, recipes, loot tables, tags
+### M4: Overworld Content And Environmental Simulation
 
-### Game Customization
-- [ ] **Resource packs**: load custom textures, models, sounds from .zip
-- [ ] **Data packs**: add/modify recipes, loot tables, advancements, functions
-- [ ] **Game rules**: `/gamerule` (mobGriefing, doFireTick, doMobSpawning, etc.)
-- [ ] **World types**: Default, Superflat, Amplified, Large Biomes
+**Purpose:** make the Overworld generate and evolve like the target version.
 
-## Legend
-- `[x]` = done
-- `[ ]` = not started
-- `[~]` = partial/in progress
+- [ ] Port or faithfully reproduce target-version biome, density, surface, aquifer, cave, ore, and feature rules using reference seeds for comparison.
+- [ ] Add missing overworld biomes and biome-dependent colors, precipitation, features, and spawn rules.
+- [ ] Add naturally generated structures in dependency order: small features/geodes, villages/outposts, dungeons/mineshafts, temples, monuments, strongholds, ancient cities, trail ruins, and trial chambers.
+- [ ] Implement crop growth, farmland, leaves, fire, snow/ice, weather, lightning, and other random/scheduled block behavior.
+- [ ] Implement weather simulation and visual/audio effects, including biome-dependent rain/snow and thunder behavior.
+- [ ] Add world-generation snapshot tests for stable seed/coordinate fixtures and structure-placement checks.
+
+**Exit criteria:** normal exploration produces stable, biome-appropriate terrain and structures, and environmental mechanics continue correctly after save/load and chunk reload.
+
+**Recommended delivery order:** create fixed seed fixtures before changing generation; validate density/surface/caves/ores; add biome-specific features; add small structures; add large structures with spacing rules; then add scheduled environmental behavior. Do not let decoration depend on chunk-generation order.
+
+### M5: Entity Platform And Vanilla Mobs
+
+**Purpose:** build one scalable entity system before adding mob lists.
+
+- [ ] Implement entity identity, lifecycle, components/state, spatial queries, collision, interpolation, serialization, and chunk activation/despawning.
+- [ ] Implement entity rendering, model animation, hitboxes, nametags, particles, sounds, and projectile support.
+- [ ] Implement AI goals, sensing, navigation, target selection, breeding, loot, equipment, and spawn caps/rules.
+- [ ] Ship a representative vertical slice: zombie, skeleton, creeper, cow, sheep, chicken, villager, and boat/minecart.
+- [ ] Expand by shared behavior families, then implement raids, trading, bosses, and version-specific mobs.
+- [ ] Add deterministic AI/combat/spawn tests and stress tests for entity counts.
+
+**Exit criteria:** entities are persistent, render and collide correctly, simulate under the 20 TPS budget, and representative passive/hostile/neutral gameplay works in naturally generated worlds.
+
+**Recommended delivery order:** entity identity and storage; collision/spatial queries; rendering; lifecycle/save-load; projectiles and damage; AI goals/pathing; representative mobs; then content expansion. Avoid a second ad-hoc entity representation for every mob family.
+
+### M6: Block Entities, Redstone, And Automation
+
+**Purpose:** support stateful blocks and Java Edition automation semantics.
+
+- [ ] Extend block-entity support for redstone-facing inventories, ticking, serialization, rendering, and neighbor updates.
+- [ ] Implement redstone power propagation, component update scheduling, repeaters, comparators, observers, lamps, and container signals.
+- [ ] Implement pistons, movable block rules, block events, quasi-connectivity policy, and Java-specific update-order behavior.
+- [ ] Implement transport and automation: hoppers, dispensers, droppers, rails/minecarts, boats, and item transfer rules.
+- [ ] Add redstone fixture worlds with expected per-tick traces before claiming Java parity.
+
+**Exit criteria:** a documented suite of common circuits and automation fixtures behaves deterministically at 20 TPS, including save/load and chunk-boundary cases.
+
+**Recommended delivery order:** neighbor update/event queue semantics; power queries; basic components; container signals; pistons; rails/transport. Record tick-by-tick expected results for each fixture because Java redstone behavior is sensitive to update ordering.
+
+### M7: Dimensions And Endgame
+
+**Purpose:** complete progression without creating dimension-specific forks of core systems.
+
+- [ ] Add dimension definitions, coordinate transforms, portals, independent time/weather policies, and per-dimension save data.
+- [ ] Implement Nether generation, biomes, structures, portal linking, mobs, and netherite progression.
+- [ ] Implement End generation, stronghold/end portal flow, dragon fight, gateways, end cities, shulkers, and elytra loop.
+- [ ] Verify portal, respawn-anchor, bed-explosion, and cross-dimension entity/item edge cases.
+
+**Exit criteria:** a survival player can reach the Nether and End through normal progression, defeat the dragon, and retain a coherent saved world across all dimensions.
+
+**Recommended delivery order:** dimension abstraction and save keys; portal linking; Nether terrain/content; stronghold and End portal progression; End terrain/content; dragon/gateway flow. Do not encode dimension assumptions in Overworld-only worldgen, chunk storage, or player respawn code.
+
+### M8: Complete Presentation And Accessibility
+
+**Purpose:** make supported gameplay feel complete rather than debug-driven.
+
+- [ ] Complete title, world-select, multiplayer, pause, options, controls, accessibility, chat, command suggestions, tooltips, toasts, subtitles, statistics, and advancements.
+- [ ] Implement positional sound, sound categories, music, ambience, weather, entity sounds, and resource-driven sound events.
+- [ ] Implement resource packs first, then data packs for recipes, loot tables, tags, advancements, functions, and worldgen where feasible.
+- [ ] Add localization support and remove hardcoded English-only gameplay strings.
+- [ ] Profile and improve culling, LOD, texture streaming/mipmaps, entity visibility, and dynamic quality without changing simulation semantics.
+
+**Exit criteria:** a player can configure, navigate, understand, and play the supported game without developer-only UI or hardcoded asset assumptions.
+
+**Recommended delivery order:** core menus/settings and input rebinding; chat/command UX; inventory/container polish; sound categories and positional events; accessibility/localization; packs; then performance options. UI screens must own their focus/cursor behavior and not leak gameplay input.
+
+### 2026-07-14: GUI state, HUD, inventory, and menu presentation
+- Owner: OpenCode
+- Scope: Restore the reusable UI state/layout layer; render the HUD, health/hunger meters, chat, toasts, inventory slots, carried items, tooltips, pause, options, controls, and accessibility screens through the orthographic GUI path; release gameplay input while a screen or chat owns focus.
+- Depends on: GUI atlas and input plumbing
+- Acceptance: Escape opens a navigable pause screen, supported menu actions work with mouse and keyboard, inventory clicks use the rendered slot layout, chat/cursor focus does not rotate or move the player, and UI rendering survives resize.
+- Status: partial
+- Notes: HUD, inventory backgrounds, status icons, crosshair, and known item icons now come from the official 1.21.1 asset checkout through the GUI atlas. The current implementation intentionally keeps the existing world initialization and native inventory/container scope. Title/world-select/multiplayer screen lifecycle, runtime key rebinding, and full localization remain follow-up work.
+
+### M9: Multiplayer Demo And External Compatibility
+
+**Purpose:** ship the playable multiplayer demo first, then evolve it toward resilient multiplayer and any explicitly chosen compatibility commitments.
+
+**Current progress:** the protocol contract and headless server foundation are complete. Server-side authoritative sessions now own movement intent, player spawn/despawn/update messages, initial inventory snapshots, compact loaded-chunk streaming, and revision/reach-checked block requests. The windowed client now consumes this transport for authoritative player/chunk/block/inventory/chat state; unsupported network drops are rejected without local mutation, and permanent disconnects no longer reconnect forever. The next critical slice is reconnect/release validation, dropped-item replication, and container actions.
+
+### 2026-07-13: Server-side replication substrate
+- Owner: OpenCode
+- Scope: Add lossless wire block state, bounded VCC1 chunk encoding, nonblocking client transport, authoritative server player sessions, fixed-tick movement, spawn/despawn/update broadcasts, initial inventory snapshots, loaded-chunk streaming, and revision/reach-checked single-block edits. Client world application, prediction, reconnect UX, and full inventory actions remain out of scope.
+- Depends on: Native multiplayer protocol contract; headless authoritative server foundation
+- Acceptance: Protocol and compact chunk round trips pass; two in-process TCP clients establish sessions; server movement produces authoritative updates; unsupported/stale/unloaded edits are rejected without client authority.
+- Status: complete
+- Notes: The server streams only chunks currently loaded by its existing streaming lifecycle; the windowed client integration is tracked in the following slice. Multi-center retention and chunk-boundary release validation remain.
+
+### 2026-07-13: Windowed authoritative client slice
+- Owner: OpenCode
+- Scope: Connect the windowed executable to `ClientTransport`; apply authoritative welcome, chunk, block, inventory, chat, and player messages; send movement, hotbar, cursor-click, chat, and block-edit requests; retain server chunks around all active player centers; prevent local generation, physics, ticking, persistence, and inventory clicks from becoming a second authority.
+- Depends on: Server-side replication substrate
+- Acceptance: A client launched with `--server IP:PORT` consumes server snapshots and renders streamed chunks/remote player proxies; local edits are requests and stale snapshots are rejected.
+- Status: partial
+- Notes: Basic server-cursor inventory clicks, right-click cursor actions, explicit rejection of unsupported network drops, automatic reconnect attempts, duplicate-name session aliases, username-keyed native player persistence, authoritative chunk-session reset, stale-inventory resynchronization, and server-driven chunk unload/re-entry are wired. Permanent disconnect codes stop automatic retries. Dropped-item entity replication, container-specific actions, remaining reconnect edge cases, server gamemode metadata, interpolation, and release validation with two independent windowed clients remain.
+
+### 2026-07-13: Native multiplayer protocol contract
+- Owner: OpenCode
+- Scope: Define the versioned client/server wire messages, bounded framing, handshake/session guard, rate limits, reject/disconnect codes, authority boundary, and serialization tests. The headless server now consumes this contract; replication and client reconciliation remain separate work.
+- Depends on: M2 fixed tick/persistence
+- Acceptance: Valid client and server messages round-trip through bounded frames; unsupported versions, malformed/truncated/trailing/oversized frames, invalid state, handshake violations, stale input, and rate-limit violations are rejected deterministically.
+- Status: complete
+- Notes: Protocol version 1 uses a four-byte big-endian length prefix around a UTF-8 JSON envelope. It is native to Vibecraft and is not Java protocol compatible. See `NETWORK_PROTOCOL.md` and `src/network/mod.rs`.
+
+- [x] Define a small, versioned native protocol with bounded framing, handshake/version rejection, message-size/rate limits, and explicit client/server ownership. Do not implement Java protocol compatibility for the demo.
+### 2026-07-13: Headless authoritative server foundation
+- Owner: OpenCode
+- Scope: Add a winit/wgpu-free TCP server binary using the shared fixed 20 TPS clock, chunk manager, scheduler, and native persistence. Accept bounded protocol sessions, complete handshake/keep-alive, autosave atomically, and reject unsupported client-authoritative edits. Player movement, chunk replication, inventory replication, and client conversion remain separate work.
+- Depends on: Native multiplayer protocol contract; M2 fixed tick/persistence
+- Acceptance: `vibecraft-server` starts without renderer setup, accepts a versioned client handshake, advances authoritative ticks, echoes keep-alives, and saves level/chunk state on shutdown.
+- Status: complete
+- Notes: Run `cargo run --bin vibecraft-server -- --world-dir PATH`; type `quit` on its console for a clean save and stop. Replication now lives in the server-side substrate and windowed client slice above; unsupported inventory actions still receive `NotAllowed`.
+
+- [x] Extract a headless authoritative server using the same fixed-tick simulation and persistence code.
+- [ ] Make the windowed executable a network client rather than a second simulation authority. `--server IP:PORT` now activates an authoritative client path for snapshots, movement, chat, hotbar selection, and block-edit requests; full inventory/container actions and reconnect UX remain.
+- [ ] Implement connection/session lifecycle, player identity/spawn/despawn, server-side input validation, and client-visible errors/disconnect reasons.
+- [ ] Replicate initial/streamed chunks, authoritative player transforms, block edits, and supported inventory changes; preserve revisions/order so stale messages cannot overwrite newer state.
+- [ ] Add basic remote-player presentation and text chat so two connected players can identify and communicate with one another.
+- [ ] Verify the Multiplayer Demo Contract with two clients, server restart, chunk-boundary edits, reconnect, and malformed/unsupported message rejection.
+- [ ] After the demo, add interpolation, prediction/reconciliation, controlled latency/loss testing, permissions/operators, observability, authentication/moderation, broader entity replication, and multi-client load tests.
+- [ ] Decide separately whether any external/Java protocol compatibility is worth supporting; require a pinned protocol version and packet tests before promising it.
+
+**Demo exit criteria:** the Multiplayer Demo Contract release bar passes and server authority is preserved for all supported mutable state. Broader load, security, prediction, and parity requirements remain post-demo work.
+
+**Recommended demo delivery order:** protocol/authority contract; headless server; one client connects and receives spawn/chunks; second client and player transforms; authoritative place/break; chat and inventory synchronization; reconnect/save; two-client release scenario. Do not start prediction, mobs, or protocol compatibility before this path is demonstrably playable.
+
+## Deferred Until Prerequisites Exist
+
+Do not schedule these as isolated features:
+
+- Full block/item/mob checklists before the registry, state, entity, and serialization systems are in place.
+- Redstone parity before scheduled ticks, block entities, and deterministic update-order tests exist.
+- Natural structures before version-pinned worldgen and persistence exist.
+- Multiplayer expansion beyond the demo before replication and the two-client release scenario exist.
+- Java protocol, Anvil/NBT, resource-pack, or data-pack compatibility before their target versions and compatibility guarantees are chosen.
+
+## Agent Work Item Template
+
+Add a short entry under the relevant milestone when taking cross-cutting work:
+
+```md
+### YYYY-MM-DD: <work item>
+- Owner: <agent or user>
+- Scope: <files/systems and non-goals>
+- Depends on: <milestone/work item>
+- Acceptance: <observable checks and tests>
+- Status: in progress | blocked | complete
+- Notes: <decisions, migration needs, or follow-up>
+```
+
+Remove completed entries after their decisions and follow-ups have been folded into the milestone or `AGENTS.md`. Keep this file concise: detailed bug investigations belong in `ISSUES.md`.
+
+## Historical Notes
+
+The previous plan's large per-feature checklist was replaced because it duplicated items, mixed partial scaffolding with completed parity claims, and placed dependent work out of order. Existing implementation details remain discoverable in source, `AGENTS.md`, and `ISSUES.md`; this roadmap intentionally tracks capabilities and prerequisites instead of approximate feature counts.

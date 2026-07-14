@@ -1,0 +1,496 @@
+{
+  "format_version": 1,
+  "data_version": 5,
+  "kind": "level",
+  "data": {
+    "seed": 42,
+    "tick": 60231,
+    "game_time": 21231,
+    "spawn": [
+      0,
+      75,
+      0
+    ],
+    "gamemode": "survival",
+    "difficulty": "normal",
+    "hardcore": false,
+    "do_daylight_cycle": true,
+    "keep_inventory": false,
+    "experience": 0,
+    "scheduled_ticks": [],
+    "dropped_items": [],
+    "xp_orbs": [],
+    "players": [
+      {
+        "username": "Player",
+        "player": {
+          "x": 0.8742407,
+          "y": 66.02547,
+          "z": -2.2546813,
+          "vy": 0.0,
+          "on_ground": true,
+          "health": 15.0,
+          "last_vy": 0.0,
+          "sneaking": false,
+          "swimming": false,
+          "oxygen": 15.0,
+          "hunger": 20.0,
+          "saturation": 20.0,
+          "exhaustion": 0.0,
+          "attack_cooldown": 1.0,
+          "armor_points": 0.0,
+          "armor_toughness": 0.0,
+          "absorption_health": 0.0,
+          "damage_cooldown": 0.5,
+          "fall_flying": false,
+          "effects": [],
+          "inventory": {
+            "slots": [
+              {
+                "id": 1,
+                "count": 62,
+                "damage": 0
+              },
+              {
+                "id": 8,
+                "count": 3,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              }
+            ],
+            "held_slot": 1
+          }
+        }
+      },
+      {
+        "username": "Player-2",
+        "player": {
+          "x": -2.1055071,
+          "y": 65.05001,
+          "z": -5.400178,
+          "vy": 0.0,
+          "on_ground": true,
+          "health": 15.0,
+          "last_vy": 0.0,
+          "sneaking": false,
+          "swimming": false,
+          "oxygen": 15.0,
+          "hunger": 20.0,
+          "saturation": 20.0,
+          "exhaustion": 0.0,
+          "attack_cooldown": 1.0,
+          "armor_points": 0.0,
+          "armor_toughness": 0.0,
+          "absorption_health": 0.0,
+          "damage_cooldown": 0.5,
+          "fall_flying": false,
+          "effects": [],
+          "inventory": {
+            "slots": [
+              {
+                "id": 1,
+                "count": 64,
+                "damage": 0
+              },
+              {
+                "id": 8,
+                "count": 5,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              },
+              {
+                "id": 0,
+                "count": 0,
+                "damage": 0
+              }
+            ],
+            "held_slot": 0
+          }
+        }
+      }
+    ]
+  }
+}

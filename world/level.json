@@ -1,0 +1,68 @@
+{
+  "format_version": 1,
+  "data_version": 5,
+  "kind": "level",
+  "data": {
+    "seed": 1783972558954253730,
+    "tick": 7975,
+    "game_time": 16974,
+    "spawn": [
+      0,
+      75,
+      0
+    ],
+    "gamemode": "survival",
+    "difficulty": "normal",
+    "hardcore": false,
+    "do_daylight_cycle": true,
+    "keep_inventory": false,
+    "experience": 0,
+    "scheduled_ticks": [
+      {
+        "due_tick": 7978,
+        "chunk": [
+          11,
+          -10
+        ],
+        "kind": "Water"
+      },
+      {
+        "due_tick": 7980,
+        "chunk": [
+          11,
+          -10
+        ],
+        "kind": "Lava"
+      }
+    ],
+    "dropped_items": [
+      {
+        "x": 29.306255,
+        "y": 57.875023,
+        "z": -144.04247,
+        "vx": 3e-45,
+        "vy": -18.25,
+        "vz": 3e-45,
+        "block_id": 2,
+        "item_id": 2,
+        "count": 1,
+        "damage": 0,
+        "lifetime": 170.50552
+      },
+      {
+        "x": 28.043335,
+        "y": 63.875023,
+        "z": -143.51431,
+        "vx": -3e-45,
+        "vy": -18.25,
+        "vz": 3e-45,
+        "block_id": 2,
+        "item_id": 2,
+        "count": 1,
+        "damage": 0,
+        "lifetime": 170.85555
+      }
+    ],
+    "xp_orbs": []
+  }
+}

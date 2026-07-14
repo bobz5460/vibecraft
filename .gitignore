@@ -1,1 +1,7 @@
 /target
+
+# Local agent work logs.
+.slim/deepwork/
+
+# Embedded asset symlink (only needed for `bundled` builds).
+/embeds_minecraft

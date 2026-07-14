@@ -1,0 +1,1 @@
+Compile with `cargo build`. Run the playable build with `timeout 15 cargo run --release`; use `VIBECRAFT_ASSETS` to override the default `/tmp/opencode/minecraft-assets` asset checkout. Do not use debug `cargo run`: atlas construction currently panics in that profile.

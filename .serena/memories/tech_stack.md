@@ -1,0 +1,1 @@
+Rust 2021 single crate. wgpu 24 + winit 0.30 rendering/event loop; nalgebra math; image PNG assets; noise terrain; rodio audio. Development uses Cargo. Release profile is opt-level 3, LTO, one codegen unit.

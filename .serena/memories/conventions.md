@@ -1,0 +1,1 @@
+Keep chunk meshes in world space. Lighting recomputation is manager-owned in `ChunkManager::recompute_lighting`; `rebuild_dirty_meshes()` returns keys whose cached GPU buffers must be evicted. WGSL uniform structs use `[f32; 4]`/`vec4<f32>`, never vec3 uniform fields. `PLAN.md` is the dynamic work log. See `AGENTS.md` for rendering/asset invariants.

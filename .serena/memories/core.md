@@ -1,0 +1,1 @@
+Single Rust voxel game crate. `src/main.rs` owns the winit event loop and wires gameplay, chunk streaming, debug UI, and renderer. `src/engine/` is camera/input/window/wgpu; `src/world/` owns blocks, chunks, mesh, lighting, terrain, and raycast. Read `mem:tech_stack` for dependencies/build and `mem:task_completion` for required verification.

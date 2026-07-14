@@ -1,0 +1,41 @@
+{
+  "format_version": 1,
+  "data_version": 5,
+  "kind": "level",
+  "data": {
+    "seed": 1592639710,
+    "tick": 2256,
+    "game_time": 11255,
+    "spawn": [
+      0,
+      64,
+      0
+    ],
+    "gamemode": "creative",
+    "difficulty": "normal",
+    "hardcore": false,
+    "do_daylight_cycle": true,
+    "keep_inventory": false,
+    "experience": 0,
+    "scheduled_ticks": [
+      {
+        "due_tick": 2260,
+        "chunk": [
+          1,
+          -2
+        ],
+        "kind": "Water"
+      },
+      {
+        "due_tick": 2264,
+        "chunk": [
+          1,
+          -2
+        ],
+        "kind": "Lava"
+      }
+    ],
+    "dropped_items": [],
+    "xp_orbs": []
+  }
+}

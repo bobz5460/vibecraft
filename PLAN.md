@@ -66,7 +66,7 @@ A parity item is complete only when all applicable conditions hold:
 | UI and audio | Partial | text, basic HUD/inventory data, commands, block sounds | graphical vanilla screens/HUD, chat, settings, positional audio |
 | Simulation content | Not started | dropped items, XP, and specialized fluid updates | no general entity or block-tick framework, mobs, projectiles, or redstone |
 | Persistence and dimensions | Partial | versioned native Overworld level/player/chunk persistence with atomic saves | no dimensions, block-entity/general-entity persistence, or scheduled-event persistence |
-| Multiplayer | Partial | versioned native protocol, bounded TCP sessions, headless 20 TPS server, atomic level/chunk persistence, handshake and keep-alive validation | windowed client is still singleplayer; no player/chunk/block/inventory replication, reconnect flow, or two-client release scenario |
+| Multiplayer | Partial | versioned native protocol, bounded TCP sessions, headless 20 TPS server, atomic level/chunk persistence, in-game direct-address join, handshake and keep-alive validation | dropped-item/container replication, reconnect edge cases, and two-client release scenario remain |
 
 ## Multiplayer Demo Contract
 
@@ -302,7 +302,7 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 
 **Purpose:** ship the playable multiplayer demo first, then evolve it toward resilient multiplayer and any explicitly chosen compatibility commitments.
 
-**Current progress:** the protocol contract and headless server foundation are complete. Server-side authoritative sessions now own movement intent, player spawn/despawn/update messages, initial inventory snapshots, compact loaded-chunk streaming, and revision/reach-checked block requests. The windowed client now consumes this transport for authoritative player/chunk/block/inventory/chat state; unsupported network drops are rejected without local mutation, and permanent disconnects no longer reconnect forever. The next critical slice is reconnect/release validation, dropped-item replication, and container actions.
+**Current progress:** the protocol contract and headless server foundation are complete. Server-side authoritative sessions now own movement intent, player spawn/despawn/update messages, initial inventory snapshots, compact loaded-chunk streaming, and revision/reach-checked block requests. The windowed client now consumes this transport for authoritative player/chunk/block/inventory/chat state, can join a direct server from the in-game pause menu, and renders interpolated articulated remote-player models with velocity-driven walk animation; unsupported network drops are rejected without local mutation, and permanent disconnects no longer reconnect forever. The next critical slice is reconnect/release validation, dropped-item replication, and container actions.
 
 ### 2026-07-13: Server-side replication substrate
 - Owner: OpenCode
@@ -316,9 +316,25 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 - Owner: OpenCode
 - Scope: Connect the windowed executable to `ClientTransport`; apply authoritative welcome, chunk, block, inventory, chat, and player messages; send movement, hotbar, cursor-click, chat, and block-edit requests; retain server chunks around all active player centers; prevent local generation, physics, ticking, persistence, and inventory clicks from becoming a second authority.
 - Depends on: Server-side replication substrate
-- Acceptance: A client launched with `--server IP:PORT` consumes server snapshots and renders streamed chunks/remote player proxies; local edits are requests and stale snapshots are rejected.
+- Acceptance: A client launched with `--server IP:PORT` consumes server snapshots and renders streamed chunks and articulated remote player models; local edits are requests and stale snapshots are rejected.
 - Status: partial
-- Notes: Basic server-cursor inventory clicks, right-click cursor actions, explicit rejection of unsupported network drops, automatic reconnect attempts, duplicate-name session aliases, username-keyed native player persistence, authoritative chunk-session reset, stale-inventory resynchronization, and server-driven chunk unload/re-entry are wired. Permanent disconnect codes stop automatic retries. Dropped-item entity replication, container-specific actions, remaining reconnect edge cases, server gamemode metadata, interpolation, and release validation with two independent windowed clients remain.
+- Notes: Basic server-cursor inventory clicks, right-click cursor actions, explicit rejection of unsupported network drops, automatic reconnect attempts, duplicate-name session aliases, username-keyed native player persistence, authoritative chunk-session reset, stale-inventory resynchronization, server-driven chunk unload/re-entry, and interpolated remote-player model animation are wired. Permanent disconnect codes stop automatic retries. Dropped-item entity replication, container-specific actions, remaining reconnect edge cases, server gamemode metadata, prediction/reconciliation, and release validation with two independent windowed clients remain.
+
+### 2026-07-14: In-game direct server connection
+- Owner: OpenCode
+- Scope: Add a pause-menu server address form using the existing native client transport; preserve local state before switching sessions and surface invalid addresses or connection failures in the UI. Public server discovery, authentication, Java protocol compatibility, and background connection workers remain out of scope.
+- Depends on: Windowed authoritative client slice
+- Acceptance: While playing, open Pause > Join Server, enter an IPv4/IPv6/hostname address with port, connect to a running native server, and transition to authoritative world state without relaunching.
+- Status: complete
+- Notes: The form defaults to `127.0.0.1:25565`, supports keyboard and mouse submission, resolves hostnames through the system resolver, and resets client-authoritative chunk/cache state after a successful connection.
+
+### 2026-07-14: Remote player model and animation
+- Owner: OpenCode
+- Scope: Replace the multiplayer remote-player cube proxy with a textured articulated avatar and client-side snapshot interpolation; animate arms and legs from authoritative horizontal velocity without changing server authority or the native wire contract. Player skins, equipment layers, name tags, and local-player first-person animation remain out of scope.
+- Depends on: Windowed authoritative client slice
+- Acceptance: Two connected clients render one another as visible head/torso/limb models, movement is smoothed between server updates, and walking produces a synchronized readable limb cycle.
+- Status: partial
+- Notes: Remote avatars use existing terrain-atlas wool textures and the shared lit/shadow terrain pipeline. The release scenario with two independently launched clients is still required.
 
 ### 2026-07-13: Native multiplayer protocol contract
 - Owner: OpenCode
@@ -338,10 +354,10 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 - Notes: Run `cargo run --bin vibecraft-server -- --world-dir PATH`; type `quit` on its console for a clean save and stop. Replication now lives in the server-side substrate and windowed client slice above; unsupported inventory actions still receive `NotAllowed`.
 
 - [x] Extract a headless authoritative server using the same fixed-tick simulation and persistence code.
-- [ ] Make the windowed executable a network client rather than a second simulation authority. `--server IP:PORT` now activates an authoritative client path for snapshots, movement, chat, hotbar selection, and block-edit requests; full inventory/container actions and reconnect UX remain.
+- [ ] Make the windowed executable a network client rather than a second simulation authority. `--server IP:PORT` and the in-game Join Server form activate an authoritative client path for snapshots, movement, chat, hotbar selection, and block-edit requests; full inventory/container actions and reconnect UX remain.
 - [ ] Implement connection/session lifecycle, player identity/spawn/despawn, server-side input validation, and client-visible errors/disconnect reasons.
 - [ ] Replicate initial/streamed chunks, authoritative player transforms, block edits, and supported inventory changes; preserve revisions/order so stale messages cannot overwrite newer state.
-- [ ] Add basic remote-player presentation and text chat so two connected players can identify and communicate with one another.
+- [x] Add basic remote-player presentation and text chat so two connected players can identify and communicate with one another.
 - [ ] Verify the Multiplayer Demo Contract with two clients, server restart, chunk-boundary edits, reconnect, and malformed/unsupported message rejection.
 - [ ] After the demo, add interpolation, prediction/reconciliation, controlled latency/loss testing, permissions/operators, observability, authentication/moderation, broader entity replication, and multi-client load tests.
 - [ ] Decide separately whether any external/Java protocol compatibility is worth supporting; require a pinned protocol version and packet tests before promising it.

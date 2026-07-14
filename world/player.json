@@ -3,19 +3,19 @@
   "data_version": 5,
   "kind": "player",
   "data": {
-    "x": -55.401836,
-    "y": 79.62481,
-    "z": -1.0074524,
+    "x": -95.381454,
+    "y": 65.002846,
+    "z": -2.8725026,
     "vy": 0.0,
-    "on_ground": false,
-    "health": 20.0,
+    "on_ground": true,
+    "health": 14.049908,
     "last_vy": 0.0,
     "sneaking": false,
     "swimming": false,
     "oxygen": 15.0,
-    "hunger": 20.0,
-    "saturation": 9.462393,
-    "exhaustion": 3.9950123,
+    "hunger": 19.274956,
+    "saturation": 0.0,
+    "exhaustion": 0.068315506,
     "attack_cooldown": 1.0,
     "armor_points": 0.0,
     "armor_toughness": 0.0,
@@ -31,153 +31,153 @@
           "damage": 0
         },
         {
+          "id": 8,
+          "count": 3,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
           "id": 1347,
           "count": 1,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
-          "damage": 0
-        },
-        {
-          "id": 0,
-          "count": 0,
           "damage": 0
         },
         {

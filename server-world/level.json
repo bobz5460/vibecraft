@@ -4,8 +4,8 @@
   "kind": "level",
   "data": {
     "seed": 42,
-    "tick": 60231,
-    "game_time": 21231,
+    "tick": 76431,
+    "game_time": 13431,
     "spawn": [
       0,
       75,
@@ -24,9 +24,9 @@
       {
         "username": "Player",
         "player": {
-          "x": 0.8742407,
-          "y": 66.02547,
-          "z": -2.2546813,
+          "x": 4.8957424,
+          "y": 67.03814,
+          "z": 3.508082,
           "vy": 0.0,
           "on_ground": true,
           "health": 15.0,
@@ -53,7 +53,7 @@
               },
               {
                 "id": 8,
-                "count": 3,
+                "count": 5,
                 "damage": 0
               },
               {
@@ -252,16 +252,16 @@
                 "damage": 0
               }
             ],
-            "held_slot": 1
+            "held_slot": 0
           }
         }
       },
       {
         "username": "Player-2",
         "player": {
-          "x": -2.1055071,
-          "y": 65.05001,
-          "z": -5.400178,
+          "x": 4.1811194,
+          "y": 66.00019,
+          "z": -4.553432,
           "vy": 0.0,
           "on_ground": true,
           "health": 15.0,

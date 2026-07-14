@@ -760,7 +760,15 @@ impl HeadlessServer {
                 &self.world,
                 difficulty_multiplier(self.level.difficulty.as_str()),
             );
-            updates.push((id, player_update(id, state, self.level.tick)));
+            updates.push((
+                id,
+                player_update(
+                    id,
+                    state,
+                    self.level.tick,
+                    [input.movement[0] * speed, state.player.vy, input.movement[2] * speed],
+                ),
+            ));
         }
         for update in updates {
             self.broadcast(update.1);
@@ -1260,12 +1268,12 @@ fn apply_inventory_click(
     }
 }
 
-fn player_update(id: u64, state: &PlayerSessionState, server_tick: u64) -> ServerMessage {
+fn player_update(id: u64, state: &PlayerSessionState, server_tick: u64, velocity: [f32; 3]) -> ServerMessage {
     ServerMessage::PlayerUpdate {
         player_id: id,
         server_tick,
         position: [state.player.x as f64, state.player.y as f64, state.player.z as f64],
-        velocity: [0.0, state.player.vy, 0.0],
+        velocity,
         yaw: state.yaw,
         pitch: state.pitch,
     }
@@ -1554,7 +1562,10 @@ mod tests {
         assert!(after > before);
         let second_outbox = &server.sessions.get(&2).unwrap().outbox;
         assert!(second_outbox.iter().any(|frame| {
-            matches!(decode_server(&frame.bytes), Ok(ServerMessage::PlayerUpdate { player_id: 1, .. }))
+            matches!(
+                decode_server(&frame.bytes),
+                Ok(ServerMessage::PlayerUpdate { player_id: 1, velocity, .. }) if velocity[0] > 0.0
+            )
         }));
         server.shutdown().unwrap();
         fs::remove_dir_all(world_dir).unwrap();

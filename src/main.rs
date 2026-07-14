@@ -1,4 +1,4 @@
-use vibecraft::config::{AppConfig, GraphicsQuality};
+use vibecraft::config::{AppConfig, GraphicsQuality, ResolvedKeyBindings};
 use vibecraft::engine;
 use vibecraft::gamemode::{Difficulty, GameMode};
 use vibecraft::inventory;
@@ -8,6 +8,7 @@ use vibecraft::world;
 
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
+use std::net::ToSocketAddrs;
 use winit::event::{ElementState, Event, MouseButton, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
@@ -29,7 +30,7 @@ use world::chunk::BlockEntity;
 use world::chunk_manager::ChunkManager;
 use world::dropped_item::{xp_orbs_to_mesh, DroppedItem, XpOrb};
 use world::entity::{EntityKind, EntityStore, Transform};
-use world::mesh::build_item_cube_mesh;
+use world::mesh::{build_item_cube_mesh, build_player_mesh, PlayerMeshInstance};
 use world::persistence::{DroppedItemData, LevelData, PlayerData, StorageError, WorldStorage, XpOrbData};
 use world::simulation::{ScheduledTick, ScheduledTickKind, TickScheduler};
 use vibecraft::ui::{self, UiAction, UiSlot};
@@ -66,6 +67,17 @@ fn ui_slot(stack: &inventory::ItemStack, items: &ItemRegistry, selected: bool) -
         selected,
         hint,
     }
+}
+
+fn resolve_server_address(value: &str) -> Result<std::net::SocketAddr, String> {
+    if let Ok(address) = value.parse() {
+        return Ok(address);
+    }
+    value
+        .to_socket_addrs()
+        .map_err(|error| error.to_string())?
+        .next()
+        .ok_or_else(|| "no address found".to_string())
 }
 
 fn gui_asset_stem(name: &str) -> String {
@@ -153,7 +165,195 @@ fn network_face(normal: (i32, i32, i32)) -> Face {
 #[derive(Clone, Debug)]
 struct RemotePlayerVisual {
     username: String,
-    position: [f64; 3],
+    position: [f32; 3],
+    target_position: [f32; 3],
+    velocity: [f32; 3],
+    yaw: f32,
+    walk_phase: f32,
+    walk_amount: f32,
+}
+
+fn update_local_player_movement(
+    player: &mut Player,
+    camera: &mut Camera,
+    input: &InputState,
+    bindings: ResolvedKeyBindings,
+    game_mode: GameMode,
+    flying: bool,
+    chunk_manager: &ChunkManager,
+    inventory: &Inventory,
+    item_registry: &ItemRegistry,
+    difficulty: Difficulty,
+    dt: f32,
+) {
+    let sprinting = input.is_key_pressed(bindings.sprint) && !flying;
+    player.sneaking = input.is_key_pressed(bindings.sneak)
+        && game_mode.has_gravity()
+        && !flying
+        && !game_mode.is_spectator();
+    (player.armor_points, player.armor_toughness) = inventory.armor_stats(item_registry);
+    player.swimming = player.is_swimming(chunk_manager);
+    player.on_ground = false;
+
+    if !flying && game_mode.has_gravity() && player.fall_flying {
+        let lift = camera.pitch.sin().max(0.0) * 15.0;
+        player.vy += (lift - player::GRAVITY * 0.5) * dt;
+        player.vy = player.vy.min(5.0).max(-15.0);
+    }
+
+    if flying || game_mode.is_spectator() {
+        let mut speed = 10.0 * dt;
+        if input.is_key_pressed(bindings.sprint) {
+            speed *= 2.0;
+        }
+        if input.is_key_pressed(bindings.forward) {
+            camera.move_forward(speed);
+        }
+        if input.is_key_pressed(bindings.back) {
+            camera.move_forward(-speed);
+        }
+        if input.is_key_pressed(bindings.left) {
+            camera.move_right(-speed);
+        }
+        if input.is_key_pressed(bindings.right) {
+            camera.move_right(speed);
+        }
+        if input.is_key_pressed(bindings.jump) {
+            camera.move_up(speed);
+        }
+        if input.is_key_pressed(bindings.sneak) {
+            camera.move_up(-speed);
+        }
+        player.x = camera.position.x;
+        player.y = camera.position.y;
+        player.z = camera.position.z;
+    } else if game_mode.has_gravity() {
+        let base_speed = if player.swimming {
+            player::SWIM_SPEED
+        } else if player.sneaking {
+            player::SNEAK_SPEED
+        } else {
+            player::WALK_SPEED
+        };
+        let walk_speed = base_speed
+            * player.get_speed_multiplier()
+            * dt
+            * if sprinting { player::SPRINT_MULT } else { 1.0 };
+
+        let mut dx = 0.0;
+        let mut dz = 0.0;
+        if input.is_key_pressed(bindings.forward) {
+            dx += camera.yaw.sin() * walk_speed;
+            dz += camera.yaw.cos() * walk_speed;
+        }
+        if input.is_key_pressed(bindings.back) {
+            dx -= camera.yaw.sin() * walk_speed;
+            dz -= camera.yaw.cos() * walk_speed;
+        }
+        if input.is_key_pressed(bindings.left) {
+            dx += camera.yaw.cos() * walk_speed;
+            dz -= camera.yaw.sin() * walk_speed;
+        }
+        if input.is_key_pressed(bindings.right) {
+            dx -= camera.yaw.cos() * walk_speed;
+            dz += camera.yaw.sin() * walk_speed;
+        }
+
+        let horizontal_length = (dx * dx + dz * dz).sqrt();
+        if horizontal_length > 0.0 {
+            let scale = walk_speed / horizontal_length;
+            dx *= scale;
+            dz *= scale;
+        }
+
+        let mut touching_climbable = false;
+        if player.swimming {
+            player.vy *= (1.0 - player::WATER_DRAG * dt).max(0.0);
+            let feet_y = player.y.floor() as i32;
+            let feet_x = player.x.floor() as i32;
+            let feet_z = player.z.floor() as i32;
+            let below = chunk_manager.get_block(feet_x, feet_y - 1, feet_z);
+            let above_water = chunk_manager.get_block(feet_x, feet_y, feet_z).id == BlockId::Water;
+            if above_water && below.id == BlockId::SoulSand {
+                player.vy += 14.0 * dt;
+            } else if above_water && below.id == BlockId::MagmaBlock {
+                player.vy -= 6.0 * dt;
+            }
+            if input.is_key_pressed(bindings.jump) {
+                player.vy += player::SWIM_SPEED * dt;
+            }
+            if input.is_key_pressed(bindings.sneak) {
+                player.vy -= player::SWIM_SPEED * dt;
+            }
+            player.vy += player::WATER_GRAVITY * dt;
+        } else {
+            let min_bx = (player.x - player::HALF_WIDTH).floor() as i32;
+            let max_bx = (player.x + player::HALF_WIDTH).ceil() as i32;
+            let min_by = (player.y - 0.1).floor() as i32;
+            let max_by = (player.y + player.current_height() + 0.1).ceil() as i32;
+            let min_bz = (player.z - player::HALF_WIDTH).floor() as i32;
+            let max_bz = (player.z + player::HALF_WIDTH).ceil() as i32;
+            'climb_search: for bx in min_bx..=max_bx {
+                for by in min_by..=max_by {
+                    for bz in min_bz..=max_bz {
+                        if chunk_manager.get_block(bx, by, bz).id.is_climbable() {
+                            touching_climbable = true;
+                            break 'climb_search;
+                        }
+                    }
+                }
+            }
+            if touching_climbable {
+                player.vy = 0.0;
+                if input.is_key_pressed(bindings.forward) || input.is_key_pressed(bindings.jump) {
+                    player.vy = player::CLIMB_SPEED;
+                }
+                if input.is_key_pressed(bindings.back) {
+                    player.vy = -player::CLIMB_SPEED;
+                }
+            } else {
+                player.vy += player::GRAVITY * dt;
+            }
+        }
+
+        let gravity_multiplier = player.get_gravity_multiplier();
+        if gravity_multiplier != 1.0 && player.vy < 0.0 {
+            player.vy *= gravity_multiplier;
+        }
+        if !touching_climbable {
+            player.vy = player.vy.max(player::TERMINAL_VELOCITY);
+        }
+        player.try_move_with_difficulty(
+            dx,
+            player.vy * dt,
+            dz,
+            chunk_manager,
+            difficulty.damage_multiplier(),
+        );
+
+        if sprinting {
+            player.sprint_exhaustion(dt);
+        }
+        if !player.swimming
+            && !touching_climbable
+            && input.is_key_pressed(bindings.jump)
+            && player.on_ground
+        {
+            player.vy = player::JUMP_SPEED * player.get_jump_multiplier();
+            player.jump_exhaustion();
+        }
+        if !player.swimming
+            && !touching_climbable
+            && input.is_key_pressed(bindings.jump)
+            && !player.on_ground
+            && player.vy > 0.0
+        {
+            let reduced_gravity = player::GRAVITY * 0.4;
+            player.vy += (reduced_gravity - player::GRAVITY) * dt;
+        }
+
+        camera.position = player.eye_position();
+    }
 }
 
 fn spawn_dropped_stack(
@@ -500,7 +700,7 @@ async fn run(config: AppConfig) {
 
     let mut chunk_manager = ChunkManager::new(seed, render_distance);
     chunk_manager.set_storage(storage.clone());
-    let network_address = config.server;
+    let mut network_address = config.server;
     let mut network_username = config.username.clone();
     let mut client_transport = match network_address {
         Some(address) => match ClientTransport::connect(address, config.username.clone()) {
@@ -515,7 +715,7 @@ async fn run(config: AppConfig) {
         },
         None => None,
     };
-    let network_mode = client_transport.is_some();
+    let mut network_mode = client_transport.is_some();
     if !network_mode {
         // Queue remaining chunks for local singleplayer loading.
         chunk_manager.update_chunks_async(
@@ -615,6 +815,9 @@ async fn run(config: AppConfig) {
     }
     let mut render_quality = config.graphics;
     let mut ui_state = ui::UiState::new(render_distance, render_quality == GraphicsQuality::Vibrant);
+    if let Some(address) = network_address {
+        ui_state.server_address = address.to_string();
+    }
     let mut command_mode = false;
     let mut command_buffer = String::new();
     let mut command_feedback = String::new();
@@ -637,6 +840,7 @@ async fn run(config: AppConfig) {
     let mut network_inventory_revision = 0u64;
     let mut network_last_held_slot = inventory.held_slot;
     let mut network_reconnect_timer = 0.0f32;
+    let mut network_connect_request: Option<String> = None;
     let mut remote_players: HashMap<u64, RemotePlayerVisual> = HashMap::new();
 
     #[allow(deprecated)]
@@ -763,6 +967,28 @@ async fn run(config: AppConfig) {
                                     }
                                     _ => {}
                                 }
+                            } else if ui_state.screen == ui::UiScreen::Connect {
+                                match &key_event.logical_key {
+                                    Key::Named(NamedKey::Enter) => {
+                                        if ui_state.handle_key(KeyCode::Enter) == UiAction::ConnectServer {
+                                            network_connect_request = Some(ui_state.server_address.clone());
+                                        }
+                                        renderer.gui_dirty = true;
+                                    }
+                                    Key::Named(NamedKey::Escape) => {
+                                        ui_state.handle_escape();
+                                        renderer.gui_dirty = true;
+                                    }
+                                    Key::Named(NamedKey::Backspace) => {
+                                        ui_state.backspace_server_address();
+                                        renderer.gui_dirty = true;
+                                    }
+                                    Key::Character(value) => {
+                                        ui_state.append_server_address(value.as_ref());
+                                        renderer.gui_dirty = true;
+                                    }
+                                    _ => {}
+                                }
                             } else {
                                 match key_event.physical_key {
                                      PhysicalKey::Code(KeyCode::Escape) => {
@@ -810,20 +1036,23 @@ async fn run(config: AppConfig) {
                                          }
                                          renderer.gui_dirty = true;
                                      }
-                                     PhysicalKey::Code(key) if ui_state.is_menu_open() && matches!(key, KeyCode::ArrowUp | KeyCode::ArrowDown | KeyCode::Enter | KeyCode::NumpadEnter) => {
-                                         let action = ui_state.handle_key(key);
-                                         if action == UiAction::ToggleGraphics {
-                                             render_quality = if ui_state.graphics_vibrant { GraphicsQuality::Vibrant } else { GraphicsQuality::Regular };
-                                         }
-                                         if !ui_state.is_menu_open() {
-                                             inventory_open = false;
-                                             grabbed = true;
-                                             input.mouse_grabbed = true;
-                                             window.set_cursor_visible(false);
-                                             let _ = window.set_cursor_grab(CursorGrabMode::Confined);
-                                         }
-                                         renderer.gui_dirty = true;
-                                     }
+                                      PhysicalKey::Code(key) if ui_state.is_menu_open() && matches!(key, KeyCode::ArrowUp | KeyCode::ArrowDown | KeyCode::Enter | KeyCode::NumpadEnter) => {
+                                          let action = ui_state.handle_key(key);
+                                          if action == UiAction::ToggleGraphics {
+                                              render_quality = if ui_state.graphics_vibrant { GraphicsQuality::Vibrant } else { GraphicsQuality::Regular };
+                                          }
+                                          if action == UiAction::ConnectServer {
+                                              network_connect_request = Some(ui_state.server_address.clone());
+                                          }
+                                          if !ui_state.is_menu_open() {
+                                              inventory_open = false;
+                                              grabbed = true;
+                                              input.mouse_grabbed = true;
+                                              window.set_cursor_visible(false);
+                                              let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+                                          }
+                                          renderer.gui_dirty = true;
+                                      }
                                      PhysicalKey::Code(KeyCode::F2) => {
                                         let path = format!("/tmp/opencode/vibecraft_screenshot_{}.png",
                                             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
@@ -1115,6 +1344,55 @@ async fn run(config: AppConfig) {
                 let frame_dt = (now - last_time).as_secs_f32().min(0.25);
                 last_time = now;
 
+                if let Some(address_text) = network_connect_request.take() {
+                    let address_text = address_text.trim();
+                    match resolve_server_address(address_text) {
+                        Err(error) => {
+                            command_feedback = format!("Invalid server address: {error}");
+                            command_feedback_timer = 5.0;
+                        }
+                        Ok(address) => match ClientTransport::connect(address, network_username.clone()) {
+                            Err(error) => {
+                                command_feedback = format!("Could not connect: {error}");
+                                command_feedback_timer = 5.0;
+                            }
+                            Ok(transport) => {
+                                if !network_mode {
+                                    save_world(
+                                        &storage, seed, &mut chunk_manager, &player, &inventory,
+                                        game_mode, difficulty, hardcore, game_time, simulation_tick,
+                                        world_spawn, do_daylight_cycle, keep_inventory, experience,
+                                        &tick_scheduler, &dropped_items, &xp_orbs,
+                                    );
+                                }
+                                if let Some(previous) = client_transport.as_mut() {
+                                    let _ = previous.disconnect();
+                                }
+                                client_transport = Some(transport);
+                                network_address = Some(address);
+                                network_mode = true;
+                                network_session_id = None;
+                                network_reconnect_timer = 0.0;
+                                remote_players.clear();
+                                chunk_manager.reset_authoritative_session();
+                                render_cache.clear();
+                                chunk_render_data.clear();
+                                all_chunk_data.clear();
+                                border_data = None;
+                                border_needs_rebuild = true;
+                                ui_state.close_to_gameplay();
+                                grabbed = true;
+                                input.mouse_grabbed = true;
+                                window.set_cursor_visible(false);
+                                let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+                                command_feedback = format!("Connecting to {address}");
+                                command_feedback_timer = 5.0;
+                            }
+                        },
+                    }
+                    renderer.gui_dirty = true;
+                }
+
                 if ui_state.render_distance != render_distance {
                     render_distance = ui_state.render_distance;
                     chunk_manager.set_render_distance(render_distance);
@@ -1176,13 +1454,22 @@ async fn run(config: AppConfig) {
                                     }
                                     ServerMessage::PlayerSpawn { player_id, username, position } => {
                                         if Some(player_id) != network_session_id {
-                                            remote_players.insert(player_id, RemotePlayerVisual { username, position });
+                                            let position = [position[0] as f32, position[1] as f32, position[2] as f32];
+                                            remote_players.insert(player_id, RemotePlayerVisual {
+                                                username,
+                                                position,
+                                                target_position: position,
+                                                velocity: [0.0; 3],
+                                                yaw: 0.0,
+                                                walk_phase: 0.0,
+                                                walk_amount: 0.0,
+                                            });
                                         }
                                     }
                                     ServerMessage::PlayerDespawn { player_id } => {
                                         remote_players.remove(&player_id);
                                     }
-                                    ServerMessage::PlayerUpdate { player_id, position, velocity, yaw: _, pitch: _, .. } => {
+                                     ServerMessage::PlayerUpdate { player_id, position, velocity, yaw, pitch: _, .. } => {
                                         if Some(player_id) == network_session_id {
                                             player.x = position[0] as f32;
                                             player.y = position[1] as f32;
@@ -1191,8 +1478,10 @@ async fn run(config: AppConfig) {
                                              // Orientation is local presentation state. Applying
                                              // delayed server echoes here makes mouse panning snap
                                              // backward and forward every authoritative tick.
-                                        } else if let Some(remote) = remote_players.get_mut(&player_id) {
-                                            remote.position = position;
+                                         } else if let Some(remote) = remote_players.get_mut(&player_id) {
+                                             remote.target_position = [position[0] as f32, position[1] as f32, position[2] as f32];
+                                             remote.velocity = velocity;
+                                             remote.yaw = yaw;
                                         }
                                     }
                                     ServerMessage::BlockUpdate { position, state, revision } => {
@@ -1392,6 +1681,23 @@ async fn run(config: AppConfig) {
                 } else {
                     simulation_clock.advance(frame_dt)
                 };
+                if !network_mode && gameplay_input {
+                    profiler::begin("player_movement");
+                    update_local_player_movement(
+                        &mut player,
+                        &mut camera,
+                        &input,
+                        bindings,
+                        game_mode,
+                        flying,
+                        &chunk_manager,
+                        &inventory,
+                        &item_registry,
+                        difficulty,
+                        frame_dt,
+                    );
+                    profiler::end("player_movement");
+                }
                 let mut hit = None;
                 for _ in 0..simulation_steps {
                     let dt = world::simulation::SIMULATION_DT;
@@ -1400,151 +1706,9 @@ async fn run(config: AppConfig) {
                     game_time = (game_time + dt).rem_euclid(1200.0);
                 }
 
-                let sprinting = input.is_key_pressed(bindings.sprint) && !flying;
                 profiler::begin("player_physics");
 
                 if !network_mode {
-
-                player.sneaking = input.is_key_pressed(bindings.sneak) && game_mode.has_gravity() && !flying && !game_mode.is_spectator();
-                (player.armor_points, player.armor_toughness) = inventory.armor_stats(&item_registry);
-                player.swimming = player.is_swimming(&chunk_manager);
-                player.on_ground = false;
-
-                // --- Elytra gliding ---
-                if !flying && game_mode.has_gravity() {
-                    if input.is_key_pressed(bindings.jump) && !player.swimming && !player.on_ground && player.vy < -1.0 {
-                        // Toggle fall flying with space while falling
-                        // (would require chestplate slot with elytra — toggle on for now as a preview)
-                    }
-                    if player.fall_flying {
-                        // Elytra physics: forward thrust based on pitch
-                        let pitch_rad = camera.pitch;
-                        let lift = pitch_rad.sin().max(0.0) * 15.0;
-                        player.vy += (lift - player::GRAVITY * 0.5) * dt;
-                        player.vy = player.vy.min(5.0).max(-15.0);
-                    }
-                }
-
-                if flying || game_mode.is_spectator() {
-                    let mut speed = 10.0 * dt;
-                    if input.is_key_pressed(bindings.sprint) { speed *= 2.0; }
-                    if input.is_key_pressed(bindings.forward) { camera.move_forward(speed); }
-                    if input.is_key_pressed(bindings.back) { camera.move_forward(-speed); }
-                    if input.is_key_pressed(bindings.left) { camera.move_right(-speed); }
-                    if input.is_key_pressed(bindings.right) { camera.move_right(speed); }
-                    if input.is_key_pressed(bindings.jump) { camera.move_up(speed); }
-                    if input.is_key_pressed(bindings.sneak) { camera.move_up(-speed); }
-                    player.x = camera.position.x;
-                    player.y = camera.position.y;
-                    player.z = camera.position.z;
-                } else if game_mode.has_gravity() {
-                    // --- Speed ---
-                    let base_spd = if player.swimming {
-                        player::SWIM_SPEED
-                    } else if player.sneaking {
-                        player::SNEAK_SPEED
-                    } else {
-                        player::WALK_SPEED
-                    };
-                    let walk_speed = base_spd * player.get_speed_multiplier() * dt * if sprinting { player::SPRINT_MULT } else { 1.0 };
-
-                    // --- Horizontal movement ---
-                    let mut dx = 0f32;
-                    let mut dz = 0f32;
-                    if input.is_key_pressed(bindings.forward) { dx += camera.yaw.sin() * walk_speed; dz += camera.yaw.cos() * walk_speed; }
-                    if input.is_key_pressed(bindings.back) { dx -= camera.yaw.sin() * walk_speed; dz -= camera.yaw.cos() * walk_speed; }
-                    if input.is_key_pressed(bindings.left) { dx += camera.yaw.cos() * walk_speed; dz -= camera.yaw.sin() * walk_speed; }
-                    if input.is_key_pressed(bindings.right) { dx -= camera.yaw.cos() * walk_speed; dz += camera.yaw.sin() * walk_speed; }
-
-                    // Diagonal normalization — prevent faster diagonal movement
-                    let len = (dx * dx + dz * dz).sqrt();
-                    if len > 0.0 {
-                        let scale = walk_speed / len;
-                        dx *= scale;
-                        dz *= scale;
-                    }
-
-                    // --- Vertical movement & gravity ---
-                    let mut touching_climbable = false;
-                    if player.swimming {
-                        player.vy *= (1.0 - player::WATER_DRAG * dt).max(0.0);
-                        // Bubble columns: soul sand → upward, magma → downward
-                        let feet_y = player.y.floor() as i32;
-                        let feet_x = player.x.floor() as i32;
-                        let feet_z = player.z.floor() as i32;
-                        let below = chunk_manager.get_block(feet_x, feet_y - 1, feet_z);
-                        let above_water = chunk_manager.get_block(feet_x, feet_y, feet_z).id == BlockId::Water;
-                        if above_water && below.id == BlockId::SoulSand {
-                            player.vy += 14.0 * dt; // upward bubble column
-                        } else if above_water && below.id == BlockId::MagmaBlock {
-                            player.vy -= 6.0 * dt; // downward bubble column
-                        }
-                        if input.is_key_pressed(bindings.jump) { player.vy += player::SWIM_SPEED * dt; }
-                        if input.is_key_pressed(bindings.sneak) { player.vy -= player::SWIM_SPEED * dt; }
-                        player.vy += player::WATER_GRAVITY * dt;
-                    } else {
-                        // Check for climbable blocks (vines, ladders) touching the player
-                        let min_bx = (player.x - player::HALF_WIDTH).floor() as i32;
-                        let max_bx = (player.x + player::HALF_WIDTH).ceil() as i32;
-                        let min_by = (player.y - 0.1).floor() as i32;
-                        let max_by = (player.y + player.current_height() + 0.1).ceil() as i32;
-                        let min_bz = (player.z - player::HALF_WIDTH).floor() as i32;
-                        let max_bz = (player.z + player::HALF_WIDTH).ceil() as i32;
-                        'climb_search: for bx in min_bx..=max_bx {
-                            for by in min_by..=max_by {
-                                for bz in min_bz..=max_bz {
-                                    if chunk_manager.get_block(bx, by, bz).id.is_climbable() {
-                                        touching_climbable = true;
-                                        break 'climb_search;
-                                    }
-                                }
-                            }
-                        }
-                        if touching_climbable {
-                            player.vy = 0.0;
-                            if input.is_key_pressed(bindings.forward) || input.is_key_pressed(bindings.jump) {
-                                player.vy = player::CLIMB_SPEED;
-                            }
-                            if input.is_key_pressed(bindings.back) {
-                                player.vy = -player::CLIMB_SPEED;
-                            }
-                        } else {
-                            player.vy += player::GRAVITY * dt;
-                        }
-                    }
-
-                    // Apply status effect gravity modifiers
-                    let grav_mult = player.get_gravity_multiplier();
-                    if grav_mult != 1.0 {
-                        if player.vy < 0.0 {
-                            player.vy *= grav_mult;
-                        }
-                    }
-
-                    // Terminal velocity (skip when climbing)
-                    if !touching_climbable {
-                        player.vy = player.vy.max(player::TERMINAL_VELOCITY);
-                    }
-                    let dy = player.vy * dt;
-
-                    // --- Collision ---
-                    player.try_move_with_difficulty(dx, dy, dz, &chunk_manager, difficulty.damage_multiplier());
-
-                    // Sprint exhaustion
-                    if sprinting {
-                        player.sprint_exhaustion(dt);
-                    }
-
-                    // Auto-jump (disabled while climbing)
-                    if !player.swimming && !touching_climbable && input.is_key_pressed(bindings.jump) && player.on_ground {
-                        player.vy = player::JUMP_SPEED * player.get_jump_multiplier();
-                        player.jump_exhaustion();
-                    }
-                    // Variable-height jump: reduce gravity while holding space during ascent
-                    if !player.swimming && !touching_climbable && input.is_key_pressed(bindings.jump) && !player.on_ground && player.vy > 0.0 {
-                        let reduced_gravity = player::GRAVITY * 0.4;
-                        player.vy += (reduced_gravity - player::GRAVITY) * dt;
-                    }
 
                     // Attack cooldown tick (uses held weapon's attack speed)
                     if game_mode.takes_damage() {
@@ -1611,37 +1775,11 @@ async fn run(config: AppConfig) {
                         }
                     }
 
-                    camera.position.x = player.x;
-                    camera.position.y = player.y + player.current_eye_height();
-                    camera.position.z = player.z;
                 } else {
                     // Adventure mode: no gravity, no flight — static camera
                     // (just allow mouse look and raycasting)
                 }
 
-                // Vanilla's dynamic FOV is roughly a 10% increase while moving and sprinting.
-                let base_fov = 70.0_f32.to_radians();
-                let moving = input.is_key_pressed(bindings.forward)
-                    || input.is_key_pressed(bindings.left)
-                    || input.is_key_pressed(bindings.back)
-                    || input.is_key_pressed(bindings.right);
-                let target_fov = if sprinting && moving {
-                    base_fov * 1.1
-                } else {
-                    base_fov
-                };
-                let fov_speed = 10.0 * dt;
-                if (camera.fov - target_fov).abs() > fov_speed {
-                    camera.fov += (target_fov - camera.fov).signum() * fov_speed;
-                } else {
-                    camera.fov = target_fov;
-                }
-
-                } else {
-                    // The server owns movement, gravity, health, and respawn.
-                    // Keep the camera attached to the last authoritative pose.
-                    camera.position = player.eye_position();
-                }
                 profiler::end("player_physics");
 
                 profiler::begin("raycast");
@@ -2021,10 +2159,53 @@ async fn run(config: AppConfig) {
     rebuild_render_data(&mut chunk_render_data, &mut all_chunk_data, &mut render_cache, &chunk_manager, &renderer, &camera);
                 profiler::end("rebuild_render_data");
                 }
+                if network_mode {
+                    // The server remains fixed-step, but the local camera follows
+                    // each authoritative snapshot on the render path.
+                    camera.position = player.eye_position();
+                }
+                // Vanilla's dynamic FOV is presentation state, so update it
+                // with the render cadence rather than the simulation tick.
+                let sprinting = input.is_key_pressed(bindings.sprint) && !flying;
+                let base_fov = 70.0_f32.to_radians();
+                let moving = input.is_key_pressed(bindings.forward)
+                    || input.is_key_pressed(bindings.left)
+                    || input.is_key_pressed(bindings.back)
+                    || input.is_key_pressed(bindings.right);
+                let target_fov = if sprinting && moving { base_fov * 1.1 } else { base_fov };
+                let fov_speed = 10.0 * frame_dt;
+                if (camera.fov - target_fov).abs() > fov_speed {
+                    camera.fov += (target_fov - camera.fov).signum() * fov_speed;
+                } else {
+                    camera.fov = target_fov;
+                }
 
                 // Render dropped items and XP orbs with persistent buffer reuse
                 {
                     let _dropped_mesh_scope = profiler::Scope::new("dropped_items_mesh");
+                    for remote in remote_players.values_mut() {
+                        let delta = [
+                            remote.target_position[0] - remote.position[0],
+                            remote.target_position[1] - remote.position[1],
+                            remote.target_position[2] - remote.position[2],
+                        ];
+                        let distance = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+                        if distance > 8.0 {
+                            remote.position = remote.target_position;
+                        } else {
+                            let blend = 1.0 - (-frame_dt * 18.0).exp();
+                            remote.position[0] += delta[0] * blend;
+                            remote.position[1] += delta[1] * blend;
+                            remote.position[2] += delta[2] * blend;
+                        }
+                        let horizontal_speed = (remote.velocity[0] * remote.velocity[0]
+                            + remote.velocity[2] * remote.velocity[2]).sqrt();
+                        let target_walk = (horizontal_speed / 4.3).clamp(0.0, 1.0);
+                        let animation_blend = 1.0 - (-frame_dt * 12.0).exp();
+                        remote.walk_amount += (target_walk - remote.walk_amount) * animation_blend;
+                        remote.walk_phase = (remote.walk_phase + horizontal_speed * frame_dt * 5.0)
+                            .rem_euclid(std::f32::consts::TAU);
+                    }
                     let item_mesh = world::dropped_item::dropped_items_to_mesh(&dropped_items);
                     let xp_mesh = xp_orbs_to_mesh(&xp_orbs);
                     let entity_data: Vec<_> = entities
@@ -2036,14 +2217,14 @@ async fn run(config: AppConfig) {
                             BlockId::Target,
                         ))
                         .collect();
-                    let mut entity_data = entity_data;
-                    entity_data.extend(remote_players.values().map(|remote| (
-                        remote.position[0] as f32,
-                        remote.position[1] as f32,
-                        remote.position[2] as f32,
-                        BlockId::Target,
-                    )));
                     let entity_mesh = build_item_cube_mesh(&entity_data);
+                    let player_instances: Vec<_> = remote_players.values().map(|remote| PlayerMeshInstance {
+                        position: remote.position,
+                        yaw: remote.yaw,
+                        walk_phase: remote.walk_phase,
+                        walk_amount: remote.walk_amount,
+                    }).collect();
+                    let player_mesh = build_player_mesh(&player_instances);
                     let mut combined = item_mesh;
                     let vert_offset = combined.vertices.len() as u32;
                     combined.vertices.extend(xp_mesh.vertices);
@@ -2051,6 +2232,9 @@ async fn run(config: AppConfig) {
                     let vert_offset = combined.vertices.len() as u32;
                     combined.vertices.extend(entity_mesh.vertices);
                     combined.indices.extend(entity_mesh.indices.iter().map(|i| i.saturating_add(vert_offset)));
+                    let vert_offset = combined.vertices.len() as u32;
+                    combined.vertices.extend(player_mesh.vertices);
+                    combined.indices.extend(player_mesh.indices.iter().map(|i| i.saturating_add(vert_offset)));
                     if !combined.vertices.is_empty() {
                         let vert_len = combined.vertices.len();
                         let idx_len = combined.indices.len();

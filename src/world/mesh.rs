@@ -1664,3 +1664,135 @@ pub fn build_item_cube_mesh(items: &[(f32, f32, f32, BlockId)]) -> ChunkMesh {
         transparent_indices: Vec::new(),
     }
 }
+
+/// Render state for a remote player. Positions are already interpolated by the
+/// client; keeping this type in the mesh module keeps animation independent of
+/// the network transport and renderer.
+#[derive(Clone, Copy, Debug)]
+pub struct PlayerMeshInstance {
+    pub position: [f32; 3],
+    pub yaw: f32,
+    pub walk_phase: f32,
+    pub walk_amount: f32,
+}
+
+fn player_transform(
+    point: [f32; 3],
+    pivot: [f32; 3],
+    limb_pitch: f32,
+    yaw: f32,
+    origin: [f32; 3],
+) -> [f32; 3] {
+    let dy = point[1] - pivot[1];
+    let dz = point[2] - pivot[2];
+    let pitch_cos = limb_pitch.cos();
+    let pitch_sin = limb_pitch.sin();
+    let pitched = [
+        point[0],
+        pivot[1] + dy * pitch_cos - dz * pitch_sin,
+        pivot[2] + dy * pitch_sin + dz * pitch_cos,
+    ];
+    let local_x = pitched[0];
+    let local_z = pitched[2];
+    [
+        origin[0] + local_x * yaw.cos() + local_z * yaw.sin(),
+        origin[1] + pitched[1],
+        origin[2] - local_x * yaw.sin() + local_z * yaw.cos(),
+    ]
+}
+
+fn emit_player_box(
+    vertices: &mut Vec<MeshVertex>,
+    indices: &mut Vec<u32>,
+    origin: [f32; 3],
+    yaw: f32,
+    min: [f32; 3],
+    max: [f32; 3],
+    pivot: [f32; 3],
+    limb_pitch: f32,
+    block_id: BlockId,
+) {
+    let tex = get_texture_index(Block::new(block_id), BlockFace::Front);
+    let light_data = (15u32 << 8) | (15u32 << 4) | 15;
+    let faces = [
+        (BlockFace::Top, [
+            [min[0], max[1], min[2]], [max[0], max[1], min[2]],
+            [max[0], max[1], max[2]], [min[0], max[1], max[2]],
+        ], true),
+        (BlockFace::Bottom, [
+            [min[0], min[1], min[2]], [max[0], min[1], min[2]],
+            [max[0], min[1], max[2]], [min[0], min[1], max[2]],
+        ], false),
+        (BlockFace::Left, [
+            [min[0], min[1], min[2]], [min[0], min[1], max[2]],
+            [min[0], max[1], max[2]], [min[0], max[1], min[2]],
+        ], false),
+        (BlockFace::Right, [
+            [max[0], min[1], min[2]], [max[0], min[1], max[2]],
+            [max[0], max[1], max[2]], [max[0], max[1], min[2]],
+        ], true),
+        (BlockFace::Front, [
+            [min[0], min[1], max[2]], [max[0], min[1], max[2]],
+            [max[0], max[1], max[2]], [min[0], max[1], max[2]],
+        ], false),
+        (BlockFace::Back, [
+            [min[0], min[1], min[2]], [max[0], min[1], min[2]],
+            [max[0], max[1], min[2]], [min[0], max[1], min[2]],
+        ], true),
+    ];
+
+    for (face, corners, reversed) in faces {
+        let normal = get_face_normal(face);
+        let base = vertices.len() as u32;
+        let transformed = corners.map(|corner| player_transform(corner, pivot, limb_pitch, yaw, origin));
+        let transformed_normal = player_transform(
+            [normal[0], normal[1], normal[2]],
+            [0.0, 0.0, 0.0],
+            limb_pitch,
+            yaw,
+            [0.0, 0.0, 0.0],
+        );
+        let normal = [transformed_normal[0], transformed_normal[1], transformed_normal[2]];
+        let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        for (pos, uv) in transformed.into_iter().zip(uvs) {
+            vertices.push(MeshVertex { pos, uv, normal, tex_index: tex, light_data });
+        }
+        if reversed {
+            indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+        } else {
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+}
+
+/// Build the simple multiplayer avatar used until player skin assets exist.
+/// Each avatar has independently animated limbs, so movement remains readable
+/// even when a server only sends transforms and velocity.
+pub fn build_player_mesh(players: &[PlayerMeshInstance]) -> ChunkMesh {
+    let mut vertices = Vec::with_capacity(players.len() * 6 * 6 * 4);
+    let mut indices = Vec::with_capacity(players.len() * 6 * 6 * 6);
+
+    for player in players {
+        let swing = player.walk_phase.sin() * 0.65 * player.walk_amount;
+        let arm_swing = -swing;
+        let head = BlockId::BrownWool;
+        let shirt = BlockId::BlueWool;
+        let sleeves = BlockId::LightBlueWool;
+        let pants = BlockId::BlackWool;
+
+        emit_player_box(&mut vertices, &mut indices, player.position, player.yaw,
+            [-0.25, 1.50, -0.25], [0.25, 2.00, 0.25], [0.0, 1.50, 0.0], 0.0, head);
+        emit_player_box(&mut vertices, &mut indices, player.position, player.yaw,
+            [-0.25, 0.75, -0.14], [0.25, 1.50, 0.14], [0.0, 0.75, 0.0], 0.0, shirt);
+        emit_player_box(&mut vertices, &mut indices, player.position, player.yaw,
+            [-0.40, 0.75, -0.14], [-0.25, 1.50, 0.14], [-0.325, 1.50, 0.0], arm_swing, sleeves);
+        emit_player_box(&mut vertices, &mut indices, player.position, player.yaw,
+            [0.25, 0.75, -0.14], [0.40, 1.50, 0.14], [0.325, 1.50, 0.0], swing, sleeves);
+        emit_player_box(&mut vertices, &mut indices, player.position, player.yaw,
+            [-0.24, 0.0, -0.12], [-0.04, 0.75, 0.12], [-0.14, 0.75, 0.0], swing, pants);
+        emit_player_box(&mut vertices, &mut indices, player.position, player.yaw,
+            [0.04, 0.0, -0.12], [0.24, 0.75, 0.12], [0.14, 0.75, 0.0], arm_swing, pants);
+    }
+
+    ChunkMesh { vertices, indices, transparent_vertices: Vec::new(), transparent_indices: Vec::new() }
+}

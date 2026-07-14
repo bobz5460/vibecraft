@@ -8,6 +8,7 @@ pub enum UiScreen {
     Options,
     Controls,
     Accessibility,
+    Connect,
     Title,
 }
 
@@ -22,6 +23,8 @@ pub enum UiAction {
     ToggleGuiScale,
     ToggleHighContrast,
     ToggleReducedMotion,
+    OpenConnect,
+    ConnectServer,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +87,7 @@ pub struct UiState {
     pub chat_opacity: f32,
     pub render_distance: i32,
     pub graphics_vibrant: bool,
+    pub server_address: String,
 }
 
 impl Default for UiState {
@@ -97,6 +101,7 @@ impl Default for UiState {
             chat_opacity: 0.72,
             render_distance: 6,
             graphics_vibrant: false,
+            server_address: "127.0.0.1:25565".to_string(),
         }
     }
 }
@@ -143,6 +148,10 @@ impl UiState {
                 self.screen = UiScreen::Pause;
                 self.selected = 0;
             }
+            UiScreen::Connect => {
+                self.screen = UiScreen::Pause;
+                self.selected = 0;
+            }
             UiScreen::Title => return UiAction::Quit,
         }
         UiAction::None
@@ -171,11 +180,12 @@ impl UiState {
 
     fn button_count(&self) -> usize {
         match self.screen {
-            UiScreen::Pause => 5,
+            UiScreen::Pause => 6,
             UiScreen::Options => 6,
             UiScreen::Controls => 1,
             UiScreen::Accessibility => 4,
-            UiScreen::Title => 3,
+            UiScreen::Connect => 2,
+            UiScreen::Title => 4,
             _ => 0,
         }
     }
@@ -188,21 +198,26 @@ impl UiState {
                     UiAction::Resume
                 }
                 1 => {
+                    self.screen = UiScreen::Connect;
+                    self.selected = 0;
+                    UiAction::OpenConnect
+                }
+                2 => {
                     self.screen = UiScreen::Options;
                     self.selected = 0;
                     UiAction::None
                 }
-                2 => {
+                3 => {
                     self.screen = UiScreen::Controls;
                     self.selected = 0;
                     UiAction::None
                 }
-                3 => {
+                4 => {
                     self.screen = UiScreen::Accessibility;
                     self.selected = 0;
                     UiAction::None
                 }
-                4 => UiAction::Quit,
+                5 => UiAction::Quit,
                 _ => UiAction::None,
             },
             UiScreen::Options => match index {
@@ -265,11 +280,25 @@ impl UiState {
                     UiAction::Resume
                 }
                 1 => {
+                    self.screen = UiScreen::Connect;
+                    self.selected = 0;
+                    UiAction::OpenConnect
+                }
+                2 => {
                     self.screen = UiScreen::Options;
                     self.selected = 0;
                     UiAction::None
                 }
-                2 => UiAction::Quit,
+                3 => UiAction::Quit,
+                _ => UiAction::None,
+            },
+            UiScreen::Connect => match index {
+                0 => UiAction::ConnectServer,
+                1 => {
+                    self.screen = UiScreen::Pause;
+                    self.selected = 0;
+                    UiAction::None
+                }
                 _ => UiAction::None,
             },
             _ => UiAction::None,
@@ -292,6 +321,18 @@ impl UiState {
         }
     }
 
+    pub fn append_server_address(&mut self, value: &str) {
+        if self.screen == UiScreen::Connect {
+            self.server_address.push_str(value);
+        }
+    }
+
+    pub fn backspace_server_address(&mut self) {
+        if self.screen == UiScreen::Connect {
+            self.server_address.pop();
+        }
+    }
+
     fn button_rects(&self, width: f32, height: f32) -> Vec<(f32, f32, f32, f32)> {
         let button_w = (width * 0.34).clamp(240.0, 420.0);
         let button_h = 34.0 * self.gui_scale;
@@ -302,6 +343,8 @@ impl UiState {
             .map(|index| {
                 let y = if self.screen == UiScreen::Controls {
                     top + 170.0
+                } else if self.screen == UiScreen::Connect {
+                    top + 70.0 + index as f32 * (button_h + 8.0)
                 } else {
                     top + index as f32 * (button_h + 8.0)
                 };
@@ -339,11 +382,12 @@ impl UiState {
                 draw_hud(&mut frame, width, height, self.gui_scale, hotbar, health, hunger, false);
                 draw_inventory(&mut frame, width, height, self.gui_scale, inventory.unwrap_or(&[]), crafting.unwrap_or(&[]), craft_result, carried, cursor, self.high_contrast);
             }
-            UiScreen::Pause => draw_menu(&mut frame, width, height, self, "Paused", &["Resume", "Options", "Controls", "Accessibility", "Quit to desktop"]),
+            UiScreen::Pause => draw_menu(&mut frame, width, height, self, "Paused", &["Resume", "Join Server", "Options", "Controls", "Accessibility", "Quit to desktop"]),
             UiScreen::Options => draw_options(&mut frame, width, height, self),
             UiScreen::Controls => draw_controls(&mut frame, width, height, self),
             UiScreen::Accessibility => draw_accessibility(&mut frame, width, height, self),
-            UiScreen::Title => draw_menu(&mut frame, width, height, self, "Vibecraft", &["Continue", "Options", "Quit"]),
+            UiScreen::Connect => draw_connect(&mut frame, width, height, self, feedback),
+            UiScreen::Title => draw_menu(&mut frame, width, height, self, "Vibecraft", &["Continue", "Join Server", "Options", "Quit"]),
         }
         frame
     }
@@ -594,6 +638,28 @@ fn draw_menu(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, titl
     }
 }
 
+fn draw_connect(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, feedback: Option<&str>) {
+    panel(frame, width, height, state.high_contrast);
+    text(frame, width * 0.5 - 110.0, height * 0.18, 28.0, "Join Server", [1.0, 0.86, 0.35, 1.0]);
+    let input_w = (width * 0.34).clamp(240.0, 420.0);
+    let input_x = (width - input_w) * 0.5;
+    let input_y = height * 0.30;
+    text(frame, input_x, input_y - 24.0, 14.0, "Server address (host:port)", [0.82, 0.82, 0.88, 1.0]);
+    rect(frame, input_x, input_y, input_w, 38.0, [0.04, 0.04, 0.06, 1.0]);
+    text(frame, input_x + 12.0, input_y + 10.0, 16.0, &state.server_address, [1.0, 1.0, 1.0, 1.0]);
+    if let Some(feedback) = feedback.filter(|text| !text.is_empty()) {
+        text(frame, input_x, input_y + 48.0, 13.0, feedback, [1.0, 0.55, 0.45, 1.0]);
+    }
+    let labels = ["Connect", "Back"];
+    let rects = state.button_rects(width, height);
+    for (index, label) in labels.iter().enumerate() {
+        if let Some(&(x, y, w, h)) = rects.get(index) {
+            rect(frame, x, y, w, h, if index == state.selected { [0.55, 0.43, 0.18, 1.0] } else { [0.12, 0.12, 0.16, 0.98] });
+            text(frame, x + 16.0, y + 9.0, 16.0, *label, [1.0, 1.0, 1.0, 1.0]);
+        }
+    }
+}
+
 fn draw_options(frame: &mut UiFrame, width: f32, height: f32, state: &UiState) {
     panel(frame, width, height, state.high_contrast);
     text(frame, width * 0.5 - 70.0, height * 0.18, 28.0, "Options", [1.0, 0.86, 0.35, 1.0]);
@@ -659,9 +725,23 @@ mod tests {
     fn menu_click_activates_options() {
         let mut ui = UiState::default();
         ui.open_pause();
-        let action = ui.click(800.0, 600.0, 400.0, 0.34 * 600.0 + 42.0);
+        let action = ui.click(800.0, 600.0, 400.0, 0.34 * 600.0 + 2.0 * 42.0);
         assert_eq!(action, UiAction::None);
         assert_eq!(ui.screen, UiScreen::Options);
+    }
+
+    #[test]
+    fn connect_screen_edits_address_and_submits() {
+        let mut ui = UiState::default();
+        ui.open_pause();
+        assert_eq!(ui.activate_focused(), UiAction::Resume);
+        ui.open_pause();
+        ui.move_focus(1);
+        assert_eq!(ui.activate_focused(), UiAction::OpenConnect);
+        ui.server_address.clear();
+        ui.append_server_address("localhost:25565");
+        assert_eq!(ui.server_address, "localhost:25565");
+        assert_eq!(ui.activate_focused(), UiAction::ConnectServer);
     }
 
     #[test]

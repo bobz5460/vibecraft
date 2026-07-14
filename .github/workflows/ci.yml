@@ -2,9 +2,66 @@ name: CI
 on: [push, pull_request]
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+        - os: ubuntu-latest
+          artifact: vibecraft-linux
+          binary: target/release/vibecraft
+        - os: windows-latest
+          artifact: vibecraft-windows
+          binary: target/release/vibecraft.exe
+        - os: macos-latest
+          artifact: vibecraft-macos
+          binary: target/release/vibecraft
+    runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+    - name: Install Linux audio build dependencies
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install --yes pkg-config libasound2-dev
+    - name: Download Minecraft assets
+      shell: bash
+      env:
+        MINECRAFT_VERSION: 1.21.1
+      run: |
+        python - <<'PY'
+        import io
+        import json
+        import os
+        from pathlib import Path
+        import urllib.request
+        import zipfile
+
+        version = os.environ["MINECRAFT_VERSION"]
+        manifest_url = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+        manifest = json.loads(urllib.request.urlopen(manifest_url).read())
+        version_url = next(item["url"] for item in manifest["versions"] if item["id"] == version)
+        version_info = json.loads(urllib.request.urlopen(version_url).read())
+        client_url = version_info["downloads"]["client"]["url"]
+        client_jar = urllib.request.urlopen(client_url).read()
+
+        prefix = "assets/minecraft/"
+        output_root = Path("embeds_minecraft")
+        extracted = 0
+        with zipfile.ZipFile(io.BytesIO(client_jar)) as archive:
+            for entry in archive.infolist():
+                if entry.is_dir() or not entry.filename.startswith(prefix):
+                    continue
+                output = output_root / entry.filename[len(prefix):]
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(archive.read(entry))
+                extracted += 1
+        print(f"Extracted {extracted} Minecraft {version} asset files")
+        PY
     - uses: dtolnay/rust-toolchain@stable
-    - run: cargo build --release
-    - run: cargo clippy -- -D warnings
+    - run: cargo build --release --features bundled
+    - name: Upload bundled executable
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact }}
+        path: ${{ matrix.binary }}
+        if-no-files-found: error

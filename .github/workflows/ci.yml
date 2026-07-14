@@ -12,7 +12,10 @@ jobs:
           artifact: vibecraft-windows
           binary: target/release/vibecraft.exe
         - os: macos-latest
-          artifact: vibecraft-macos
+          artifact: vibecraft-macos-arm
+          binary: target/release/vibecraft
+        - os: macos-13
+          artifact: vibecraft-macos-intel
           binary: target/release/vibecraft
     runs-on: ${{ matrix.os }}
     steps:

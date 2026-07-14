@@ -1671,31 +1671,31 @@ impl Renderer {
                         sprite_indices.extend(quad_indices.into_iter().map(|index| index + base));
                     }
                 }
-                UiCommand::Item { x, y, size, name, sprite, count, hint } => {
-                    if let Some((quad, quad_indices)) = self.gui_atlas.build_sprite(sprite, *x, *y, *size, *size, [1.0, 1.0, 1.0, 1.0]) {
+                UiCommand::NineSlice { sprite, x, y, w, h, border, color } => {
+                    if let Some((quad, quad_indices)) = self.gui_atlas.build_nine_slice(sprite, *x, *y, *w, *h, *border, *color) {
                         let base = sprite_vertices.len() as u32;
                         sprite_vertices.extend(quad);
                         sprite_indices.extend(quad_indices.into_iter().map(|index| index + base));
                     }
-                    let hue = (*hint % 7) as f32 / 7.0;
-                    let color = [0.35 + hue * 0.45, 0.45 + (1.0 - hue) * 0.35, 0.55, 1.0];
-                    if self.gui_atlas.get_uv(sprite) == [0.0, 0.0, 0.0, 0.0] {
+                }
+                UiCommand::Item { x, y, size, name: _, sprite, count, hint } => {
+                    if let Some((quad, quad_indices)) = self.gui_atlas.build_sprite(sprite, *x, *y, *size, *size, [1.0, 1.0, 1.0, 1.0]) {
+                        let base = sprite_vertices.len() as u32;
+                        sprite_vertices.extend(quad);
+                        sprite_indices.extend(quad_indices.into_iter().map(|index| index + base));
+                    } else {
+                        let hue = (*hint % 7) as f32 / 7.0;
+                        let color = [0.35 + hue * 0.45, 0.45 + (1.0 - hue) * 0.35, 0.55, 1.0];
                         let (quad, quad_indices) = self.font.build_colored_rect(*x, *y, *size, *size, color);
                         let base = vertices.len() as u32;
                         vertices.extend(quad);
                         indices.extend(quad_indices.into_iter().map(|index| index + base));
                     }
-                    let label = name.chars().next().map(|ch| ch.to_ascii_uppercase().to_string()).unwrap_or_else(|| "?".to_string());
-                    let (mut label_vertices, label_indices) = self.font.build_text(&label, *x + *size * 0.25, *y + *size * 0.16, *size * 0.42, *size * 0.42);
-                    for vertex in &mut label_vertices {
-                        vertex.color = [1.0, 1.0, 1.0, 1.0];
-                    }
-                    let label_base = vertices.len() as u32;
-                    vertices.extend(label_vertices);
-                    indices.extend(label_indices.into_iter().map(|index| index + label_base));
                     if *count > 1 {
                         let count_text = count.to_string();
-                        let (mut count_vertices, count_indices) = self.font.build_text(&count_text, *x + *size * 0.55, *y + *size * 0.62, *size * 0.25, *size * 0.25);
+                        let cw = *size * 0.28;
+                        let ch = *size * 0.28;
+                        let (mut count_vertices, count_indices) = self.font.build_text(&count_text, *x + *size - cw * count_text.len() as f32 - 1.0, *y + *size - ch - 1.0, cw, ch);
                         for vertex in &mut count_vertices {
                             vertex.color = [1.0, 1.0, 1.0, 1.0];
                         }

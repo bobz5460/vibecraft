@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use crate::assets::reader::AssetReader;
+use crate::engine::text::TextVertex;
 
 fn sprite_id(name: &str) -> u64 {
     let mut h = 0x9e3779b97f4a7c15u64;
@@ -62,6 +63,16 @@ impl GuiAtlas {
         // Title screen textures
         if reader.exists("textures/gui/title") {
             Self::load_pngs(reader, "textures/gui/title", &mut entries, "title/");
+        }
+
+        // Widget sprites (buttons, sliders, etc.)
+        if reader.exists("textures/gui/sprites/widget") {
+            Self::load_pngs(reader, "textures/gui/sprites/widget", &mut entries, "widget/");
+        }
+
+        // Popup/tooltip backgrounds
+        if reader.exists("textures/gui/sprites/popup") {
+            Self::load_pngs(reader, "textures/gui/sprites/popup", &mut entries, "popup/");
         }
 
         // Mob effect icons
@@ -296,6 +307,72 @@ impl GuiAtlas {
         ];
         let indices = vec![0, 1, 2, 0, 2, 3];
         Some((verts, indices))
+    }
+
+    /// Build nine-slice geometry at screen position (x,y) with dimensions (w,h).
+    /// `border` is the pixel border from the source sprite edges.
+    /// Returns 9 quads (vertices + indices) representing the 9-slice layout.
+    pub fn build_nine_slice(
+        &self,
+        name: &str,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        border: f32,
+        color: [f32; 4],
+    ) -> Option<(Vec<TextVertex>, Vec<u32>)> {
+        let uv = self.get_uv(name);
+        if uv == [0.0, 0.0, 0.0, 0.0] {
+            return None;
+        }
+        let [u0, v0, u1, v1] = uv;
+
+        // Source sprite pixel size from atlas UV
+        let af = self.atlas_size as f32;
+        let src_w = (u1 - u0) * af;
+        let src_h = (v1 - v0) * af;
+
+        // Scale border proportionally to the larger of the two scaling factors
+        let scale_x = w / src_w;
+        let scale_y = h / src_h;
+        let bp = border * scale_x.max(scale_y);
+
+        let b_u = border / src_w;
+        let b_v = border / src_h;
+
+        // UV boundaries
+        let um = [u0, u0 + b_u, u1 - b_u, u1];
+        let vm = [v0, v0 + b_v, v1 - b_v, v1];
+
+        // Pixel boundaries
+        let xm = [x, x + bp, x + w - bp, x + w];
+        let ym = [y, y + bp, y + h - bp, y + h];
+
+        let mut vertices = Vec::with_capacity(36);
+        let mut indices = Vec::with_capacity(54);
+
+        for row in 0..3 {
+            for col in 0..3 {
+                let u_left = um[col];
+                let u_right = um[col + 1];
+                let v_top = vm[row];
+                let v_bot = vm[row + 1];
+                let px = xm[col];
+                let py = ym[row];
+                let pw = xm[col + 1] - px;
+                let ph = ym[row + 1] - py;
+
+                let base = vertices.len() as u32;
+                vertices.push(TextVertex { pos: [px, py], uv: [u_left, v_top], color });
+                vertices.push(TextVertex { pos: [px + pw, py], uv: [u_right, v_top], color });
+                vertices.push(TextVertex { pos: [px + pw, py + ph], uv: [u_right, v_bot], color });
+                vertices.push(TextVertex { pos: [px, py + ph], uv: [u_left, v_bot], color });
+                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+        }
+
+        Some((vertices, indices))
     }
 
     /// Build vertex data using a white reference pixel for solid color quads

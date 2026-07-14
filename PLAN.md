@@ -296,7 +296,7 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 - Depends on: GUI atlas and input plumbing
 - Acceptance: Escape opens a navigable pause screen, supported menu actions work with mouse and keyboard, inventory clicks use the rendered slot layout, chat/cursor focus does not rotate or move the player, and UI rendering survives resize.
 - Status: partial
-- Notes: HUD, inventory backgrounds, status icons, crosshair, and known item icons now come from the official 1.21.1 asset checkout through the GUI atlas. The current implementation intentionally keeps the existing world initialization and native inventory/container scope. Title/world-select/multiplayer screen lifecycle, runtime key rebinding, and full localization remain follow-up work.
+- Notes: HUD, inventory backgrounds, status icons, crosshair, and known item icons now come from the official 1.21.1 asset checkout through the GUI atlas. Hotbar now includes experience bar, armor bar, and selected item name above the bar, matching vanilla layout. Settings screens (options, controls, accessibility) have been updated with more Minecraft-like button layouts and additional options (view bobbing, auto-jump). Title/world-select/multiplayer screen lifecycle, runtime key rebinding, and full localization remain follow-up work.
 
 ### M9: Multiplayer Demo And External Compatibility
 
@@ -334,7 +334,7 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 - Depends on: Windowed authoritative client slice
 - Acceptance: Two connected clients render one another as visible head/torso/limb models, movement is smoothed between server updates, and walking produces a synchronized readable limb cycle.
 - Status: partial
-- Notes: Remote avatars use existing terrain-atlas wool textures and the shared lit/shadow terrain pipeline. The release scenario with two independently launched clients is still required.
+- Notes: Remote avatars use existing terrain-atlas wool textures and the shared lit/shadow terrain pipeline. Local player camera now interpolates smoothly between authoritative server position updates using exponential blending, decoupling render rate from the 20 TPS simulation clock. The release scenario with two independently launched clients is still required.
 
 ### 2026-07-13: Native multiplayer protocol contract
 - Owner: OpenCode

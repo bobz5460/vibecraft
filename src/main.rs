@@ -595,7 +595,7 @@ async fn run(config: AppConfig) {
     window_state.window.set_cursor_visible(false);
     let _ = window_state
         .window
-        .set_cursor_grab(CursorGrabMode::Confined);
+        .set_cursor_grab(CursorGrabMode::Locked);
 
     let window = window_state.window.clone();
 
@@ -814,7 +814,8 @@ async fn run(config: AppConfig) {
         });
     }
     let mut render_quality = config.graphics;
-    let mut ui_state = ui::UiState::new(render_distance, render_quality == GraphicsQuality::Vibrant);
+    let screen_height = renderer.size.1 as f32;
+    let mut ui_state = ui::UiState::new(render_distance, render_quality == GraphicsQuality::Vibrant, screen_height);
     if let Some(address) = network_address {
         ui_state.server_address = address.to_string();
     }
@@ -937,7 +938,7 @@ async fn run(config: AppConfig) {
                                             grabbed = true;
                                             input.mouse_grabbed = true;
                                             window.set_cursor_visible(false);
-                                            let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+                                            let _ = window.set_cursor_grab(CursorGrabMode::Locked);
                                         }
                                         renderer.gui_dirty = true;
                                     }
@@ -949,7 +950,7 @@ async fn run(config: AppConfig) {
                                             grabbed = true;
                                             input.mouse_grabbed = true;
                                             window.set_cursor_visible(false);
-                                            let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+                                            let _ = window.set_cursor_grab(CursorGrabMode::Locked);
                                         }
                                         renderer.gui_dirty = true;
                                     }
@@ -1032,7 +1033,7 @@ async fn run(config: AppConfig) {
                                              grabbed = true;
                                              input.mouse_grabbed = true;
                                              window.set_cursor_visible(false);
-                                             let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+                                             let _ = window.set_cursor_grab(CursorGrabMode::Locked);
                                          }
                                          renderer.gui_dirty = true;
                                      }
@@ -1049,7 +1050,7 @@ async fn run(config: AppConfig) {
                                               grabbed = true;
                                               input.mouse_grabbed = true;
                                               window.set_cursor_visible(false);
-                                              let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+                                              let _ = window.set_cursor_grab(CursorGrabMode::Locked);
                                           }
                                           renderer.gui_dirty = true;
                                       }
@@ -1118,43 +1119,45 @@ async fn run(config: AppConfig) {
                                     PhysicalKey::Code(KeyCode::Digit7) => { inventory.held_slot = 6.min(inventory::HOTBAR_SLOTS - 1); }
                                     PhysicalKey::Code(KeyCode::Digit8) => { inventory.held_slot = 7.min(inventory::HOTBAR_SLOTS - 1); }
                                     PhysicalKey::Code(KeyCode::Digit9) => { inventory.held_slot = 8.min(inventory::HOTBAR_SLOTS - 1); }
-                                     PhysicalKey::Code(key) if key == bindings.inventory => {
-                                         if !command_mode && !ui_state.is_menu_open() {
-                                             inventory_open = !inventory_open;
-                                             if inventory_open {
-                                                 ui_state.open_inventory();
-                                             } else {
-                                                 ui_state.close_to_gameplay();
-                                             }
-                                             renderer.gui_dirty = true;
-                                            if inventory_open {
-                                                grabbed = false;
-                                                input.mouse_grabbed = false;
-                                                window.set_cursor_visible(true);
-                                                let _ = window.set_cursor_grab(CursorGrabMode::None);
-                                            } else {
-                                                grabbed = true;
-                                                input.mouse_grabbed = true;
-                                                window.set_cursor_visible(false);
-                                                let _ = window.set_cursor_grab(CursorGrabMode::Confined);
-                                                 // Drop carried item when closing inventory
-                                                 if !network_mode {
-                                                     return_crafting_items(
-                                                         &mut player_crafting,
-                                                         &mut inventory,
-                                                         &mut carried_item,
-                                                         &mut dropped_items,
-                                                         player.x,
-                                                         player.y + player.current_eye_height(),
-                                                         player.z,
-                                                         &item_registry,
-                                                     );
-                                                 } else {
-                                                     carried_item = None;
-                                                 }
-                                            }
-                                        }
-                                    }
+                                      PhysicalKey::Code(key) if key == bindings.inventory => {
+                                          if !command_mode {
+                                              let was_open = inventory_open;
+                                              if was_open || !ui_state.is_menu_open() {
+                                                  inventory_open = !inventory_open;
+                                                  if inventory_open {
+                                                      ui_state.open_inventory();
+                                                  } else {
+                                                      ui_state.close_to_gameplay();
+                                                  }
+                                                  renderer.gui_dirty = true;
+                                                  if inventory_open {
+                                                      grabbed = false;
+                                                      input.mouse_grabbed = false;
+                                                      window.set_cursor_visible(true);
+                                                      let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                                  } else {
+                                                      grabbed = true;
+                                                      input.mouse_grabbed = true;
+                                                      window.set_cursor_visible(false);
+                                                      let _ = window.set_cursor_grab(CursorGrabMode::Locked);
+                                                      if !network_mode {
+                                                          return_crafting_items(
+                                                              &mut player_crafting,
+                                                              &mut inventory,
+                                                              &mut carried_item,
+                                                              &mut dropped_items,
+                                                              player.x,
+                                                              player.y + player.current_eye_height(),
+                                                              player.z,
+                                                              &item_registry,
+                                                          );
+                                                      } else {
+                                                          carried_item = None;
+                                                      }
+                                                  }
+                                              }
+                                          }
+                                     }
                                      PhysicalKey::Code(key) if key == bindings.drop_item => {
                                          if !command_mode && !inventory_open {
                                              if network_mode {
@@ -1216,7 +1219,7 @@ async fn run(config: AppConfig) {
                                     grabbed = true;
                                     input.mouse_grabbed = true;
                                     window.set_cursor_visible(false);
-                                    let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+                                    let _ = window.set_cursor_grab(CursorGrabMode::Locked);
                                 }
                                 renderer.gui_dirty = true;
                             } else if inventory_open
@@ -1320,7 +1323,7 @@ async fn run(config: AppConfig) {
                                 grabbed = true;
                                 input.mouse_grabbed = true;
                                 window.set_cursor_visible(false);
-                                let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+                                let _ = window.set_cursor_grab(CursorGrabMode::Locked);
                             }
                         } else if !*focused && grabbed {
                             grabbed = false;
@@ -1384,7 +1387,7 @@ async fn run(config: AppConfig) {
                                 grabbed = true;
                                 input.mouse_grabbed = true;
                                 window.set_cursor_visible(false);
-                                let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+                                let _ = window.set_cursor_grab(CursorGrabMode::Locked);
                                 command_feedback = format!("Connecting to {address}");
                                 command_feedback_timer = 5.0;
                             }
@@ -2160,9 +2163,17 @@ async fn run(config: AppConfig) {
                 profiler::end("rebuild_render_data");
                 }
                 if network_mode {
-                    // The server remains fixed-step, but the local camera follows
-                    // each authoritative snapshot on the render path.
-                    camera.position = player.eye_position();
+                    // Smoothly interpolate the camera between server position
+                    // updates so the view remains fluid despite 20 TPS physics.
+                    let target_eye = player.eye_position();
+                    let delta = target_eye - camera.position;
+                    let dist = delta.norm();
+                    if dist > 8.0 {
+                        camera.position = target_eye;
+                    } else {
+                        let blend = 1.0 - (-frame_dt * 18.0).exp();
+                        camera.position = camera.position + delta * blend;
+                    }
                 }
                 // Vanilla's dynamic FOV is presentation state, so update it
                 // with the render cadence rather than the simulation tick.
@@ -2587,7 +2598,7 @@ async fn run(config: AppConfig) {
                         } else { 0 },
                         is_empty: ci.is_empty(),
                     });
-                    let cursor = if inventory_open { Some((cursor_x, cursor_y)) } else { None };
+                    let cursor = if inventory_open || ui_state.is_menu_open() { Some((cursor_x, cursor_y)) } else { None };
                     let ui_hotbar: Vec<UiSlot> = (0..inventory::HOTBAR_SLOTS)
                         .map(|index| ui_slot(inventory.hotbar_slot(index), &item_registry, index == inventory.held_slot))
                         .collect();
@@ -2605,6 +2616,8 @@ async fn run(config: AppConfig) {
                     let craft_result = player_crafting.result(&item_registry);
                     let ui_craft_result = if inventory_open { Some(ui_slot(&craft_result, &item_registry, false)) } else { None };
                     let toast = if feedback_visible && !show_debug { Some(command_feedback.as_str()) } else { None };
+                    let selected_stack = inventory.selected_stack();
+                    let selected_item_name = if selected_stack.is_empty() { String::new() } else { item_registry.name(selected_stack.id).to_string() };
                     let ui_frame = ui_state.frame(
                         renderer.size.0.max(1) as f32,
                         renderer.size.1.max(1) as f32,
@@ -2615,6 +2628,9 @@ async fn run(config: AppConfig) {
                         ui_carried.as_ref(),
                         player.health,
                         player.hunger,
+                        player.armor_points,
+                        experience as f32 / 100.0,
+                        &selected_item_name,
                         &chat_lines,
                         toast,
                         cursor,

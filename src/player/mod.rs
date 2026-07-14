@@ -8,19 +8,22 @@ use nalgebra::Point3;
 
 pub const STANDING_EYE_HEIGHT: f32 = 1.6;
 pub const SNEAK_EYE_HEIGHT: f32 = 1.27;
+pub const SWIMMING_EYE_HEIGHT: f32 = 0.52;
 pub const GRAVITY: f32 = -25.0;
 pub const WATER_GRAVITY: f32 = -5.0;
 pub const JUMP_SPEED: f32 = 8.0;
 pub const WIDTH: f32 = 0.6;
 pub const STANDING_HEIGHT: f32 = 1.8;
 pub const SNEAK_HEIGHT: f32 = 1.5;
+pub const SWIMMING_HEIGHT: f32 = 0.6;
 pub const HALF_WIDTH: f32 = WIDTH / 2.0;
 pub const MAX_HEALTH: f32 = 20.0;
 pub const TERMINAL_VELOCITY: f32 = -78.4;
 pub const WALK_SPEED: f32 = 4.317;
 pub const SNEAK_SPEED: f32 = 1.295;
 pub const SPRINT_MULT: f32 = 1.3;
-pub const SWIM_SPEED: f32 = 2.5;
+pub const SWIM_SPEED: f32 = 3.0;
+pub const SURFACE_SWIM_SPEED: f32 = 2.2;
 pub const WATER_DRAG: f32 = 0.8;
 pub const CLIMB_SPEED: f32 = 2.35;
 pub const MAX_OXYGEN: f32 = 15.0;
@@ -87,7 +90,9 @@ impl Player {
     }
 
     pub fn current_height(&self) -> f32 {
-        if self.sneaking {
+        if self.swimming {
+            SWIMMING_HEIGHT
+        } else if self.sneaking {
             SNEAK_HEIGHT
         } else {
             STANDING_HEIGHT
@@ -95,7 +100,9 @@ impl Player {
     }
 
     pub fn current_eye_height(&self) -> f32 {
-        if self.sneaking {
+        if self.swimming {
+            SWIMMING_EYE_HEIGHT
+        } else if self.sneaking {
             SNEAK_EYE_HEIGHT
         } else {
             STANDING_EYE_HEIGHT
@@ -304,13 +311,13 @@ impl Player {
         self.effects.gravity_multiplier()
     }
 
-    pub fn is_swimming(&self, cm: &ChunkManager) -> bool {
+    pub fn is_in_water(&self, cm: &ChunkManager) -> bool {
         let min_y = self.y.floor() as i32;
         let max_y = (self.y + self.current_height()).ceil() as i32;
         let min_x = (self.x - HALF_WIDTH).floor() as i32;
-        let max_x = (self.x + HALF_WIDTH).floor() as i32;
+        let max_x = (self.x + HALF_WIDTH).ceil() as i32;
         let min_z = (self.z - HALF_WIDTH).floor() as i32;
-        let max_z = (self.z + HALF_WIDTH).floor() as i32;
+        let max_z = (self.z + HALF_WIDTH).ceil() as i32;
         for by in min_y..=max_y {
             for bx in min_x..=max_x {
                 for bz in min_z..=max_z {
@@ -323,12 +330,28 @@ impl Player {
         false
     }
 
+    pub fn is_fully_in_water(&self, cm: &ChunkManager) -> bool {
+        let eye_y = (self.y + self.current_eye_height()).floor() as i32;
+        let min_x = (self.x - HALF_WIDTH).floor() as i32;
+        let max_x = (self.x + HALF_WIDTH).ceil() as i32;
+        let min_z = (self.z - HALF_WIDTH).floor() as i32;
+        let max_z = (self.z + HALF_WIDTH).ceil() as i32;
+        for bx in min_x..=max_x {
+            for bz in min_z..=max_z {
+                if cm.get_block(bx, eye_y, bz).id == BlockId::Water {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn is_head_submerged(&self, cm: &ChunkManager) -> bool {
         let eye_y = (self.y + self.current_eye_height()).floor() as i32;
         let min_x = (self.x - HALF_WIDTH).floor() as i32;
-        let max_x = (self.x + HALF_WIDTH).floor() as i32;
+        let max_x = (self.x + HALF_WIDTH).ceil() as i32;
         let min_z = (self.z - HALF_WIDTH).floor() as i32;
-        let max_z = (self.z + HALF_WIDTH).floor() as i32;
+        let max_z = (self.z + HALF_WIDTH).ceil() as i32;
         (min_x..=max_x).any(|x| (min_z..=max_z).any(|z| cm.get_block(x, eye_y, z).id == BlockId::Water))
     }
 
@@ -536,7 +559,7 @@ impl Player {
             self.y = ny;
         } else if dy < 0.0 {
             self.on_ground = true;
-            if !self.is_swimming(cm) && self.last_vy <= -10.0 {
+            if !self.is_in_water(cm) && self.last_vy <= -10.0 {
                 let fall_dist = (self.last_vy * self.last_vy) / (2.0 * -GRAVITY);
                 let dmg = (fall_dist - 3.0).max(0.0).ceil();
                 if dmg > 0.0 {

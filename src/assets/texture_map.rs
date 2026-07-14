@@ -313,6 +313,19 @@ fn face_textures_for_block(reader: &AssetReader, id: BlockId) -> Option<[String;
     }
 }
 
+/// Resolves the top-facing texture used for a block's inventory icon. This
+/// intentionally reuses the same blockstate/model face resolution as terrain
+/// loading, rather than deriving a PNG path from a display name.
+pub fn inventory_texture_for_block(reader: &AssetReader, id: BlockId) -> Option<String> {
+    if let Some(faces) = face_textures_for_block(reader, id) {
+        return Some(faces[0].clone());
+    }
+    let (_, name) = collect_all_block_ids().into_iter().find(|(block, _)| *block == id)?;
+    reader
+        .exists(&format!("textures/block/{name}.png"))
+        .then(|| name.to_string())
+}
+
 fn collect_all_block_ids() -> Vec<(BlockId, &'static str)> {
     use BlockId::*;
     let mut all = Vec::new();

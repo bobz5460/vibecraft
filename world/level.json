@@ -4,8 +4,8 @@
   "kind": "level",
   "data": {
     "seed": 1783972558954253730,
-    "tick": 10452,
-    "game_time": 19450,
+    "tick": 11347,
+    "game_time": 20345,
     "spawn": [
       0,
       75,
@@ -19,20 +19,20 @@
     "experience": 0,
     "scheduled_ticks": [
       {
-        "due_tick": 10453,
+        "due_tick": 11348,
         "chunk": [
-          -4,
-          -1
-        ],
-        "kind": "Water"
-      },
-      {
-        "due_tick": 10460,
-        "chunk": [
-          -4,
-          -1
+          -6,
+          0
         ],
         "kind": "Lava"
+      },
+      {
+        "due_tick": 11348,
+        "chunk": [
+          -6,
+          0
+        ],
+        "kind": "Water"
       }
     ],
     "dropped_items": [
@@ -40,14 +40,14 @@
         "x": -58.321285,
         "y": 63.0,
         "z": 1.0297599,
-        "vx": 3.4694435e-37,
-        "vy": 0.0,
-        "vz": 1.0284433e-36,
+        "vx": 3e-45,
+        "vy": 0.5,
+        "vz": 3e-45,
         "block_id": 8,
         "item_id": 8,
         "count": 1,
         "damage": 0,
-        "lifetime": 284.50378
+        "lifetime": 239.75975
       }
     ],
     "xp_orbs": [],

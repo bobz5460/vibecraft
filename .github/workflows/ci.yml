@@ -14,9 +14,10 @@ jobs:
         - os: macos-latest
           artifact: vibecraft-macos-arm
           binary: target/release/vibecraft
-        - os: macos-13
+        - os: macos-latest
           artifact: vibecraft-macos-intel
-          binary: target/release/vibecraft
+          binary: target/x86_64-apple-darwin/release/vibecraft
+          target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
@@ -61,7 +62,14 @@ jobs:
         print(f"Extracted {extracted} Minecraft {version} asset files")
         PY
     - uses: dtolnay/rust-toolchain@stable
-    - run: cargo build --release --features bundled
+      with:
+        targets: ${{ matrix.target }}
+    - name: Build (native)
+      if: ${{ !matrix.target }}
+      run: cargo build --release --features bundled
+    - name: Build (cross-compile)
+      if: ${{ matrix.target }}
+      run: cargo build --release --features bundled --target ${{ matrix.target }}
     - name: Upload bundled executable
       uses: actions/upload-artifact@v4
       with:

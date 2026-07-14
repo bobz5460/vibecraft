@@ -1,6 +1,11 @@
 use crate::assets::reader::AssetReader;
 use wgpu::*;
 
+const ASCII_FIRST: u32 = 32;
+const ASCII_LAST: u32 = 126;
+const ASCII_GLYPH_COUNT: usize = (ASCII_LAST - ASCII_FIRST + 1) as usize;
+const GLYPH_SIZE: f32 = 8.0;
+
 pub struct FontTexture {
     #[allow(dead_code)]
     pub texture: Texture,
@@ -10,6 +15,8 @@ pub struct FontTexture {
     pub font_width: f32,
     /// Total texture height (read from image at load time)
     pub font_height: f32,
+    glyph_advances: [f32; ASCII_GLYPH_COUNT],
+    white_ref_uv: [f32; 2],
 }
 
 #[repr(C)]
@@ -50,6 +57,8 @@ impl FontTexture {
             Self::fallback_font()
         };
 
+        let glyph_advances = Self::glyph_advances(&img);
+        let white_ref_uv = Self::opaque_ref_uv(&img);
         let (font_width, font_height) = (img.width(), img.height());
         let pixels = img.into_raw();
 
@@ -104,6 +113,8 @@ impl FontTexture {
             sampler,
             font_width: font_width as f32,
             font_height: font_height as f32,
+            glyph_advances,
+            white_ref_uv,
         }
     }
 
@@ -148,20 +159,11 @@ impl FontTexture {
         (verts, indices)
     }
 
-    /// Build a solid-colored rectangle using a white reference pixel in the font texture
-    /// Uses the bottom-right corner pixel as white reference.
-    /// UV coordinate of the bottom-right texel, expected to be pure white in both
-    /// the fallback font and ascii.png. Used as a white reference for tinted quads.
     fn white_ref_uv(&self) -> [f32; 2] {
-        let u = (self.font_width - 0.5) / self.font_width;
-        let v = (self.font_height - 0.5) / self.font_height;
-        [u, v]
+        self.white_ref_uv
     }
 
-    /// Build a solid-colored rectangle. Uses the bottom-right pixel of the font
-    /// texture as a white reference (both the fallback font and ascii.png have
-    /// one). For true solid fills, the reference coordinates are baked at
-    /// (width-0.5, height-0.5) in texel space.
+    /// Build a solid-colored rectangle using an opaque pixel from the loaded font.
     pub fn build_colored_rect(
         &self,
         x: f32,
@@ -260,17 +262,23 @@ impl FontTexture {
         (verts, indices)
     }
 
-    /// Build text vertex data for a string at screen position (x, y)
-    /// Character size (char_w × char_h) in screen pixels.
-    /// Uses Minecraft font layout: ascii.png is 128×128 with 16×16 glyph grid,
-    /// each glyph cell = 8×8. ASCII 32-127 occupies rows 2-7.
+    /// Measure text in screen pixels for a square 8px Minecraft glyph cell scaled to `size`.
+    pub fn measure_text(&self, text: &str, size: f32) -> f32 {
+        text.chars()
+            .filter_map(|ch| self.glyph_advance(ch))
+            .map(|advance| advance * size / GLYPH_SIZE)
+            .sum()
+    }
+
+    /// Build text vertex data for a string at screen position (x, y).
+    /// The Mojangles bitmap glyph cells remain square; their advances are read from
+    /// the official ASCII texture so narrow glyphs do not stretch or mis-center text.
     pub fn build_text(
         &self,
         text: &str,
         x: f32,
         y: f32,
-        char_w: f32,
-        char_h: f32,
+        size: f32,
     ) -> (Vec<TextVertex>, Vec<u32>) {
         let fw = self.font_width;
         let fh = self.font_height;
@@ -281,18 +289,12 @@ impl FontTexture {
         let mut cursor_x = x;
         for ch in text.chars() {
             let code = ch as u32;
-            if code < 32 || code > 127 {
+            if !(ASCII_FIRST..=ASCII_LAST).contains(&code) {
                 continue;
             }
-            let char_idx = code - 32;
-            let tc = (char_idx % 16) as f32;
-            // Minecraft font: ASCII chars start at glyph row 2 (0-indexed)
-            let tr = (2 + char_idx / 16) as f32;
-
-            let u0 = (tc * 8.0) / fw;
-            let v0 = (tr * 8.0) / fh;
-            let u1 = ((tc + 1.0) * 8.0) / fw;
-            let v1 = ((tr + 1.0) * 8.0) / fh;
+            let Some([u0, v0, u1, v1]) = Self::glyph_uv(code, fw, fh) else {
+                continue;
+            };
 
             let base = verts.len() as u32;
             let white = [1.0, 1.0, 1.0, 1.0];
@@ -302,25 +304,124 @@ impl FontTexture {
                 color: white,
             });
             verts.push(TextVertex {
-                pos: [cursor_x + char_w, y],
+                pos: [cursor_x + size, y],
                 uv: [u1, v0],
                 color: white,
             });
             verts.push(TextVertex {
-                pos: [cursor_x + char_w, y + char_h],
+                pos: [cursor_x + size, y + size],
                 uv: [u1, v1],
                 color: white,
             });
             verts.push(TextVertex {
-                pos: [cursor_x, y + char_h],
+                pos: [cursor_x, y + size],
                 uv: [u0, v1],
                 color: white,
             });
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 
-            cursor_x += char_w;
+            cursor_x += self.glyph_advance(ch).unwrap_or_default() * size / GLYPH_SIZE;
         }
 
         (verts, indices)
+    }
+
+    pub fn build_text_centered(
+        &self,
+        text: &str,
+        center_x: f32,
+        y: f32,
+        size: f32,
+    ) -> (Vec<TextVertex>, Vec<u32>) {
+        self.build_text(text, center_x - self.measure_text(text, size) * 0.5, y, size)
+    }
+
+    fn glyph_advance(&self, ch: char) -> Option<f32> {
+        let code = ch as u32;
+        (ASCII_FIRST..=ASCII_LAST)
+            .contains(&code)
+            .then(|| self.glyph_advances[(code - ASCII_FIRST) as usize])
+    }
+
+    fn glyph_advances(img: &image::RgbaImage) -> [f32; ASCII_GLYPH_COUNT] {
+        let mut advances = [GLYPH_SIZE; ASCII_GLYPH_COUNT];
+        advances[0] = 4.0; // The default font's space provider is four pixels wide.
+        if img.width() < 128 || img.height() < 128 {
+            return advances;
+        }
+        for (index, advance) in advances.iter_mut().enumerate().skip(1) {
+            let column = (index % 16) as u32;
+            let row = 2 + (index / 16) as u32;
+            let mut rightmost = None;
+            for y in 0..8 {
+                for x in 0..8 {
+                    if img.get_pixel(column * 8 + x, row * 8 + y)[3] != 0 {
+                        rightmost = Some(rightmost.map_or(x, |current: u32| current.max(x)));
+                    }
+                }
+            }
+            if let Some(x) = rightmost {
+                *advance = x as f32 + 2.0;
+            }
+        }
+        advances
+    }
+
+    fn glyph_uv(code: u32, font_width: f32, font_height: f32) -> Option<[f32; 4]> {
+        if !(ASCII_FIRST..=ASCII_LAST).contains(&code) || font_width <= 0.0 || font_height <= 0.0 {
+            return None;
+        }
+        let index = code - ASCII_FIRST;
+        let column = (index % 16) as f32;
+        // The bitmap provider places U+0020..U+007E in atlas rows 2 through 7.
+        let row = (2 + index / 16) as f32;
+        Some([
+            column * GLYPH_SIZE / font_width,
+            row * GLYPH_SIZE / font_height,
+            (column + 1.0) * GLYPH_SIZE / font_width,
+            (row + 1.0) * GLYPH_SIZE / font_height,
+        ])
+    }
+
+    fn opaque_ref_uv(img: &image::RgbaImage) -> [f32; 2] {
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let pixel = img.get_pixel(x, y);
+                if pixel[3] != 0 && pixel[0] != 0 && pixel[1] != 0 && pixel[2] != 0 {
+                    return [(x as f32 + 0.5) / img.width() as f32, (y as f32 + 0.5) / img.height() as f32];
+                }
+            }
+        }
+        [0.5 / img.width().max(1) as f32, 0.5 / img.height().max(1) as f32]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitmap_metrics_keep_narrow_glyphs_narrow() {
+        let mut image = image::RgbaImage::new(128, 128);
+        // A reaches x=4, while i reaches x=0 in their respective font cells.
+        image.put_pixel(8 + 4, 4 * 8, image::Rgba([255, 255, 255, 255]));
+        image.put_pixel(9 * 8, 6 * 8 + 2, image::Rgba([255, 255, 255, 255]));
+        let advances = FontTexture::glyph_advances(&image);
+        assert_eq!(advances[('A' as u32 - ASCII_FIRST) as usize], 6.0);
+        assert_eq!(advances[('i' as u32 - ASCII_FIRST) as usize], 2.0);
+        assert_eq!(advances[0], 4.0);
+    }
+
+    #[test]
+    fn opaque_reference_avoids_transparent_font_padding() {
+        let mut image = image::RgbaImage::new(128, 128);
+        image.put_pixel(8, 16, image::Rgba([255, 255, 255, 255]));
+        let uv = FontTexture::opaque_ref_uv(&image);
+        assert_eq!(uv, [8.5 / 128.0, 16.5 / 128.0]);
+    }
+
+    #[test]
+    fn ascii_uvs_match_the_official_bitmap_provider_layout() {
+        assert_eq!(FontTexture::glyph_uv('A' as u32, 128.0, 128.0), Some([8.0 / 128.0, 32.0 / 128.0, 16.0 / 128.0, 40.0 / 128.0]));
     }
 }

@@ -10,6 +10,7 @@ pub enum UiScreen {
     Accessibility,
     Connect,
     Title,
+    Loading,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +18,8 @@ pub enum UiAction {
     None,
     Resume,
     Quit,
+    QuitToTitle,
+    StartGame,
     ToggleGraphics,
     DecreaseRenderDistance,
     IncreaseRenderDistance,
@@ -55,12 +58,28 @@ pub enum UiCommand {
         text: String,
         color: [f32; 4],
     },
+    CenteredText {
+        center_x: f32,
+        y: f32,
+        size: f32,
+        text: String,
+        color: [f32; 4],
+    },
     Sprite {
         name: String,
         x: f32,
         y: f32,
         w: f32,
         h: f32,
+        color: [f32; 4],
+    },
+    SpriteProgress {
+        name: String,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        progress: f32,
         color: [f32; 4],
     },
     Item {
@@ -92,6 +111,8 @@ pub struct UiFrame {
 pub struct UiState {
     pub screen: UiScreen,
     pub selected: usize,
+    keyboard_focus: Option<usize>,
+    pub prev_screen: Option<UiScreen>,
     pub gui_scale: f32,
     pub high_contrast: bool,
     pub reduced_motion: bool,
@@ -101,6 +122,9 @@ pub struct UiState {
     pub render_distance: i32,
     pub graphics_vibrant: bool,
     pub server_address: String,
+    pub connect_username: String,
+    pub connect_field: usize,
+    pub loading_progress: f32,
 }
 
 impl Default for UiState {
@@ -108,6 +132,8 @@ impl Default for UiState {
         Self {
             screen: UiScreen::Playing,
             selected: 0,
+            keyboard_focus: None,
+            prev_screen: None,
             gui_scale: 1.0,
             high_contrast: false,
             reduced_motion: false,
@@ -117,6 +143,9 @@ impl Default for UiState {
             render_distance: 6,
             graphics_vibrant: false,
             server_address: "127.0.0.1:25565".to_string(),
+            connect_username: "Player".to_string(),
+            connect_field: 0,
+            loading_progress: 0.0,
         }
     }
 }
@@ -135,18 +164,33 @@ impl UiState {
     pub fn open_inventory(&mut self) {
         self.screen = UiScreen::Inventory;
         self.selected = 0;
+        self.keyboard_focus = None;
     }
 
     pub fn close_to_gameplay(&mut self) {
         self.screen = UiScreen::Playing;
         self.selected = 0;
+        self.keyboard_focus = None;
     }
 
     pub fn open_pause(&mut self) {
         if self.screen == UiScreen::Playing {
             self.screen = UiScreen::Pause;
             self.selected = 0;
+            self.keyboard_focus = None;
         }
+    }
+
+    pub fn open_title(&mut self) {
+        self.screen = UiScreen::Title;
+        self.selected = 0;
+        self.keyboard_focus = None;
+    }
+
+    fn start_loading(&mut self) {
+        self.screen = UiScreen::Loading;
+        self.selected = 0;
+        self.keyboard_focus = None;
     }
 
     pub fn is_menu_open(&self) -> bool {
@@ -164,12 +208,16 @@ impl UiState {
             UiScreen::Options | UiScreen::Controls | UiScreen::Accessibility => {
                 self.screen = UiScreen::Pause;
                 self.selected = 0;
+                self.keyboard_focus = None;
             }
             UiScreen::Connect => {
-                self.screen = UiScreen::Pause;
+                self.screen = self.prev_screen.unwrap_or(UiScreen::Pause);
+                self.prev_screen = None;
                 self.selected = 0;
+                self.keyboard_focus = None;
             }
             UiScreen::Title => return UiAction::Quit,
+            UiScreen::Loading => {}
         }
         UiAction::None
     }
@@ -177,6 +225,7 @@ impl UiState {
     pub fn move_focus(&mut self, direction: i32) {
         let count = self.button_count().max(1);
         self.selected = (self.selected as i32 + direction).rem_euclid(count as i32) as usize;
+        self.keyboard_focus = Some(self.selected);
     }
 
     pub fn activate_focused(&mut self) -> UiAction {
@@ -190,6 +239,7 @@ impl UiState {
             .find(|(_, rect)| contains(**rect, x, y))
             .map(|(index, _)| {
                 self.selected = index;
+                self.keyboard_focus = None;
                 self.activate(index)
             })
             .unwrap_or(UiAction::None)
@@ -202,7 +252,7 @@ impl UiState {
             UiScreen::Controls => 2,
             UiScreen::Accessibility => 5,
             UiScreen::Connect => 2,
-            UiScreen::Title => 3,
+            UiScreen::Title => 4,
             _ => 0,
         }
     }
@@ -217,14 +267,16 @@ impl UiState {
                 1 => {
                     self.screen = UiScreen::Options;
                     self.selected = 0;
+                    self.keyboard_focus = None;
                     UiAction::None
                 }
                 2 => {
                     self.screen = UiScreen::Controls;
                     self.selected = 0;
+                    self.keyboard_focus = None;
                     UiAction::None
                 }
-                3 => UiAction::Quit,
+                3 => UiAction::QuitToTitle,
                 _ => UiAction::None,
             },
             UiScreen::Options => match index {
@@ -251,11 +303,13 @@ impl UiState {
                 5 => {
                     self.screen = UiScreen::Accessibility;
                     self.selected = 0;
+                    self.keyboard_focus = None;
                     UiAction::None
                 }
                 6 => {
                     self.screen = UiScreen::Pause;
                     self.selected = 0;
+                    self.keyboard_focus = None;
                     UiAction::None
                 }
                 _ => UiAction::None,
@@ -280,6 +334,7 @@ impl UiState {
                 4 => {
                     self.screen = UiScreen::Options;
                     self.selected = 0;
+                    self.keyboard_focus = None;
                     UiAction::None
                 }
                 _ => UiAction::None,
@@ -289,28 +344,39 @@ impl UiState {
                 1 => {
                     self.screen = UiScreen::Pause;
                     self.selected = 0;
+                    self.keyboard_focus = None;
                     UiAction::None
                 }
                 _ => UiAction::None,
             },
             UiScreen::Title => match index {
                 0 => {
-                    self.close_to_gameplay();
-                    UiAction::Resume
+                    self.start_loading();
+                    UiAction::StartGame
                 }
                 1 => {
-                    self.screen = UiScreen::Options;
+                    self.prev_screen = Some(self.screen);
+                    self.screen = UiScreen::Connect;
                     self.selected = 0;
+                    self.keyboard_focus = None;
                     UiAction::None
                 }
-                2 => UiAction::Quit,
+                2 => {
+                    self.screen = UiScreen::Options;
+                    self.selected = 0;
+                    self.keyboard_focus = None;
+                    UiAction::None
+                }
+                3 => UiAction::Quit,
                 _ => UiAction::None,
             },
             UiScreen::Connect => match index {
                 0 => UiAction::ConnectServer,
                 1 => {
-                    self.screen = UiScreen::Pause;
+                    self.screen = self.prev_screen.unwrap_or(UiScreen::Pause);
+                    self.prev_screen = None;
                     self.selected = 0;
+                    self.keyboard_focus = None;
                     UiAction::None
                 }
                 _ => UiAction::None,
@@ -329,6 +395,12 @@ impl UiState {
                 self.move_focus(1);
                 UiAction::None
             }
+            KeyCode::Tab => {
+                if self.screen == UiScreen::Connect {
+                    self.switch_connect_field();
+                }
+                UiAction::None
+            }
             KeyCode::Enter | KeyCode::NumpadEnter => self.activate_focused(),
             KeyCode::Escape => self.handle_escape(),
             _ => UiAction::None,
@@ -344,6 +416,24 @@ impl UiState {
     pub fn backspace_server_address(&mut self) {
         if self.screen == UiScreen::Connect {
             self.server_address.pop();
+        }
+    }
+
+    pub fn append_connect_username(&mut self, value: &str) {
+        if self.screen == UiScreen::Connect && self.connect_username.len() + value.len() <= 16 {
+            self.connect_username.push_str(value);
+        }
+    }
+
+    pub fn backspace_connect_username(&mut self) {
+        if self.screen == UiScreen::Connect {
+            self.connect_username.pop();
+        }
+    }
+
+    pub fn switch_connect_field(&mut self) {
+        if self.screen == UiScreen::Connect {
+            self.connect_field = (self.connect_field + 1) % 2;
         }
     }
 
@@ -400,7 +490,8 @@ impl UiState {
             UiScreen::Controls => draw_controls(&mut frame, width, height, self, cursor),
             UiScreen::Accessibility => draw_accessibility(&mut frame, width, height, self, cursor),
             UiScreen::Connect => draw_connect(&mut frame, width, height, self, cursor, feedback),
-            UiScreen::Title => draw_menu(&mut frame, width, height, self, cursor, "Vibecraft", &["Continue", "Options...", "Quit"]),
+            UiScreen::Title => draw_title_screen(&mut frame, width, height, self, cursor),
+            UiScreen::Loading => draw_loading(&mut frame, width, height, self.gui_scale, self.loading_progress),
         }
         frame
     }
@@ -476,6 +567,10 @@ fn text(frame: &mut UiFrame, x: f32, y: f32, size: f32, value: impl Into<String>
     frame.commands.push(UiCommand::Text { x, y, size, text: value.into(), color });
 }
 
+fn centered_text(frame: &mut UiFrame, center_x: f32, y: f32, size: f32, value: impl Into<String>, color: [f32; 4]) {
+    frame.commands.push(UiCommand::CenteredText { center_x, y, size, text: value.into(), color });
+}
+
 fn panel(frame: &mut UiFrame, width: f32, height: f32, high_contrast: bool) {
     rect(frame, 0.0, 0.0, width, height, [0.0, 0.0, 0.0, if high_contrast { 0.72 } else { 0.52 }]);
 }
@@ -487,38 +582,45 @@ fn nine_slice(frame: &mut UiFrame, sprite: &str, x: f32, y: f32, w: f32, h: f32,
     });
 }
 
-fn minecraft_button(frame: &mut UiFrame, x: f32, y: f32, w: f32, h: f32, label: &str, selected: bool, hover: bool) {
-    let sprite = if selected || hover { "widget/button_highlighted" } else { "widget/button" };
-    if selected {
-        rect(frame, x - 1.0, y - 1.0, w + 2.0, h + 2.0, [1.0, 1.0, 1.0, 0.35]);
-    }
+fn minecraft_button(frame: &mut UiFrame, x: f32, y: f32, w: f32, h: f32, label: &str, focused: bool, hover: bool) {
+    let sprite = if focused || hover { "widget/button_highlighted" } else { "widget/button" };
     nine_slice(frame, sprite, x, y, w, h, 3.0, [1.0, 1.0, 1.0, 1.0]);
-    let text_color = if selected { [1.0, 1.0, 0.55, 1.0] } else { [1.0, 1.0, 1.0, 1.0] };
-    let text_size = (h * 0.65).max(10.0);
-    let text_w = label.chars().count() as f32 * text_size * 0.55;
-    let text_x = x + (w - text_w) * 0.5;
-    let text_y = y + (h - text_size) * 0.5 - 1.0;
-    text(frame, text_x, text_y, text_size, label, text_color);
+    let text_size = h * 0.4;
+    let text_y = y + (h - text_size) * 0.5;
+    centered_text(frame, x + w * 0.5, text_y, text_size, label, [1.0, 1.0, 1.0, 1.0]);
 }
 
-fn draw_hud(frame: &mut UiFrame, width: f32, height: f32, scale: f32, hotbar: &[UiSlot], health: f32, hunger: f32, armor: f32, experience: f32, selected_item_name: &str, show_crosshair: bool) {
+fn draw_loading(frame: &mut UiFrame, width: f32, height: f32, scale: f32, progress: f32) {
+    rect(frame, 0.0, 0.0, width, height, [0.0, 0.0, 0.0, 1.0]);
+    centered_text(frame, width * 0.5, height * 0.5 - 8.0 * scale, 8.0 * scale, "Loading terrain...", [1.0, 1.0, 1.0, 1.0]);
+    let bar_w = 182.0 * scale;
+    let bar_h = 5.0 * scale;
+    let bar_x = (width - bar_w) * 0.5;
+    let bar_y = height * 0.5 + 8.0 * scale;
+    frame.commands.push(UiCommand::Sprite {
+        name: "hud/experience_bar_background".to_string(),
+        x: bar_x,
+        y: bar_y,
+        w: bar_w,
+        h: bar_h,
+        color: [1.0, 1.0, 1.0, 1.0],
+    });
+    frame.commands.push(UiCommand::SpriteProgress {
+        name: "hud/experience_bar_progress".to_string(),
+        x: bar_x,
+        y: bar_y,
+        w: bar_w,
+        h: bar_h,
+        progress,
+        color: [1.0, 1.0, 1.0, 1.0],
+    });
+}
+
+fn draw_hud(frame: &mut UiFrame, width: f32, height: f32, scale: f32, hotbar: &[UiSlot], health: f32, hunger: f32, armor: f32, experience: f32, _selected_item_name: &str, show_crosshair: bool) {
     let bar_w = 182.0 * scale;
     let bar_h = 22.0 * scale;
     let left = (width - bar_w) * 0.5;
     let top = height - bar_h - 8.0 * scale;
-
-    // Selected item name above hotbar (tooltip-style, small)
-    if !selected_item_name.is_empty() {
-        let name_size = 8.0 * scale;
-        let text_w = selected_item_name.chars().count() as f32 * name_size * 0.6;
-        let pad = 4.0 * scale;
-        let bg_w = text_w + pad * 2.0;
-        let bg_h = name_size + pad * 1.5;
-        let bg_x = (width - bg_w) * 0.5;
-        let bg_y = top - bg_h - 2.0 * scale;
-        nine_slice(frame, "popup/background", bg_x, bg_y, bg_w, bg_h, 6.0, [1.0, 1.0, 1.0, 1.0]);
-        text(frame, bg_x + pad, bg_y + pad * 0.75, name_size, selected_item_name, [1.0, 1.0, 1.0, 1.0]);
-    }
 
     // Experience bar
     let exp_bar_w = 182.0 * scale;
@@ -730,47 +832,59 @@ fn draw_toast(frame: &mut UiFrame, width: f32, message: &str) {
 
 fn draw_menu(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>, title: &str, labels: &[&str]) {
     panel(frame, width, height, state.high_contrast);
-    let title_size = 24.0 * state.gui_scale;
-    let title_w = title.chars().count() as f32 * title_size * 0.55;
-    text(frame, (width - title_w) * 0.5, 24.0 * state.gui_scale, title_size, title, [1.0, 0.86, 0.35, 1.0]);
     let rects = state.button_rects(width, height);
+    let first_button_y = rects.first().map(|r| r.1).unwrap_or(0.0);
+    let title_size = 8.0 * state.gui_scale;
+    centered_text(frame, width * 0.5, first_button_y - 20.0 * state.gui_scale, title_size, title, [1.0, 1.0, 1.0, 1.0]);
     for (index, label) in labels.iter().enumerate() {
         if let Some(&(x, y, w, h)) = rects.get(index) {
             let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
-            minecraft_button(frame, x, y, w, h, label, index == state.selected, hovered);
+            minecraft_button(frame, x, y, w, h, label, state.keyboard_focus == Some(index), hovered);
         }
     }
 }
 
 fn draw_connect(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>, feedback: Option<&str>) {
     panel(frame, width, height, state.high_contrast);
-    text(frame, (width - 180.0) * 0.5, height * 0.18, 28.0, "Join Server", [1.0, 0.86, 0.35, 1.0]);
+    let title = "Join Server";
+    let title_size = 8.0 * state.gui_scale;
+    centered_text(frame, width * 0.5, height * 0.14, title_size, title, [1.0, 1.0, 1.0, 1.0]);
     let input_w = (width * 0.34).clamp(240.0, 420.0);
     let input_h = 20.0;
     let input_x = (width - input_w) * 0.5;
-    let input_y = height * 0.30;
-    text(frame, input_x, input_y - 22.0, 12.0, "Server Address", [0.82, 0.82, 0.88, 1.0]);
-    nine_slice(frame, "widget/text_field", input_x, input_y, input_w, input_h, 3.0, [1.0, 1.0, 1.0, 1.0]);
-    text(frame, input_x + 6.0, input_y + 4.0, 12.0, &state.server_address, [1.0, 1.0, 1.0, 1.0]);
+
+    let address_y = height * 0.26;
+    text(frame, input_x, address_y - 22.0, 12.0, "Server Address", [0.82, 0.82, 0.88, 1.0]);
+    nine_slice(frame, "widget/text_field", input_x, address_y, input_w, input_h, 3.0, [1.0, 1.0, 1.0, 1.0]);
+    let addr_color = if state.connect_field == 0 { [1.0, 1.0, 1.0, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
+    text(frame, input_x + 6.0, address_y + 4.0, 12.0, &state.server_address, addr_color);
+
+    let username_y = address_y + input_h + 18.0;
+    text(frame, input_x, username_y - 22.0, 12.0, "Username", [0.82, 0.82, 0.88, 1.0]);
+    nine_slice(frame, "widget/text_field", input_x, username_y, input_w, input_h, 3.0, [1.0, 1.0, 1.0, 1.0]);
+    let name_color = if state.connect_field == 1 { [1.0, 1.0, 1.0, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
+    text(frame, input_x + 6.0, username_y + 4.0, 12.0, &state.connect_username, name_color);
+
     if let Some(feedback) = feedback.filter(|text| !text.is_empty()) {
-        text(frame, input_x, input_y + input_h + 6.0, 11.0, feedback, [1.0, 0.55, 0.45, 1.0]);
+        text(frame, input_x, username_y + input_h + 6.0, 11.0, feedback, [1.0, 0.55, 0.45, 1.0]);
     }
     let labels = ["Connect", "Back"];
     let rects = state.button_rects(width, height);
     for (index, label) in labels.iter().enumerate() {
         if let Some(&(x, y, w, h)) = rects.get(index) {
             let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
-            minecraft_button(frame, x, y, w, h, label, index == state.selected, hovered);
+            minecraft_button(frame, x, y, w, h, label, state.keyboard_focus == Some(index), hovered);
         }
     }
 }
 
 fn draw_options(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>) {
     panel(frame, width, height, state.high_contrast);
-    let title_size = 24.0 * state.gui_scale;
+    let rects = state.button_rects(width, height);
+    let first_y = rects.first().map(|r| r.1).unwrap_or(0.0);
+    let title_size = 8.0 * state.gui_scale;
     let t = "Options";
-    let title_w = t.chars().count() as f32 * title_size * 0.55;
-    text(frame, (width - title_w) * 0.5, 24.0 * state.gui_scale, title_size, t, [1.0, 0.86, 0.35, 1.0]);
+    centered_text(frame, width * 0.5, first_y - 20.0 * state.gui_scale, title_size, t, [1.0, 1.0, 1.0, 1.0]);
     let labels = [
         format!("Graphics: {}", if state.graphics_vibrant { "Fabulous!" } else { "Fancy" }),
         format!("Render Distance: {}", state.render_distance),
@@ -780,20 +894,20 @@ fn draw_options(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, c
         "Accessibility Settings...".to_string(),
         "Done".to_string(),
     ];
-    let rects = state.button_rects(width, height);
     for (index, label) in labels.iter().enumerate() {
         let (x, y, w, h) = rects[index];
         let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
-        minecraft_button(frame, x, y, w, h, label, index == state.selected, hovered);
+        minecraft_button(frame, x, y, w, h, label, state.keyboard_focus == Some(index), hovered);
     }
 }
 
 fn draw_controls(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>) {
     panel(frame, width, height, state.high_contrast);
-    let title_size = 24.0 * state.gui_scale;
+    let rects = state.button_rects(width, height);
+    let first_y = rects.first().map(|r| r.1).unwrap_or(0.0);
+    let title_size = 8.0 * state.gui_scale;
     let t = "Controls";
-    let title_w = t.chars().count() as f32 * title_size * 0.55;
-    text(frame, (width - title_w) * 0.5, 24.0 * state.gui_scale, title_size, t, [1.0, 0.86, 0.35, 1.0]);
+    centered_text(frame, width * 0.5, first_y - 20.0 * state.gui_scale, title_size, t, [1.0, 1.0, 1.0, 1.0]);
     let lines = [
         ("WASD", "Move"),
         ("Space", "Jump"),
@@ -814,21 +928,21 @@ fn draw_controls(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, 
         text(frame, col1_x, y, text_size, *key, [0.55, 0.43, 0.18, 1.0]);
         text(frame, col2_x, y, text_size, *action, [1.0, 1.0, 1.0, 1.0]);
     }
-    let rects = state.button_rects(width, height);
     for (index, label) in ["Reset", "Done"].iter().enumerate() {
         if let Some(&(x, y, w, h)) = rects.get(index) {
             let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
-            minecraft_button(frame, x, y, w, h, label, index == state.selected, hovered);
+            minecraft_button(frame, x, y, w, h, label, state.keyboard_focus == Some(index), hovered);
         }
     }
 }
 
 fn draw_accessibility(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>) {
     panel(frame, width, height, state.high_contrast);
-    let title_size = 24.0 * state.gui_scale;
+    let rects = state.button_rects(width, height);
+    let first_y = rects.first().map(|r| r.1).unwrap_or(0.0);
+    let title_size = 8.0 * state.gui_scale;
     let t = "Accessibility";
-    let title_w = t.chars().count() as f32 * title_size * 0.55;
-    text(frame, (width - title_w) * 0.5, 24.0 * state.gui_scale, title_size, t, [1.0, 0.86, 0.35, 1.0]);
+    centered_text(frame, width * 0.5, first_y - 20.0 * state.gui_scale, title_size, t, [1.0, 1.0, 1.0, 1.0]);
     let labels = [
         format!("High Contrast: {}", if state.high_contrast { "ON" } else { "OFF" }),
         format!("Reduced Motion: {}", if state.reduced_motion { "ON" } else { "OFF" }),
@@ -836,12 +950,47 @@ fn draw_accessibility(frame: &mut UiFrame, width: f32, height: f32, state: &UiSt
         format!("GUI Scale: {}", state.gui_scale as i32),
         "Done".to_string(),
     ];
-    let rects = state.button_rects(width, height);
     for (index, label) in labels.iter().enumerate() {
         let (x, y, w, h) = rects[index];
         let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
-        minecraft_button(frame, x, y, w, h, label, index == state.selected, hovered);
+        minecraft_button(frame, x, y, w, h, label, state.keyboard_focus == Some(index), hovered);
     }
+}
+
+fn draw_title_screen(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>) {
+    panel(frame, width, height, state.high_contrast);
+
+    // Title text rendered with the Minecraft font (gold color, large)
+    let title = "Vibecraft";
+    let title_size = 36.0 * state.gui_scale;
+    let title_y = (height * 0.10).max(24.0);
+    centered_text(frame, width * 0.5, title_y, title_size, title, [1.0, 0.84, 0.0, 1.0]);
+
+    // Subtitle in smaller text
+    let subtitle = "A Minecraft-inspired game";
+    let sub_size = 14.0 * state.gui_scale;
+    centered_text(frame, width * 0.5, title_y + title_size * 1.1, sub_size, subtitle, [0.6, 0.6, 0.6, 1.0]);
+
+    // Buttons: Singleplayer, Multiplayer, Options..., Quit
+    let button_w = (width * 0.34).clamp(240.0, 420.0);
+    let button_h = 20.0 * state.gui_scale;
+    let gap = 3.0 * state.gui_scale;
+    let count = 4;
+    let total_h = count as f32 * button_h + (count - 1) as f32 * gap;
+    let left = (width - button_w) * 0.5;
+    let top = (height - total_h) * 0.5 + 20.0 * state.gui_scale;
+
+    let labels = ["Singleplayer", "Multiplayer", "Options...", "Quit"];
+    for (index, label) in labels.iter().enumerate() {
+        let y = top + index as f32 * (button_h + gap);
+        let hovered = cursor.map_or(false, |(cx, cy)| contains((left, y, button_w, button_h), cx, cy));
+        minecraft_button(frame, left, y, button_w, button_h, label, state.keyboard_focus == Some(index), hovered);
+    }
+
+    // Copyright footer
+    let copyright = "Copyright Bobby AI";
+    let text_size = 10.0 * state.gui_scale;
+    centered_text(frame, width * 0.5, height - 18.0 * state.gui_scale, text_size, copyright, [0.5, 0.5, 0.5, 1.0]);
 }
 
 #[cfg(test)]
@@ -870,13 +1019,77 @@ mod tests {
     }
 
     #[test]
+    fn pause_frame_emits_textured_buttons_and_centered_labels() {
+        let mut ui = UiState::default();
+        ui.open_pause();
+        let frame = ui.frame(
+            800.0,
+            600.0,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            20.0,
+            20.0,
+            0.0,
+            0.0,
+            "",
+            &[],
+            None,
+            None,
+            false,
+        );
+
+        let button_sprites: Vec<&str> = frame.commands.iter().filter_map(|command| match command {
+            UiCommand::NineSlice { sprite, .. } if sprite.starts_with("widget/button") => Some(sprite.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(button_sprites.len(), 4);
+        assert_eq!(button_sprites.iter().filter(|sprite| **sprite == "widget/button_highlighted").count(), 0);
+
+        ui.move_focus(1);
+        let focused_frame = ui.frame(
+            800.0, 600.0, &[], None, None, None, None, 20.0, 20.0, 0.0, 0.0, "", &[], None, None, false,
+        );
+        assert_eq!(
+            focused_frame.commands.iter().filter(|command| matches!(command, UiCommand::NineSlice { sprite, .. } if sprite == "widget/button_highlighted")).count(),
+            1,
+        );
+
+        let labels: Vec<&str> = frame.commands.iter().filter_map(|command| match command {
+            UiCommand::CenteredText { center_x, text, .. } if *center_x == 400.0 => Some(text.as_str()),
+            _ => None,
+        }).collect();
+        assert!(labels.contains(&"Back to Game"));
+        assert!(labels.contains(&"Options..."));
+        assert!(labels.contains(&"Controls..."));
+        assert!(labels.contains(&"Save and Quit to Title"));
+    }
+
+    #[test]
+    fn loading_frame_uses_the_vanilla_experience_bar_sprites() {
+        let mut ui = UiState::default();
+        ui.screen = UiScreen::Loading;
+        ui.loading_progress = 0.5;
+        let frame = ui.frame(
+            800.0, 600.0, &[], None, None, None, None, 20.0, 20.0, 0.0, 0.0, "", &[], None, None, false,
+        );
+        assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::Sprite { name, .. } if name == "hud/experience_bar_background")));
+        assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::SpriteProgress { name, progress, .. } if name == "hud/experience_bar_progress" && *progress == 0.5)));
+    }
+
+    #[test]
     fn connect_screen_edits_address_and_submits() {
         let mut ui = UiState::default();
         ui.screen = UiScreen::Title;
-        assert_eq!(ui.activate_focused(), UiAction::Resume);
+        assert_eq!(ui.activate_focused(), UiAction::StartGame);
+        assert_eq!(ui.screen, UiScreen::Loading);
+        assert_eq!(ui.handle_escape(), UiAction::None);
+        assert_eq!(ui.screen, UiScreen::Loading);
         ui.screen = UiScreen::Title;
         ui.selected = 0;
-        ui.move_focus(2);
+        ui.move_focus(3);
         assert_eq!(ui.activate_focused(), UiAction::Quit);
         ui.screen = UiScreen::Connect;
         ui.selected = 0;

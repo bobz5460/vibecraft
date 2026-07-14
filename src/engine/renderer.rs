@@ -33,6 +33,43 @@ pub enum RendererInitError {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiBatchKind {
+    Sprite,
+    Text,
+}
+
+struct UiBatch {
+    kind: UiBatchKind,
+    vertices: Vec<TextVertex>,
+    indices: Vec<u32>,
+}
+
+struct UiDrawBatch {
+    kind: UiBatchKind,
+    index_start: u32,
+    index_end: u32,
+}
+
+fn append_ui_geometry(
+    batches: &mut Vec<UiBatch>,
+    kind: UiBatchKind,
+    vertices: Vec<TextVertex>,
+    indices: Vec<u32>,
+) {
+    if vertices.is_empty() {
+        return;
+    }
+    if !matches!(batches.last(), Some(batch) if batch.kind == kind) {
+        batches.push(UiBatch { kind, vertices: Vec::new(), indices: Vec::new() });
+    }
+    if let Some(batch) = batches.last_mut() {
+        let base = batch.vertices.len() as u32;
+        batch.vertices.extend(vertices);
+        batch.indices.extend(indices.into_iter().map(|index| index + base));
+    }
+}
+
 fn load_destroy_texture(
     device: &Device,
     queue: &Queue,
@@ -219,6 +256,12 @@ pub struct InventorySlot {
     pub is_empty: bool,
 }
 
+pub struct NametagRender {
+    pub screen_x: f32,
+    pub screen_y: f32,
+    pub text: String,
+}
+
 pub struct RenderContext<'a> {
     pub camera: &'a Camera,
     pub chunk_data: &'a [(i32, i32, ChunkRenderData)],
@@ -246,6 +289,7 @@ pub struct RenderContext<'a> {
     pub break_progress: f32,
     pub ui_frame: Option<&'a UiFrame>,
     pub ui_captures_gameplay: bool,
+    pub nametags: &'a [NametagRender],
 }
 
 pub struct Renderer {
@@ -1643,73 +1687,91 @@ impl Renderer {
     }
 
     fn render_ui(&mut self, encoder: &mut CommandEncoder, view: &TextureView, frame: &UiFrame) {
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
-        let mut sprite_vertices: Vec<TextVertex> = Vec::new();
-        let mut sprite_indices: Vec<u32> = Vec::new();
+        let mut batches = Vec::new();
         for command in &frame.commands {
             match command {
                 UiCommand::Rect { x, y, w, h, color } => {
                     let (quad, quad_indices) = self.font.build_colored_rect(*x, *y, *w, *h, *color);
-                    let base = vertices.len() as u32;
-                    vertices.extend(quad);
-                    indices.extend(quad_indices.into_iter().map(|index| index + base));
+                    append_ui_geometry(&mut batches, UiBatchKind::Text, quad, quad_indices);
                 }
                 UiCommand::Text { x, y, size, text, color } => {
-                    let (mut text_vertices, text_indices) = self.font.build_text(text, *x, *y, *size, *size * 1.35);
+                    let (mut text_vertices, text_indices) = self.font.build_text(text, *x, *y, *size);
                     for vertex in &mut text_vertices {
                         vertex.color = *color;
                     }
-                    let base = vertices.len() as u32;
-                    vertices.extend(text_vertices);
-                    indices.extend(text_indices.into_iter().map(|index| index + base));
+                    append_ui_geometry(&mut batches, UiBatchKind::Text, text_vertices, text_indices);
+                }
+                UiCommand::CenteredText { center_x, y, size, text, color } => {
+                    let (mut text_vertices, text_indices) = self.font.build_text_centered(text, *center_x, *y, *size);
+                    for vertex in &mut text_vertices {
+                        vertex.color = *color;
+                    }
+                    append_ui_geometry(&mut batches, UiBatchKind::Text, text_vertices, text_indices);
                 }
                 UiCommand::Sprite { name, x, y, w, h, color } => {
                     if let Some((quad, quad_indices)) = self.gui_atlas.build_sprite(name, *x, *y, *w, *h, *color) {
-                        let base = sprite_vertices.len() as u32;
-                        sprite_vertices.extend(quad);
-                        sprite_indices.extend(quad_indices.into_iter().map(|index| index + base));
+                        append_ui_geometry(&mut batches, UiBatchKind::Sprite, quad, quad_indices);
+                    }
+                }
+                UiCommand::SpriteProgress { name, x, y, w, h, progress, color } => {
+                    if let Some((quad, quad_indices)) = self.gui_atlas.build_sprite_progress(name, *x, *y, *w, *h, *progress, *color) {
+                        append_ui_geometry(&mut batches, UiBatchKind::Sprite, quad, quad_indices);
                     }
                 }
                 UiCommand::NineSlice { sprite, x, y, w, h, border, color } => {
                     if let Some((quad, quad_indices)) = self.gui_atlas.build_nine_slice(sprite, *x, *y, *w, *h, *border, *color) {
-                        let base = sprite_vertices.len() as u32;
-                        sprite_vertices.extend(quad);
-                        sprite_indices.extend(quad_indices.into_iter().map(|index| index + base));
+                        append_ui_geometry(&mut batches, UiBatchKind::Sprite, quad, quad_indices);
                     }
                 }
                 UiCommand::Item { x, y, size, name: _, sprite, count, hint } => {
                     if let Some((quad, quad_indices)) = self.gui_atlas.build_sprite(sprite, *x, *y, *size, *size, [1.0, 1.0, 1.0, 1.0]) {
-                        let base = sprite_vertices.len() as u32;
-                        sprite_vertices.extend(quad);
-                        sprite_indices.extend(quad_indices.into_iter().map(|index| index + base));
+                        append_ui_geometry(&mut batches, UiBatchKind::Sprite, quad, quad_indices);
                     } else {
                         let hue = (*hint % 7) as f32 / 7.0;
                         let color = [0.35 + hue * 0.45, 0.45 + (1.0 - hue) * 0.35, 0.55, 1.0];
                         let (quad, quad_indices) = self.font.build_colored_rect(*x, *y, *size, *size, color);
-                        let base = vertices.len() as u32;
-                        vertices.extend(quad);
-                        indices.extend(quad_indices.into_iter().map(|index| index + base));
+                        append_ui_geometry(&mut batches, UiBatchKind::Text, quad, quad_indices);
                     }
                     if *count > 1 {
                         let count_text = count.to_string();
                         let cw = *size * 0.28;
-                        let ch = *size * 0.28;
-                        let (mut count_vertices, count_indices) = self.font.build_text(&count_text, *x + *size - cw * count_text.len() as f32 - 1.0, *y + *size - ch - 1.0, cw, ch);
+                        let count_w = self.font.measure_text(&count_text, cw);
+                        let (mut count_vertices, count_indices) = self.font.build_text(&count_text, *x + *size - count_w - 1.0, *y + *size - cw - 1.0, cw);
                         for vertex in &mut count_vertices {
                             vertex.color = [1.0, 1.0, 1.0, 1.0];
                         }
-                        let count_base = vertices.len() as u32;
-                        vertices.extend(count_vertices);
-                        indices.extend(count_indices.into_iter().map(|index| index + count_base));
+                        append_ui_geometry(&mut batches, UiBatchKind::Text, count_vertices, count_indices);
                     }
                 }
             }
         }
-        if vertices.is_empty() && sprite_vertices.is_empty() {
+        if batches.is_empty() {
             return;
         }
-        self.ensure_gui_capacity(vertices.len().max(sprite_vertices.len()), indices.len().max(sprite_indices.len()));
+        let mut text_vertices = Vec::new();
+        let mut text_indices = Vec::new();
+        let mut sprite_vertices = Vec::new();
+        let mut sprite_indices = Vec::new();
+        let mut draw_batches = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let (vertices, indices) = match batch.kind {
+                UiBatchKind::Sprite => (&mut sprite_vertices, &mut sprite_indices),
+                UiBatchKind::Text => (&mut text_vertices, &mut text_indices),
+            };
+            let vertex_base = vertices.len() as u32;
+            let index_start = indices.len() as u32;
+            vertices.extend(batch.vertices);
+            indices.extend(batch.indices.into_iter().map(|index| index + vertex_base));
+            draw_batches.push(UiDrawBatch {
+                kind: batch.kind,
+                index_start,
+                index_end: indices.len() as u32,
+            });
+        }
+        self.ensure_gui_capacity(
+            text_vertices.len().max(sprite_vertices.len()),
+            text_indices.len().max(sprite_indices.len()),
+        );
         let width = self.size.0.max(1) as f32;
         let height = self.size.1.max(1) as f32;
         let ortho: [[f32; 4]; 4] = [
@@ -1719,39 +1781,45 @@ impl Renderer {
             [-1.0, 1.0, 0.0, 1.0],
         ];
         self.queue.write_buffer(&self.text_uniform_buffer, 0, bytemuck::cast_slice(&[ortho]));
-        // Draw official sprites first. Text, item counts, and fallback shapes
-        // then render over the container/HUD artwork in the intended order.
         if !sprite_vertices.is_empty() {
             self.queue.write_buffer(&self.gui_vb, 0, bytemuck::cast_slice(&sprite_vertices));
             self.queue.write_buffer(&self.gui_ib, 0, bytemuck::cast_slice(&sprite_indices));
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("ui_sprite_pass"),
-                color_attachments: &[Some(RenderPassColorAttachment { view, resolve_target: None, ops: Operations { load: LoadOp::Load, store: StoreOp::Store } })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.gui_pipeline);
-            pass.set_bind_group(0, &self.gui_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.gui_vb.slice(..));
-            pass.set_index_buffer(self.gui_ib.slice(..), IndexFormat::Uint32);
-            pass.draw_indexed(0..sprite_indices.len() as u32, 0, 0..1);
         }
-        if !vertices.is_empty() {
-            self.queue.write_buffer(&self.overlay_vb, 0, bytemuck::cast_slice(&vertices));
-            self.queue.write_buffer(&self.overlay_ib, 0, bytemuck::cast_slice(&indices));
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("ui_text_pass"),
-                color_attachments: &[Some(RenderPassColorAttachment { view, resolve_target: None, ops: Operations { load: LoadOp::Load, store: StoreOp::Store } })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.text_pipeline);
-            pass.set_bind_group(0, &self.text_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.overlay_vb.slice(..));
-            pass.set_index_buffer(self.overlay_ib.slice(..), IndexFormat::Uint32);
-            pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+        if !text_vertices.is_empty() {
+            self.queue.write_buffer(&self.overlay_vb, 0, bytemuck::cast_slice(&text_vertices));
+            self.queue.write_buffer(&self.overlay_ib, 0, bytemuck::cast_slice(&text_indices));
+        }
+        for batch in draw_batches {
+            match batch.kind {
+                UiBatchKind::Sprite => {
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("ui_sprite_pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment { view, resolve_target: None, ops: Operations { load: LoadOp::Load, store: StoreOp::Store } })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.gui_pipeline);
+                    pass.set_bind_group(0, &self.gui_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.gui_vb.slice(..));
+                    pass.set_index_buffer(self.gui_ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(batch.index_start..batch.index_end, 0, 0..1);
+                }
+                UiBatchKind::Text => {
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("ui_text_pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment { view, resolve_target: None, ops: Operations { load: LoadOp::Load, store: StoreOp::Store } })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.text_pipeline);
+                    pass.set_bind_group(0, &self.text_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.overlay_vb.slice(..));
+                    pass.set_index_buffer(self.overlay_ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(batch.index_start..batch.index_end, 0, 0..1);
+                }
+            }
         }
     }
 
@@ -1766,7 +1834,7 @@ impl Renderer {
     ) {
         if lines.is_empty() { return; }
         let cw = screen_w / 160.0;
-        let ch = cw * 1.5;
+        let ch = cw;
         let mut all_verts = Vec::new();
         let mut all_indices = Vec::new();
 
@@ -1777,7 +1845,7 @@ impl Renderer {
         all_indices.extend(bg.1);
 
         for (i, line) in lines.iter().enumerate() {
-            let (verts, indices) = self.font.build_text(line, 4.0, start_y + 4.0 + i as f32 * (ch + 4.0), cw, ch);
+            let (verts, indices) = self.font.build_text(line, 4.0, start_y + 4.0 + i as f32 * (ch + 4.0), cw);
             if !verts.is_empty() {
                 let inds: Vec<u32> = indices.iter().map(|idx| idx + all_verts.len() as u32).collect();
                 all_verts.extend(verts);
@@ -1885,11 +1953,13 @@ impl Renderer {
     fn render_first_person_hand(&mut self, encoder: &mut CommandEncoder, view: &TextureView) {
         let width = self.size.0 as f32;
         let height = self.size.1 as f32;
+        let arm_h = height * 0.24;
+        let arm_w = arm_h / 3.0;
         let (vertices, indices) = self.font.build_colored_rect(
-            width * 0.72,
-            height * 0.70,
-            width * 0.23,
-            height * 0.32,
+            width - arm_w - width * 0.04,
+            height - arm_h + height * 0.03,
+            arm_w,
+            arm_h,
             [0.78, 0.55, 0.38, 1.0],
         );
         self.queue.write_buffer(&self.overlay_vb, 0, bytemuck::cast_slice(&vertices));
@@ -1908,6 +1978,74 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.overlay_vb.slice(..));
         pass.set_index_buffer(self.overlay_ib.slice(..), IndexFormat::Uint32);
         pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+    }
+
+    fn render_nametags(&self, encoder: &mut CommandEncoder, view: &TextureView, nametags: &[NametagRender]) {
+        if nametags.is_empty() { return; }
+        let mut all_verts = Vec::new();
+        let mut all_indices = Vec::new();
+        let cw = 8.0;
+        let ch = cw;
+        for nametag in nametags {
+            let text_w = self.font.measure_text(&nametag.text, cw);
+            let pad = 3.0;
+            let bg_w = text_w + pad * 2.0;
+            let bg_h = ch + pad * 1.5;
+            let bg_x = nametag.screen_x - bg_w * 0.5;
+            let bg_y = nametag.screen_y - bg_h;
+            // Dark background pill (Minecraft-style)
+            let (bg_verts, bg_inds) = self.font.build_colored_rect(bg_x, bg_y, bg_w, bg_h, [0.06, 0.06, 0.08, 0.65]);
+            let base = all_verts.len() as u32;
+            all_verts.extend(bg_verts);
+            all_indices.extend(bg_inds.into_iter().map(|i| i + base));
+            // Text shadow (1px offset, dark color)
+            let (mut shadow_tv, shadow_ti) = self.font.build_text(&nametag.text, bg_x + pad + 1.0, bg_y + pad * 0.75 + 1.0, cw);
+            for v in &mut shadow_tv { v.color = [0.05, 0.05, 0.05, 1.0]; }
+            let base = all_verts.len() as u32;
+            all_verts.extend(shadow_tv);
+            all_indices.extend(shadow_ti.into_iter().map(|i| i + base));
+            // White text
+            let (mut tv, ti) = self.font.build_text(&nametag.text, bg_x + pad, bg_y + pad * 0.75, cw);
+            for v in &mut tv { v.color = [1.0, 1.0, 1.0, 1.0]; }
+            let base = all_verts.len() as u32;
+            all_verts.extend(tv);
+            all_indices.extend(ti.into_iter().map(|i| i + base));
+        }
+        let width = self.size.0 as f32;
+        let height = self.size.1 as f32;
+        let ortho: [[f32; 4]; 4] = [
+            [2.0 / width, 0.0, 0.0, 0.0],
+            [0.0, -2.0 / height, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0, 1.0],
+        ];
+        self.queue.write_buffer(&self.text_uniform_buffer, 0, bytemuck::cast_slice(&[ortho]));
+        let vb = self.device.create_buffer(&BufferDescriptor {
+            label: Some("nametag_vb"),
+            size: (all_verts.len() as u64) * std::mem::size_of::<TextVertex>() as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&all_verts));
+        let ib = self.device.create_buffer(&BufferDescriptor {
+            label: Some("nametag_ib"),
+            size: (all_indices.len() as u64) * std::mem::size_of::<u32>() as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&ib, 0, bytemuck::cast_slice(&all_indices));
+        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("nametag_pass"),
+            color_attachments: &[Some(RenderPassColorAttachment { view, resolve_target: None, ops: Operations { load: LoadOp::Load, store: StoreOp::Store } })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.text_pipeline);
+        pass.set_bind_group(0, &self.text_bind_group, &[]);
+        pass.set_vertex_buffer(0, vb.slice(..));
+        pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+        pass.draw_indexed(0..all_indices.len() as u32, 0, 0..1);
     }
 
     pub fn render(&mut self, ctx: &RenderContext) -> Result<(), SurfaceError> {
@@ -2088,6 +2226,7 @@ impl Renderer {
         if let Some(frame) = ctx.ui_frame {
             self.render_ui(&mut encoder, &view, frame);
         }
+        self.render_nametags(&mut encoder, &view, ctx.nametags);
         if !ctx.ui_captures_gameplay {
             self.render_first_person_hand(&mut encoder, &view);
             if ctx.ui_frame.is_none() {
@@ -2099,5 +2238,27 @@ impl Renderer {
         output.present();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vertex() -> TextVertex {
+        TextVertex { pos: [0.0, 0.0], uv: [0.0, 0.0], color: [1.0; 4] }
+    }
+
+    #[test]
+    fn ui_batches_preserve_text_sprite_text_order() {
+        let mut batches = Vec::new();
+        append_ui_geometry(&mut batches, UiBatchKind::Text, vec![vertex()], vec![0]);
+        append_ui_geometry(&mut batches, UiBatchKind::Sprite, vec![vertex()], vec![0]);
+        append_ui_geometry(&mut batches, UiBatchKind::Text, vec![vertex()], vec![0]);
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].kind, UiBatchKind::Text);
+        assert_eq!(batches[1].kind, UiBatchKind::Sprite);
+        assert_eq!(batches[2].kind, UiBatchKind::Text);
     }
 }

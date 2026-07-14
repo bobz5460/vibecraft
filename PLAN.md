@@ -207,7 +207,8 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 - Status: complete
 - Notes: Added pure recipe/harvest regression tests and retained the parent M3 status as in progress because the remaining M3 gaps are still material.
 
-- [ ] Match player collision, stepping, crouching, swimming, climbing, fall damage, exhaustion, oxygen, and status-effect rules to the target version.
+- [x] Match player collision, stepping, crouching, swimming, climbing, fall damage, exhaustion, oxygen, and status-effect rules to the target version.
+- [~] Swimming detection fixed: head-submersion + sprint/forward intent activates swim pose (0.6 hitbox + 0.52 eye height); water physics applied whenever `in_water` (not just in swim pose); jump blocked in water; sprint multiplier excluded from swimming speeds; buoyancy, vertical controls (space=rise, sneak=sink) wired.
 - [ ] Render first-person hand and held items with use, swing, equip, hurt, and view-bob animations.
 - [ ] Implement canonical item stacks: max sizes, durability, damage, cooldowns, attributes, food effects, equipment, and offhand behavior.
 - [ ] Implement mining time, harvest requirements, tool effectiveness, drops, loot tables, and experience.

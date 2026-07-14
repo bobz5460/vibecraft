@@ -36,7 +36,7 @@ impl AssetReader {
 
     pub fn exists(&self, rel_path: &str) -> bool {
         #[cfg(feature = "bundled")]
-        if EMBEDDED.get_file(rel_path).is_some() {
+        if EMBEDDED.get_file(rel_path).is_some() || EMBEDDED.get_dir(rel_path).is_some() {
             return true;
         }
         self.root.join(rel_path).exists()
@@ -72,5 +72,17 @@ impl AssetReader {
             .collect();
         names.sort();
         names
+    }
+}
+
+#[cfg(all(test, feature = "bundled"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_reader_recognizes_asset_directories() {
+        let reader = AssetReader::new(PathBuf::new());
+        assert!(reader.exists("textures/gui/sprites/widget"));
+        assert!(reader.read_dir("textures/gui/sprites/widget").iter().any(|name| name == "button.png"));
     }
 }

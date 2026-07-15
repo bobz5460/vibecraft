@@ -326,6 +326,53 @@ impl FontTexture {
         (verts, indices)
     }
 
+    pub fn build_text_with_shadow(
+        &self,
+        text: &str,
+        x: f32,
+        y: f32,
+        size: f32,
+        color: [f32; 4],
+    ) -> (Vec<TextVertex>, Vec<u32>) {
+        // Keep the shadow directly adjacent to the bitmap glyph. Scaling this
+        // offset with larger labels left a visible gap between the glyph and
+        // its shadow.
+        let shadow_offset = 1.0;
+        let (shadow_verts, shadow_idx) = self.build_text(text, x + shadow_offset, y + shadow_offset, size);
+        let shadow_verts: Vec<TextVertex> = shadow_verts
+            .into_iter()
+            .map(|mut v| { v.color = [0.0, 0.0, 0.0, 1.0]; v })
+            .collect();
+        let base = shadow_verts.len() as u32;
+        let (fg_verts, fg_idx) = self.build_text(text, x, y, size);
+        let fg_verts: Vec<TextVertex> = fg_verts
+            .into_iter()
+            .map(|mut v| { v.color = color; v })
+            .collect();
+        let mut verts = shadow_verts;
+        verts.extend(fg_verts);
+        let mut indices = shadow_idx;
+        indices.extend(fg_idx.into_iter().map(|i| i + base));
+        (verts, indices)
+    }
+
+    pub fn build_text_centered_with_shadow(
+        &self,
+        text: &str,
+        center_x: f32,
+        y: f32,
+        size: f32,
+        color: [f32; 4],
+    ) -> (Vec<TextVertex>, Vec<u32>) {
+        self.build_text_with_shadow(
+            text,
+            center_x - self.measure_text(text, size) * 0.5,
+            y,
+            size,
+            color,
+        )
+    }
+
     pub fn build_text_centered(
         &self,
         text: &str,

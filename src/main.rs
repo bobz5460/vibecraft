@@ -92,19 +92,20 @@ fn ui_slot(
             .cloned()
             .unwrap_or_else(|| format!("block/{}", gui_asset_stem(&display_name)))
     } else {
-        let stem = match stack.id {
-            inventory::item::ENCHANTED_APPLE => "golden_apple".to_string(),
-            _ if display_name == "Redstone Dust" => "redstone".to_string(),
-            _ if display_name == "Compass" => "compass_00".to_string(),
-            _ if display_name == "Clock" => "clock_00".to_string(),
-            _ => gui_asset_stem(&display_name),
-        };
-        format!("item/{stem}")
+        items
+            .texture_stem(stack.id)
+            .map(|stem| format!("item/{stem}"))
+            .unwrap_or_else(|| "_missing".to_string())
     };
-    let hint = items
-        .block_from_item(stack.id)
-        .map(|block| world::mesh::get_face_tile(block, world::block::BlockFace::Top))
-        .unwrap_or(stack.id as u32);
+    let block_tiles = items.block_from_item(stack.id).map(|block| {
+        use world::block::BlockFace;
+        [
+            world::mesh::get_face_tile(block, BlockFace::Top),
+            world::mesh::get_face_tile(block, BlockFace::Front),
+            world::mesh::get_face_tile(block, BlockFace::Right),
+        ]
+    });
+    let hint = block_tiles.map(|t| t[0]).unwrap_or(stack.id as u32);
     UiSlot {
         name: display_name,
         sprite,
@@ -112,6 +113,7 @@ fn ui_slot(
         empty: stack.is_empty(),
         selected,
         hint,
+        block_tiles,
     }
 }
 
@@ -219,6 +221,11 @@ struct RemotePlayerVisual {
     walk_amount: f32,
 }
 
+/// Check a key binding that may have left/right variants (Shift, Ctrl).
+fn check_mod(input: &InputState, primary: KeyCode, secondary: KeyCode) -> bool {
+    input.is_key_pressed(primary) || input.is_key_pressed(secondary)
+}
+
 fn update_local_player_movement(
     player: &mut Player,
     camera: &mut Camera,
@@ -232,8 +239,8 @@ fn update_local_player_movement(
     difficulty: Difficulty,
     dt: f32,
 ) {
-    let sprinting = input.is_key_pressed(bindings.sprint) && !flying;
-    player.sneaking = input.is_key_pressed(bindings.sneak)
+    let sprinting = check_mod(input, bindings.sprint, KeyCode::ControlRight) && !flying;
+    player.sneaking = check_mod(input, bindings.sneak, KeyCode::ShiftRight)
         && game_mode.has_gravity()
         && !flying
         && !game_mode.is_spectator();
@@ -253,27 +260,28 @@ fn update_local_player_movement(
     }
 
     if flying || game_mode.is_spectator() {
-        let mut speed = 10.0 * dt;
-        if input.is_key_pressed(bindings.sprint) {
-            speed *= 2.0;
+        let v_speed = 10.0 * dt;
+        let mut h_speed = v_speed;
+        if check_mod(input, bindings.sprint, KeyCode::ControlRight) {
+            h_speed *= 2.0;
         }
         if input.is_key_pressed(bindings.forward) {
-            camera.move_forward(speed);
+            camera.move_forward(h_speed);
         }
         if input.is_key_pressed(bindings.back) {
-            camera.move_forward(-speed);
+            camera.move_forward(-h_speed);
         }
         if input.is_key_pressed(bindings.left) {
-            camera.move_right(-speed);
+            camera.move_right(-h_speed);
         }
         if input.is_key_pressed(bindings.right) {
-            camera.move_right(speed);
+            camera.move_right(h_speed);
         }
         if input.is_key_pressed(bindings.jump) {
-            camera.move_up(speed);
+            camera.move_up(v_speed);
         }
         if input.is_key_pressed(bindings.sneak) {
-            camera.move_up(-speed);
+            camera.move_up(-v_speed);
         }
         player.x = camera.position.x;
         player.y = camera.position.y;
@@ -319,7 +327,6 @@ fn update_local_player_movement(
 
         let mut touching_climbable = false;
         if in_water {
-            player.vy *= (1.0 - player::WATER_DRAG * dt).max(0.0);
             let feet_y = player.y.floor() as i32;
             let feet_x = player.x.floor() as i32;
             let feet_z = player.z.floor() as i32;
@@ -330,13 +337,11 @@ fn update_local_player_movement(
             } else if in_water_block && below.id == BlockId::MagmaBlock {
                 player.vy -= 6.0 * dt;
             }
-            if input.is_key_pressed(bindings.jump) {
-                player.vy += player::SWIM_SPEED * dt;
-            }
-            if input.is_key_pressed(bindings.sneak) {
-                player.vy -= player::SWIM_SPEED * dt;
-            }
-            player.vy += player::WATER_GRAVITY * dt;
+            player.update_water_vertical_velocity(
+                input.is_key_pressed(bindings.jump),
+                input.is_key_pressed(bindings.sneak),
+                dt,
+            );
         } else {
             let min_bx = (player.x - player::HALF_WIDTH).floor() as i32;
             let max_bx = (player.x + player::HALF_WIDTH).ceil() as i32;
@@ -399,7 +404,7 @@ fn update_local_player_movement(
             && !player.on_ground
             && player.vy > 0.0
         {
-            let reduced_gravity = player::GRAVITY * 0.4;
+            let reduced_gravity = player::GRAVITY * 0.55;
             player.vy += (reduced_gravity - player::GRAVITY) * dt;
         }
 
@@ -2371,7 +2376,26 @@ async fn run(config: AppConfig) {
                     camera.fov = target_fov;
                 }
 
-                // Render dropped items and XP orbs with persistent buffer reuse
+                let world_billboards: Vec<_> = dropped_items
+                    .iter()
+                    .filter(|item| !item.stack.is_empty())
+                    .map(|item| {
+                        let slot = ui_slot(
+                            &item.stack,
+                            &item_registry,
+                            &inventory_block_sprite_map,
+                            false,
+                        );
+                        engine::renderer::WorldBillboard {
+                            position: [item.x, item.y, item.z],
+                            sprite: slot.sprite,
+                        }
+                    })
+                    .collect();
+
+                // XP orbs, temporary entities, and remote players retain the
+                // terrain-mesh path. Dropped item stacks render separately as
+                // ItemAtlas billboards in Renderer::render.
                 {
                     let _dropped_mesh_scope = profiler::Scope::new("dropped_items_mesh");
                     for remote in remote_players.values_mut() {
@@ -2397,7 +2421,6 @@ async fn run(config: AppConfig) {
                         remote.walk_phase = (remote.walk_phase + horizontal_speed * frame_dt * 5.0)
                             .rem_euclid(std::f32::consts::TAU);
                     }
-                    let item_mesh = world::dropped_item::dropped_items_to_mesh(&dropped_items);
                     let xp_mesh = xp_orbs_to_mesh(&xp_orbs);
                     let entity_data: Vec<_> = entities
                         .entities()
@@ -2416,10 +2439,7 @@ async fn run(config: AppConfig) {
                         walk_amount: remote.walk_amount,
                     }).collect();
                     let player_mesh = build_player_mesh(&player_instances);
-                    let mut combined = item_mesh;
-                    let vert_offset = combined.vertices.len() as u32;
-                    combined.vertices.extend(xp_mesh.vertices);
-                    combined.indices.extend(xp_mesh.indices.iter().map(|i| i.saturating_add(vert_offset)));
+                    let mut combined = xp_mesh;
                     let vert_offset = combined.vertices.len() as u32;
                     combined.vertices.extend(entity_mesh.vertices);
                     combined.indices.extend(entity_mesh.indices.iter().map(|i| i.saturating_add(vert_offset)));
@@ -2869,7 +2889,12 @@ async fn run(config: AppConfig) {
                         ui_frame: Some(&ui_frame),
                         ui_captures_gameplay: ui_state.captures_gameplay_input() || chat_open || command_mode,
                         nametags: &nametags,
+                        world_billboards: &world_billboards,
+                        blur_enabled: ui_state.screen == ui::UiScreen::Pause || ui_state.screen == ui::UiScreen::Options || ui_state.screen == ui::UiScreen::Controls || ui_state.screen == ui::UiScreen::Accessibility,
+                        blur_intensity: ui_state.blur_intensity,
                     };
+                    renderer.blur_enabled = ctx.blur_enabled;
+                    renderer.blur_intensity = ctx.blur_intensity;
                     match renderer.render(&ctx) {
                         Ok(_) => {}
                         Err(wgpu::SurfaceError::Lost) => {

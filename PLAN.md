@@ -62,7 +62,7 @@ A parity item is complete only when all applicable conditions hold:
 | Overworld terrain | Partial | seeded terrain, biomes, caves, ores, decorations, async generation | not data-version-faithful; no natural structures or cave biomes |
 | Blocks and lighting | Partial | registry/state and resolved-model foundations, chunk lighting, greedy cube/crossed/slab/stair meshes | metadata does not yet drive all gameplay/rendering; no generic model-element or block-entity system |
 | Player survival | Partial | movement, collision, modes, health/hunger, effects, basic fluids | formulas and interactions are incomplete; no entity combat |
-| Items and inventory | Partial | item registry, stacks, hotbar, basic inventory interaction, drops | no durability, equipment, crafting, containers, or item models |
+| Items and inventory | Partial | item registry, stack counts, hotbar/inventory textures, block/item drop billboards | no durability, equipment, crafting, containers, or generic item/entity-model rendering |
 | UI and audio | Partial | text, basic HUD/inventory data, commands, block sounds | graphical vanilla screens/HUD, chat, settings, positional audio |
 | Simulation content | Not started | dropped items, XP, and specialized fluid updates | no general entity or block-tick framework, mobs, projectiles, or redstone |
 | Persistence and dimensions | Partial | versioned native Overworld level/player/chunk persistence with atomic saves | no dimensions, block-entity/general-entity persistence, or scheduled-event persistence |

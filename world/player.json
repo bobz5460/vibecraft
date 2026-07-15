@@ -3,19 +3,19 @@
   "data_version": 5,
   "kind": "player",
   "data": {
-    "x": -93.43762,
-    "y": 65.000145,
-    "z": 0.44829288,
+    "x": -6.0465336,
+    "y": 66.0,
+    "z": -2.664921,
     "vy": 0.0,
     "on_ground": true,
-    "health": 15.324888,
+    "health": 20.0,
     "last_vy": 0.0,
     "sneaking": false,
     "swimming": false,
     "oxygen": 15.0,
-    "hunger": 17.999878,
-    "saturation": 0.0,
-    "exhaustion": 0.068315506,
+    "hunger": 20.0,
+    "saturation": 13.962439,
+    "exhaustion": 0.6,
     "attack_cooldown": 1.0,
     "armor_points": 0.0,
     "armor_toughness": 0.0,
@@ -26,18 +26,18 @@
     "inventory": {
       "slots": [
         {
-          "id": 13,
-          "count": 1,
+          "id": 0,
+          "count": 0,
           "damage": 0
         },
         {
-          "id": 8,
-          "count": 4,
+          "id": 0,
+          "count": 0,
           "damage": 0
         },
         {
-          "id": 1347,
-          "count": 1,
+          "id": 0,
+          "count": 0,
           "damage": 0
         },
         {

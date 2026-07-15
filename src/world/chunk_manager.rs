@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::thread;
 
 pub const DEFAULT_RENDER_DISTANCE: i32 = 6;
-const MAX_LOADED_CHUNKS_PER_FRAME: usize = 16;
-const MAX_MESHES_IN_FLIGHT: usize = 4;
-const MAX_LIGHT_KEYS_PER_FRAME: usize = 8;
+const MAX_LOADED_CHUNKS_PER_FRAME: usize = 32;
+const MAX_MESHES_IN_FLIGHT: usize = 8;
+const MAX_LIGHT_KEYS_PER_FRAME: usize = 16;
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -115,9 +115,9 @@ impl ChunkManager {
         let available_workers = thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let mesh_workers = if available_workers >= 8 { 2 } else { 1 };
+        let mesh_workers = (available_workers / 3).max(1);
         let generation_workers = available_workers
-            .saturating_sub(mesh_workers + 2)
+            .saturating_sub(mesh_workers + 1)
             .max(1);
 
         for _ in 0..generation_workers {

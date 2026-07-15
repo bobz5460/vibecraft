@@ -9,9 +9,9 @@ use nalgebra::Point3;
 pub const STANDING_EYE_HEIGHT: f32 = 1.6;
 pub const SNEAK_EYE_HEIGHT: f32 = 1.27;
 pub const SWIMMING_EYE_HEIGHT: f32 = 0.52;
-pub const GRAVITY: f32 = -25.0;
-pub const WATER_GRAVITY: f32 = -5.0;
-pub const JUMP_SPEED: f32 = 8.0;
+pub const GRAVITY: f32 = -34.0;
+pub const WATER_GRAVITY: f32 = -6.5;
+pub const JUMP_SPEED: f32 = 9.2;
 pub const WIDTH: f32 = 0.6;
 pub const STANDING_HEIGHT: f32 = 1.8;
 pub const SNEAK_HEIGHT: f32 = 1.5;
@@ -23,6 +23,7 @@ pub const WALK_SPEED: f32 = 4.317;
 pub const SNEAK_SPEED: f32 = 1.295;
 pub const SPRINT_MULT: f32 = 1.3;
 pub const SWIM_SPEED: f32 = 3.0;
+pub const SWIM_ASCENT_ACCELERATION: f32 = 10.0;
 pub const SURFACE_SWIM_SPEED: f32 = 2.2;
 pub const WATER_DRAG: f32 = 0.8;
 pub const CLIMB_SPEED: f32 = 2.35;
@@ -115,6 +116,19 @@ impl Player {
 
     pub fn eye_position(&self) -> Point3<f32> {
         Point3::new(self.x, self.y + self.current_eye_height(), self.z)
+    }
+
+    /// Updates vertical water motion. A dedicated ascent acceleration must
+    /// exceed water gravity so holding jump actually moves the player upward.
+    pub fn update_water_vertical_velocity(&mut self, jump: bool, sneak: bool, dt: f32) {
+        self.vy *= (1.0 - WATER_DRAG * dt).max(0.0);
+        if jump {
+            self.vy += SWIM_ASCENT_ACCELERATION * dt;
+        }
+        if sneak {
+            self.vy -= SWIM_SPEED * dt;
+        }
+        self.vy += WATER_GRAVITY * dt;
     }
 
     pub fn apply_damage(&mut self, base_amount: f32, damage_mult: f32) -> f32 {
@@ -619,5 +633,16 @@ mod tests {
         let mut player = Player::new(0.0, 64.0, 0.0);
         player.try_move_with_difficulty(1.0, 0.0, 0.0, &manager, 1.0);
         assert_eq!(player.x, 0.0);
+    }
+
+    #[test]
+    fn holding_jump_in_water_accelerates_upward() {
+        let mut player = Player::new(0.0, 64.0, 0.0);
+        player.update_water_vertical_velocity(true, false, 0.05);
+        assert!(player.vy > 0.0);
+
+        player.vy = 0.0;
+        player.update_water_vertical_velocity(false, true, 0.05);
+        assert!(player.vy < 0.0);
     }
 }

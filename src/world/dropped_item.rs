@@ -16,11 +16,11 @@ pub struct DroppedItem {
     pub vx: f32,
     pub vy: f32,
     pub vz: f32,
-    /// The authoritative dropped payload. For block-backed stacks, `block_id`
-    /// selects the official terrain texture for every face of the item cube.
-    /// Non-block stacks retain the current stone fallback until item-model
-    /// geometry is added.
+    /// The authoritative dropped payload. Rendering derives an ItemAtlas sprite
+    /// from this stack; no visual texture state is stored in the entity.
     pub stack: ItemStack,
+    /// Retained for native-save compatibility and legacy item-ID recovery.
+    /// Item rendering must use `stack.id`, not this field.
     pub block_id: BlockId,
     pub lifetime: f32,
     pub pickup_delay: f32,
@@ -265,14 +265,6 @@ pub fn map_drop(block_id: BlockId) -> BlockId {
     }
 }
 
-pub fn dropped_items_to_mesh(items: &[DroppedItem]) -> ChunkMesh {
-    // build_item_cube_mesh resolves each face through the official terrain
-    // atlas, so block drops use block textures rather than GUI item sprites.
-    let item_data: Vec<(f32, f32, f32, BlockId)> =
-        items.iter().map(|i| (i.x, i.y, i.z, i.block_id)).collect();
-    crate::world::mesh::build_item_cube_mesh(&item_data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn block_drops_keep_their_block_texture_source() {
+    fn block_drops_keep_their_legacy_block_identity() {
         let registry = ItemRegistry::new();
         let stack = ItemStack::new(registry.item_id_from_block(BlockId::Stone), 1);
         let dropped = DroppedItem::from_stack(0.0, 64.0, 0.0, stack, &registry).unwrap();

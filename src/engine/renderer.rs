@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use crate::assets::reader::AssetReader;
 use crate::assets::gui_atlas::GuiAtlas;
+use crate::assets::item_atlas::ItemAtlas;
 use wgpu::*;
 use winit::window::Window;
 use crate::assets::LoadedTextureManager;
@@ -36,6 +37,8 @@ pub enum RendererInitError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiBatchKind {
     Sprite,
+    Item,
+    IsometricBlock,
     Text,
 }
 
@@ -262,6 +265,13 @@ pub struct NametagRender {
     pub text: String,
 }
 
+/// World-space item sprite supplied by gameplay. The renderer resolves the
+/// atlas coordinates and generates camera-facing geometry each frame.
+pub struct WorldBillboard {
+    pub position: [f32; 3],
+    pub sprite: String,
+}
+
 pub struct RenderContext<'a> {
     pub camera: &'a Camera,
     pub chunk_data: &'a [(i32, i32, ChunkRenderData)],
@@ -290,6 +300,9 @@ pub struct RenderContext<'a> {
     pub ui_frame: Option<&'a UiFrame>,
     pub ui_captures_gameplay: bool,
     pub nametags: &'a [NametagRender],
+    pub world_billboards: &'a [WorldBillboard],
+    pub blur_enabled: bool,
+    pub blur_intensity: f32,
 }
 
 pub struct Renderer {
@@ -317,15 +330,33 @@ pub struct Renderer {
     destroy_texture: Texture,
     pub font: FontTexture,
     pub text_pipeline: RenderPipeline,
+    pub crosshair_invert_pipeline: RenderPipeline,
     pub text_bind_group: BindGroup,
     pub text_uniform_buffer: Buffer,
     gui_atlas: GuiAtlas,
+    item_atlas: ItemAtlas,
     gui_pipeline: RenderPipeline,
     gui_bind_group: BindGroup,
+    item_gui_bind_group: BindGroup,
+    terrain_gui_bind_group: BindGroup,
+    iso_vb: Buffer,
+    iso_ib: Buffer,
+    iso_vb_cap: usize,
+    iso_ib_cap: usize,
+    item_billboard_bind_group: BindGroup,
+    item_billboard_pipeline: RenderPipeline,
     gui_vb: Buffer,
     gui_ib: Buffer,
     gui_vb_cap: usize,
     gui_ib_cap: usize,
+    item_gui_vb: Buffer,
+    item_gui_ib: Buffer,
+    item_gui_vb_cap: usize,
+    item_gui_ib_cap: usize,
+    item_billboard_vb: Buffer,
+    item_billboard_ib: Buffer,
+    item_billboard_vb_cap: usize,
+    item_billboard_ib_cap: usize,
     star_vertex_buffer: Buffer,
     star_count: u32,
     moon_vertex_buffer: Buffer,
@@ -349,6 +380,15 @@ pub struct Renderer {
     cube_outline_vb: Option<Buffer>,
     cube_outline_vb_cap: u64,
     screenshot_path: Option<String>,
+    scene_texture: Texture,
+    scene_view: TextureView,
+    scene_sampler: Sampler,
+    blit_bgl: BindGroupLayout,
+    blit_pipeline: RenderPipeline,
+    blit_bind_group: BindGroup,
+    blur_uniform_buffer: Buffer,
+    pub blur_enabled: bool,
+    pub blur_intensity: f32,
 }
 
 impl Renderer {
@@ -603,7 +643,7 @@ impl Renderer {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: Some(DepthStencilState {
+                depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
                 depth_write_enabled: true,
                 depth_compare: CompareFunction::Less,
@@ -1062,8 +1102,8 @@ impl Renderer {
                 depth_compare: CompareFunction::LessEqual,
                 stencil: StencilState::default(),
                 bias: DepthBiasState {
-                    constant: 0,
-                    slope_scale: 2.0,
+                    constant: -2,
+                    slope_scale: 0.0,
                     clamp: 0.0,
                 },
             }),
@@ -1236,6 +1276,52 @@ impl Renderer {
             cache: None,
         });
 
+        // Crosshair invert pipeline — uses OneMinusDstColor blend to invert the background
+        let crosshair_invert_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("crosshair_invert_pipeline"),
+            layout: Some(&text_pipeline_layout),
+            vertex: VertexState {
+                module: &text_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[TextVertex::desc()],
+            },
+            fragment: Some(FragmentState {
+                module: &text_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: config.format,
+                    blend: Some(BlendState {
+                        color: BlendComponent {
+                            src_factor: BlendFactor::OneMinusDst,
+                            dst_factor: BlendFactor::Zero,
+                            operation: BlendOperation::Add,
+                        },
+                        alpha: BlendComponent {
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::OneMinusSrcAlpha,
+                            operation: BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let text_bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("text_bg"),
             layout: &text_bgl,
@@ -1256,6 +1342,7 @@ impl Renderer {
         });
 
         let gui_atlas = GuiAtlas::new(&device, &queue, reader);
+        let item_atlas = ItemAtlas::new(&device, &queue, reader);
         let gui_shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("gui_shader"),
             source: ShaderSource::Wgsl(include_str!("../shaders/gui.wgsl").into()),
@@ -1347,6 +1434,117 @@ impl Renderer {
                 },
             ],
         });
+        let item_gui_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("item_gui_bind_group"),
+            layout: &gui_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: text_uniform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&item_atlas.view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&item_atlas.sampler),
+                },
+            ],
+        });
+        let terrain_gui_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("terrain_gui_bind_group"),
+            layout: &gui_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: text_uniform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&tex_manager.atlas_view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&tex_manager.atlas_sampler),
+                },
+            ],
+        });
+        let iso_vb_cap = 4096usize;
+        let iso_ib_cap = 4096usize;
+        let iso_vb = device.create_buffer(&BufferDescriptor {
+            label: Some("iso_vb"),
+            size: (iso_vb_cap * std::mem::size_of::<TextVertex>()) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let iso_ib = device.create_buffer(&BufferDescriptor {
+            label: Some("iso_ib"),
+            size: (iso_ib_cap * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let item_billboard_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("item_billboard_bind_group"),
+            layout: &gui_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&item_atlas.view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&item_atlas.sampler),
+                },
+            ],
+        });
+        let item_billboard_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("item_billboard_shader"),
+            source: ShaderSource::Wgsl(include_str!("../shaders/item_billboard.wgsl").into()),
+        });
+        let item_billboard_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("item_billboard_pipeline"),
+            layout: Some(&gui_pipeline_layout),
+            vertex: VertexState {
+                module: &item_billboard_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Vertex::desc()],
+            },
+            fragment: Some(FragmentState {
+                module: &item_billboard_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: config.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: CompareFunction::Less,
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
         const GUI_VERT_CAP: usize = 8192;
         let gui_vb = device.create_buffer(&BufferDescriptor {
             label: Some("gui_vb"),
@@ -1359,6 +1557,172 @@ impl Renderer {
             size: (GUI_VERT_CAP * std::mem::size_of::<u32>()) as u64,
             usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
+        });
+        let item_gui_vb = device.create_buffer(&BufferDescriptor {
+            label: Some("item_gui_vb"),
+            size: (GUI_VERT_CAP * std::mem::size_of::<TextVertex>()) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let item_gui_ib = device.create_buffer(&BufferDescriptor {
+            label: Some("item_gui_ib"),
+            size: (GUI_VERT_CAP * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        const ITEM_BILLBOARD_CAP: usize = 4096;
+        let item_billboard_vb = device.create_buffer(&BufferDescriptor {
+            label: Some("item_billboard_vb"),
+            size: (ITEM_BILLBOARD_CAP * std::mem::size_of::<Vertex>()) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let item_billboard_ib = device.create_buffer(&BufferDescriptor {
+            label: Some("item_billboard_ib"),
+            size: (ITEM_BILLBOARD_CAP * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Scene texture for pause blur
+        let scene_texture = device.create_texture(&TextureDescriptor {
+            label: Some("scene_texture"),
+            size: Extent3d { width: size.width.max(1), height: size.height.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: config.format,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let scene_view = scene_texture.create_view(&TextureViewDescriptor::default());
+        let blit_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("blit_shader"),
+            source: ShaderSource::Wgsl(include_str!("../shaders/fullscreen.wgsl").into()),
+        });
+        let blit_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("blit_bgl"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::VERTEX,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let blit_pl_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("blit_pl_layout"),
+            bind_group_layouts: &[&blit_bgl],
+            push_constant_ranges: &[],
+        });
+        let blit_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("blit_pipeline"),
+            layout: Some(&blit_pl_layout),
+            vertex: VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: config.format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        #[repr(C)]
+        #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+        struct BlitUniform {
+            intensity: f32,
+            _pad: [f32; 3],
+        }
+        let blur_uniform_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("blur_ub"),
+            size: std::mem::size_of::<BlitUniform>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let scene_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("scene_sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+        let blit_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("blit_bg"),
+            layout: &blit_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: text_uniform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&scene_view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&scene_sampler),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: blur_uniform_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         Ok(Renderer {
@@ -1389,15 +1753,33 @@ impl Renderer {
             moon_index_buffer,
             font,
             text_pipeline,
+            crosshair_invert_pipeline,
             text_bind_group,
             text_uniform_buffer,
             gui_atlas,
+            item_atlas,
             gui_pipeline,
             gui_bind_group,
+            item_gui_bind_group,
+            terrain_gui_bind_group,
+            iso_vb,
+            iso_ib,
+            iso_vb_cap,
+            iso_ib_cap,
+            item_billboard_bind_group,
+            item_billboard_pipeline,
             gui_vb,
             gui_ib,
             gui_vb_cap: GUI_VERT_CAP,
             gui_ib_cap: GUI_VERT_CAP,
+            item_gui_vb,
+            item_gui_ib,
+            item_gui_vb_cap: GUI_VERT_CAP,
+            item_gui_ib_cap: GUI_VERT_CAP,
+            item_billboard_vb,
+            item_billboard_ib,
+            item_billboard_vb_cap: ITEM_BILLBOARD_CAP,
+            item_billboard_ib_cap: ITEM_BILLBOARD_CAP,
             depth_texture,
             depth_view,
             shadow_texture,
@@ -1417,6 +1799,15 @@ impl Renderer {
             cube_outline_vb: None,
             cube_outline_vb_cap: 0,
             screenshot_path: None,
+            scene_texture,
+            scene_view,
+            scene_sampler,
+            blit_bgl,
+            blit_pipeline,
+            blit_bind_group,
+            blur_uniform_buffer,
+            blur_enabled: false,
+            blur_intensity: 3.0,
         })
     }
 
@@ -1548,6 +1939,28 @@ impl Renderer {
             view_formats: &[TextureFormat::Depth32Float],
         });
         self.depth_view = self.depth_texture.create_view(&TextureViewDescriptor::default());
+        // Recreate scene texture for blur
+        self.scene_texture = self.device.create_texture(&TextureDescriptor {
+            label: Some("scene_texture"),
+            size: Extent3d { width: new_size.0.max(1), height: new_size.1.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: self.config.format,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.scene_view = self.scene_texture.create_view(&TextureViewDescriptor::default());
+        self.blit_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("blit_bg"),
+            layout: &self.blit_bgl,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: self.text_uniform_buffer.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&self.scene_view) },
+                BindGroupEntry { binding: 2, resource: BindingResource::Sampler(&self.scene_sampler) },
+                BindGroupEntry { binding: 3, resource: self.blur_uniform_buffer.as_entire_binding() },
+            ],
+        });
     }
 
     pub fn update_uniforms(
@@ -1686,6 +2099,69 @@ impl Renderer {
         }
     }
 
+    fn ensure_item_gui_capacity(&mut self, vertex_count: usize, index_count: usize) {
+        if vertex_count > self.item_gui_vb_cap {
+            self.item_gui_vb_cap = vertex_count.next_power_of_two();
+            self.item_gui_vb = self.device.create_buffer(&BufferDescriptor {
+                label: Some("item_gui_vb"),
+                size: (self.item_gui_vb_cap * std::mem::size_of::<TextVertex>()) as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if index_count > self.item_gui_ib_cap {
+            self.item_gui_ib_cap = index_count.next_power_of_two();
+            self.item_gui_ib = self.device.create_buffer(&BufferDescriptor {
+                label: Some("item_gui_ib"),
+                size: (self.item_gui_ib_cap * std::mem::size_of::<u32>()) as u64,
+                usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+    }
+
+    fn ensure_iso_capacity(&mut self, vertex_count: usize, index_count: usize) {
+        if vertex_count > self.iso_vb_cap {
+            self.iso_vb_cap = vertex_count.next_power_of_two();
+            self.iso_vb = self.device.create_buffer(&BufferDescriptor {
+                label: Some("iso_vb"),
+                size: (self.iso_vb_cap * std::mem::size_of::<TextVertex>()) as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if index_count > self.iso_ib_cap {
+            self.iso_ib_cap = index_count.next_power_of_two();
+            self.iso_ib = self.device.create_buffer(&BufferDescriptor {
+                label: Some("iso_ib"),
+                size: (self.iso_ib_cap * std::mem::size_of::<u32>()) as u64,
+                usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+    }
+
+    fn ensure_item_billboard_capacity(&mut self, vertex_count: usize, index_count: usize) {
+        if vertex_count > self.item_billboard_vb_cap {
+            self.item_billboard_vb_cap = vertex_count.next_power_of_two();
+            self.item_billboard_vb = self.device.create_buffer(&BufferDescriptor {
+                label: Some("item_billboard_vb"),
+                size: (self.item_billboard_vb_cap * std::mem::size_of::<Vertex>()) as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if index_count > self.item_billboard_ib_cap {
+            self.item_billboard_ib_cap = index_count.next_power_of_two();
+            self.item_billboard_ib = self.device.create_buffer(&BufferDescriptor {
+                label: Some("item_billboard_ib"),
+                size: (self.item_billboard_ib_cap * std::mem::size_of::<u32>()) as u64,
+                usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+    }
+
     fn render_ui(&mut self, encoder: &mut CommandEncoder, view: &TextureView, frame: &UiFrame) {
         let mut batches = Vec::new();
         for command in &frame.commands {
@@ -1695,18 +2171,12 @@ impl Renderer {
                     append_ui_geometry(&mut batches, UiBatchKind::Text, quad, quad_indices);
                 }
                 UiCommand::Text { x, y, size, text, color } => {
-                    let (mut text_vertices, text_indices) = self.font.build_text(text, *x, *y, *size);
-                    for vertex in &mut text_vertices {
-                        vertex.color = *color;
-                    }
-                    append_ui_geometry(&mut batches, UiBatchKind::Text, text_vertices, text_indices);
+                    let (verts, indices) = self.font.build_text_with_shadow(text, *x, *y, *size, *color);
+                    append_ui_geometry(&mut batches, UiBatchKind::Text, verts, indices);
                 }
                 UiCommand::CenteredText { center_x, y, size, text, color } => {
-                    let (mut text_vertices, text_indices) = self.font.build_text_centered(text, *center_x, *y, *size);
-                    for vertex in &mut text_vertices {
-                        vertex.color = *color;
-                    }
-                    append_ui_geometry(&mut batches, UiBatchKind::Text, text_vertices, text_indices);
+                    let (verts, indices) = self.font.build_text_centered_with_shadow(text, *center_x, *y, *size, *color);
+                    append_ui_geometry(&mut batches, UiBatchKind::Text, verts, indices);
                 }
                 UiCommand::Sprite { name, x, y, w, h, color } => {
                     if let Some((quad, quad_indices)) = self.gui_atlas.build_sprite(name, *x, *y, *w, *h, *color) {
@@ -1724,8 +2194,8 @@ impl Renderer {
                     }
                 }
                 UiCommand::Item { x, y, size, name: _, sprite, count, hint } => {
-                    if let Some((quad, quad_indices)) = self.gui_atlas.build_sprite(sprite, *x, *y, *size, *size, [1.0, 1.0, 1.0, 1.0]) {
-                        append_ui_geometry(&mut batches, UiBatchKind::Sprite, quad, quad_indices);
+                    if let Some((quad, quad_indices)) = self.item_atlas.build_sprite(sprite, *x, *y, *size, *size, [1.0, 1.0, 1.0, 1.0]) {
+                        append_ui_geometry(&mut batches, UiBatchKind::Item, quad, quad_indices);
                     } else {
                         let hue = (*hint % 7) as f32 / 7.0;
                         let color = [0.35 + hue * 0.45, 0.45 + (1.0 - hue) * 0.35, 0.55, 1.0];
@@ -1734,13 +2204,94 @@ impl Renderer {
                     }
                     if *count > 1 {
                         let count_text = count.to_string();
-                        let cw = *size * 0.28;
+                        let cw = *size * 0.5;
+                        let shadow_offset = 1.0;
                         let count_w = self.font.measure_text(&count_text, cw);
-                        let (mut count_vertices, count_indices) = self.font.build_text(&count_text, *x + *size - count_w - 1.0, *y + *size - cw - 1.0, cw);
+                        let cx = *x + *size - count_w - shadow_offset;
+                        let cy = *y + *size - cw - shadow_offset;
+                        let (mut shadow_vertices, shadow_indices) = self.font.build_text(&count_text, cx + shadow_offset, cy + shadow_offset, cw);
+                        for vertex in &mut shadow_vertices {
+                            vertex.color = [0.0, 0.0, 0.0, 1.0];
+                        }
+                        append_ui_geometry(&mut batches, UiBatchKind::Text, shadow_vertices, shadow_indices);
+                        let (mut count_vertices, count_indices) = self.font.build_text(&count_text, cx, cy, cw);
                         for vertex in &mut count_vertices {
                             vertex.color = [1.0, 1.0, 1.0, 1.0];
                         }
                         append_ui_geometry(&mut batches, UiBatchKind::Text, count_vertices, count_indices);
+                    }
+                }
+                UiCommand::IsometricBlock { x, y, size, count, top_tile, front_tile, right_tile } => {
+                    let s = *size;
+                    let cx = *x;
+                    let cy = *y;
+                    const TPR: f32 = 32.0;
+                    const ASF: f32 = 512.0;
+                    const TSF: f32 = 16.0;
+                    const INS: f32 = 0.5 / ASF;
+
+                    let tile_uv = |tile: u32| -> [f32; 4] {
+                        let tx = (tile as f32 % TPR) * TSF;
+                        let ty = (tile as f32 / TPR).floor() * TSF;
+                        [tx / ASF + INS, ty / ASF + INS, (tx + TSF) / ASF - INS, (ty + TSF) / ASF - INS]
+                    };
+                    let project = |px: f32, py: f32, pz: f32| -> (f32, f32) {
+                        let sx = (px - pz) * s * 0.5;
+                        let sy = (px + pz) * s * 0.25 - py * s * 0.5;
+                        (cx + sx, cy + sy)
+                    };
+                    let top_uv = tile_uv(*top_tile);
+                    let front_uv = tile_uv(*front_tile);
+                    let right_uv = tile_uv(*right_tile);
+                    // Top face: v7(front-left) -> v3(back-left) -> v2(back-right) -> v6(front-right)
+                    let (t0x, t0y) = project(-0.5, 0.5, 0.5);  // v7
+                    let (t1x, t1y) = project(-0.5, 0.5, -0.5); // v3
+                    let (t2x, t2y) = project(0.5, 0.5, -0.5);  // v2
+                    let (t3x, t3y) = project(0.5, 0.5, 0.5);   // v6
+                    // Front face: v7 -> v6 -> v5 -> v4
+                    let f_uv = front_uv;
+                    let (f0x, f0y) = project(-0.5, 0.5, 0.5);   // v7
+                    let (f1x, f1y) = project(0.5, 0.5, 0.5);    // v6
+                    let (f2x, f2y) = project(0.5, -0.5, 0.5);   // v5
+                    let (f3x, f3y) = project(-0.5, -0.5, 0.5);  // v4
+                    // Right face: v2 -> v6 -> v5 -> v1
+                    let r_uv = right_uv;
+                    let (r0x, r0y) = project(0.5, 0.5, -0.5);   // v2
+                    let (r1x, r1y) = project(0.5, 0.5, 0.5);    // v6
+                    let (r2x, r2y) = project(0.5, -0.5, 0.5);   // v5
+                    let (r3x, r3y) = project(0.5, -0.5, -0.5);  // v1
+                    let iso_verts = vec![
+                        TextVertex { pos: [t0x, t0y], uv: [top_uv[0], top_uv[3]], color: [1.0; 4] },
+                        TextVertex { pos: [t1x, t1y], uv: [top_uv[0], top_uv[1]], color: [1.0; 4] },
+                        TextVertex { pos: [t2x, t2y], uv: [top_uv[2], top_uv[1]], color: [1.0; 4] },
+                        TextVertex { pos: [t3x, t3y], uv: [top_uv[2], top_uv[3]], color: [1.0; 4] },
+                        TextVertex { pos: [f0x, f0y], uv: [f_uv[0], f_uv[1]], color: [1.0; 4] },
+                        TextVertex { pos: [f1x, f1y], uv: [f_uv[2], f_uv[1]], color: [1.0; 4] },
+                        TextVertex { pos: [f2x, f2y], uv: [f_uv[2], f_uv[3]], color: [1.0; 4] },
+                        TextVertex { pos: [f3x, f3y], uv: [f_uv[0], f_uv[3]], color: [1.0; 4] },
+                        TextVertex { pos: [r0x, r0y], uv: [r_uv[0], r_uv[1]], color: [1.0; 4] },
+                        TextVertex { pos: [r1x, r1y], uv: [r_uv[2], r_uv[1]], color: [1.0; 4] },
+                        TextVertex { pos: [r2x, r2y], uv: [r_uv[2], r_uv[3]], color: [1.0; 4] },
+                        TextVertex { pos: [r3x, r3y], uv: [r_uv[0], r_uv[3]], color: [1.0; 4] },
+                    ];
+                    let iso_indices: Vec<u32> = (0..3).flat_map(|f| {
+                        let b = f as u32 * 4;
+                        vec![b, b + 1, b + 2, b, b + 2, b + 3]
+                    }).collect();
+                    append_ui_geometry(&mut batches, UiBatchKind::IsometricBlock, iso_verts, iso_indices);
+                    if *count > 1 {
+                        let count_text = count.to_string();
+                        let cw = s * 0.5;
+                        let shadow_offset = 1.0;
+                        let count_w = self.font.measure_text(&count_text, cw);
+                        let isox = cx + s * 0.5 - count_w - shadow_offset;
+                        let isoy = cy + s * 0.5 - cw - shadow_offset;
+                        let (mut sh_vert, sh_idx) = self.font.build_text(&count_text, isox + shadow_offset, isoy + shadow_offset, cw);
+                        for v in &mut sh_vert { v.color = [0.0, 0.0, 0.0, 1.0]; }
+                        append_ui_geometry(&mut batches, UiBatchKind::Text, sh_vert, sh_idx);
+                        let (mut fg_vert, fg_idx) = self.font.build_text(&count_text, isox, isoy, cw);
+                        for v in &mut fg_vert { v.color = [1.0; 4]; }
+                        append_ui_geometry(&mut batches, UiBatchKind::Text, fg_vert, fg_idx);
                     }
                 }
             }
@@ -1752,10 +2303,16 @@ impl Renderer {
         let mut text_indices = Vec::new();
         let mut sprite_vertices = Vec::new();
         let mut sprite_indices = Vec::new();
+        let mut item_vertices = Vec::new();
+        let mut item_indices = Vec::new();
+        let mut iso_vertices = Vec::new();
+        let mut iso_indices = Vec::new();
         let mut draw_batches = Vec::with_capacity(batches.len());
         for batch in batches {
             let (vertices, indices) = match batch.kind {
                 UiBatchKind::Sprite => (&mut sprite_vertices, &mut sprite_indices),
+                UiBatchKind::Item => (&mut item_vertices, &mut item_indices),
+                UiBatchKind::IsometricBlock => (&mut iso_vertices, &mut iso_indices),
                 UiBatchKind::Text => (&mut text_vertices, &mut text_indices),
             };
             let vertex_base = vertices.len() as u32;
@@ -1772,6 +2329,8 @@ impl Renderer {
             text_vertices.len().max(sprite_vertices.len()),
             text_indices.len().max(sprite_indices.len()),
         );
+        self.ensure_item_gui_capacity(item_vertices.len(), item_indices.len());
+        self.ensure_iso_capacity(iso_vertices.len(), iso_indices.len());
         let width = self.size.0.max(1) as f32;
         let height = self.size.1.max(1) as f32;
         let ortho: [[f32; 4]; 4] = [
@@ -1789,6 +2348,14 @@ impl Renderer {
             self.queue.write_buffer(&self.overlay_vb, 0, bytemuck::cast_slice(&text_vertices));
             self.queue.write_buffer(&self.overlay_ib, 0, bytemuck::cast_slice(&text_indices));
         }
+        if !item_vertices.is_empty() {
+            self.queue.write_buffer(&self.item_gui_vb, 0, bytemuck::cast_slice(&item_vertices));
+            self.queue.write_buffer(&self.item_gui_ib, 0, bytemuck::cast_slice(&item_indices));
+        }
+        if !iso_vertices.is_empty() {
+            self.queue.write_buffer(&self.iso_vb, 0, bytemuck::cast_slice(&iso_vertices));
+            self.queue.write_buffer(&self.iso_ib, 0, bytemuck::cast_slice(&iso_indices));
+        }
         for batch in draw_batches {
             match batch.kind {
                 UiBatchKind::Sprite => {
@@ -1803,6 +2370,34 @@ impl Renderer {
                     pass.set_bind_group(0, &self.gui_bind_group, &[]);
                     pass.set_vertex_buffer(0, self.gui_vb.slice(..));
                     pass.set_index_buffer(self.gui_ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(batch.index_start..batch.index_end, 0, 0..1);
+                }
+                UiBatchKind::Item => {
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("ui_item_pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment { view, resolve_target: None, ops: Operations { load: LoadOp::Load, store: StoreOp::Store } })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.gui_pipeline);
+                    pass.set_bind_group(0, &self.item_gui_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.item_gui_vb.slice(..));
+                    pass.set_index_buffer(self.item_gui_ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(batch.index_start..batch.index_end, 0, 0..1);
+                }
+                UiBatchKind::IsometricBlock => {
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("ui_isometric_pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment { view, resolve_target: None, ops: Operations { load: LoadOp::Load, store: StoreOp::Store } })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.gui_pipeline);
+                    pass.set_bind_group(0, &self.terrain_gui_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.iso_vb.slice(..));
+                    pass.set_index_buffer(self.iso_ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(batch.index_start..batch.index_end, 0, 0..1);
                 }
                 UiBatchKind::Text => {
@@ -1821,6 +2416,55 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    fn build_item_billboards(&self, ctx: &RenderContext) -> (Vec<Vertex>, Vec<u32>) {
+        let mut billboards: Vec<&WorldBillboard> = ctx.world_billboards.iter().collect();
+        let camera_pos = ctx.camera.position.coords;
+        billboards.sort_by(|a, b| {
+            let a_pos = nalgebra::Vector3::from(a.position);
+            let b_pos = nalgebra::Vector3::from(b.position);
+            (b_pos - camera_pos)
+                .norm_squared()
+                .partial_cmp(&(a_pos - camera_pos).norm_squared())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut vertices = Vec::with_capacity(billboards.len() * 4);
+        let mut indices = Vec::with_capacity(billboards.len() * 6);
+        let right = ctx.camera.right().normalize() * 0.18;
+        let up = right.cross(&ctx.camera.forward()).normalize() * 0.18;
+        for billboard in billboards {
+            let Some([u0, v0, u1, v1]) = self.item_atlas.sprite_uv(&billboard.sprite) else {
+                continue;
+            };
+            let bob = (ctx.game_time * 2.0 + billboard.position[0] * 0.73 + billboard.position[2] * 0.37)
+                .sin()
+                * 0.05;
+            let center = nalgebra::Vector3::new(
+                billboard.position[0],
+                billboard.position[1] + 0.18 + bob,
+                billboard.position[2],
+            );
+            let base = vertices.len() as u32;
+            let normal: [f32; 3] = ctx.camera.forward().into();
+            for (position, uv) in [
+                (center - right + up, [u0, v0]),
+                (center + right + up, [u1, v0]),
+                (center + right - up, [u1, v1]),
+                (center - right - up, [u0, v1]),
+            ] {
+                vertices.push(Vertex {
+                    pos: position.into(),
+                    uv,
+                    normal,
+                    tex_index: 0,
+                    light_data: 0,
+                });
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        (vertices, indices)
     }
 
     fn render_overlay(
@@ -1903,22 +2547,6 @@ impl Renderer {
     fn render_crosshair(&mut self, encoder: &mut CommandEncoder, view: &TextureView) {
         let cx = self.size.0 as f32 * 0.5;
         let cy = self.size.1 as f32 * 0.5;
-        let mut vertices = Vec::with_capacity(16);
-        let mut indices = Vec::with_capacity(24);
-        for (x, y, w, h, color) in [
-            (cx - 6.0, cy - 1.5, 12.0, 3.0, [0.0, 0.0, 0.0, 0.75]),
-            (cx - 1.5, cy - 6.0, 3.0, 12.0, [0.0, 0.0, 0.0, 0.75]),
-            (cx - 5.0, cy - 0.5, 10.0, 1.0, [1.0, 1.0, 1.0, 1.0]),
-            (cx - 0.5, cy - 5.0, 1.0, 10.0, [1.0, 1.0, 1.0, 1.0]),
-        ] {
-            let (quad, quad_indices) = self.font.build_colored_rect(x, y, w, h, color);
-            let base = vertices.len() as u32;
-            vertices.extend(quad);
-            indices.extend(quad_indices.into_iter().map(|index| index + base));
-        }
-        self.queue.write_buffer(&self.overlay_vb, 0, bytemuck::cast_slice(&vertices));
-        self.queue.write_buffer(&self.overlay_ib, 0, bytemuck::cast_slice(&indices));
-
         let width = self.size.0 as f32;
         let height = self.size.1 as f32;
         let ortho: [[f32; 4]; 4] = [
@@ -1929,22 +2557,75 @@ impl Renderer {
         ];
         self.queue.write_buffer(&self.text_uniform_buffer, 0, bytemuck::cast_slice(&[ortho]));
 
-        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-            label: Some("crosshair_pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view,
-                resolve_target: None,
-                ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        pass.set_pipeline(&self.text_pipeline);
-        pass.set_bind_group(0, &self.text_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.overlay_vb.slice(..));
-        pass.set_index_buffer(self.overlay_ib.slice(..), IndexFormat::Uint32);
-        pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+        // Outline pass — black outline using normal alpha blending
+        {
+            let mut outline_verts = Vec::with_capacity(8);
+            let mut outline_idx = Vec::with_capacity(12);
+            for (x, y, w, h, color) in [
+                (cx - 6.0, cy - 1.5, 12.0, 3.0, [0.0, 0.0, 0.0, 0.75]),
+                (cx - 1.5, cy - 6.0, 3.0, 12.0, [0.0, 0.0, 0.0, 0.75]),
+            ] {
+                let (quad, quad_indices) = self.font.build_colored_rect(x, y, w, h, color);
+                let base = outline_verts.len() as u32;
+                outline_verts.extend(quad);
+                outline_idx.extend(quad_indices.into_iter().map(|i| i + base));
+            }
+            if !outline_verts.is_empty() {
+                self.queue.write_buffer(&self.overlay_vb, 0, bytemuck::cast_slice(&outline_verts));
+                self.queue.write_buffer(&self.overlay_ib, 0, bytemuck::cast_slice(&outline_idx));
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("crosshair_outline_pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.text_pipeline);
+                pass.set_bind_group(0, &self.text_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.overlay_vb.slice(..));
+                pass.set_index_buffer(self.overlay_ib.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..outline_idx.len() as u32, 0, 0..1);
+            }
+        }
+
+        // Invert pass — white fill inverts the background color
+        {
+            let mut fill_verts = Vec::with_capacity(8);
+            let mut fill_idx = Vec::with_capacity(12);
+            for (x, y, w, h, color) in [
+                (cx - 5.0, cy - 0.5, 10.0, 1.0, [1.0, 1.0, 1.0, 1.0]),
+                (cx - 0.5, cy - 5.0, 1.0, 10.0, [1.0, 1.0, 1.0, 1.0]),
+            ] {
+                let (quad, quad_indices) = self.font.build_colored_rect(x, y, w, h, color);
+                let base = fill_verts.len() as u32;
+                fill_verts.extend(quad);
+                fill_idx.extend(quad_indices.into_iter().map(|i| i + base));
+            }
+            if !fill_verts.is_empty() {
+                self.queue.write_buffer(&self.overlay_vb, 0, bytemuck::cast_slice(&fill_verts));
+                self.queue.write_buffer(&self.overlay_ib, 0, bytemuck::cast_slice(&fill_idx));
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("crosshair_invert_pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.crosshair_invert_pipeline);
+                pass.set_bind_group(0, &self.text_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.overlay_vb.slice(..));
+                pass.set_index_buffer(self.overlay_ib.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..fill_idx.len() as u32, 0, 0..1);
+            }
+        }
     }
 
     /// Temporary first-person arm silhouette. It deliberately uses the shared
@@ -2090,6 +2771,24 @@ impl Renderer {
             label: Some("render_encoder"),
         });
 
+        let (item_billboard_vertices, item_billboard_indices) = self.build_item_billboards(ctx);
+        if !item_billboard_vertices.is_empty() {
+            self.ensure_item_billboard_capacity(
+                item_billboard_vertices.len(),
+                item_billboard_indices.len(),
+            );
+            self.queue.write_buffer(
+                &self.item_billboard_vb,
+                0,
+                bytemuck::cast_slice(&item_billboard_vertices),
+            );
+            self.queue.write_buffer(
+                &self.item_billboard_ib,
+                0,
+                bytemuck::cast_slice(&item_billboard_indices),
+            );
+        }
+
         // Shadow pass: render depth from sun's POV
         {
             let mut spass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -2117,12 +2816,19 @@ impl Renderer {
             }
         }
 
-        // Main pass
+        // Determine render target: scene texture (if blur) or output surface
+        let main_target = if self.blur_enabled && self.blur_intensity > 0.0 {
+            &self.scene_view
+        } else {
+            &view
+        };
+
+        // Main pass - render scene to main_target
         {
             let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("main_rpass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
+                    view: main_target,
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Clear(wgpu::Color::BLACK),
@@ -2194,6 +2900,13 @@ impl Renderer {
                     rpass.draw_indexed(0..data.transparent_num_indices, 0, 0..1);
                 }
             }
+            if !item_billboard_indices.is_empty() {
+                rpass.set_pipeline(&self.item_billboard_pipeline);
+                rpass.set_bind_group(0, &self.item_billboard_bind_group, &[]);
+                rpass.set_vertex_buffer(0, self.item_billboard_vb.slice(..));
+                rpass.set_index_buffer(self.item_billboard_ib.slice(..), IndexFormat::Uint32);
+                rpass.draw_indexed(0..item_billboard_indices.len() as u32, 0, 0..1);
+            }
             if let Some(hl) = ctx.highlight {
                 rpass.set_pipeline(&self.highlight_pipeline);
                 rpass.set_bind_group(0, &self.highlight_bind_group, &[]);
@@ -2212,6 +2925,26 @@ impl Renderer {
                 rpass.set_vertex_buffer(0, border_buf.slice(..));
                 rpass.draw(0..*border_count, 0..1);
             }
+        }
+
+        // Blit pass: if blur enabled, render scene texture to output with blur
+        if self.blur_enabled && self.blur_intensity > 0.0 {
+            let blur_data = [self.blur_intensity, 0.0, 0.0, 0.0];
+            self.queue.write_buffer(&self.blur_uniform_buffer, 0, bytemuck::cast_slice(&[blur_data]));
+            let mut bpass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("blit_rpass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Clear(wgpu::Color::BLACK), store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            bpass.set_pipeline(&self.blit_pipeline);
+            bpass.set_bind_group(0, &self.blit_bind_group, &[]);
+            bpass.draw(0..3, 0..1);
         }
 
         let sw = self.size.0 as f32;

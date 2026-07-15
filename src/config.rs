@@ -278,7 +278,9 @@ fn parse_key(action: &str, key: &str) -> Result<KeyCode, ConfigError> {
     let code = match key {
         "KeyW" => KeyCode::KeyW, "KeyA" => KeyCode::KeyA, "KeyS" => KeyCode::KeyS, "KeyD" => KeyCode::KeyD,
         "KeyE" => KeyCode::KeyE, "KeyQ" => KeyCode::KeyQ, "KeyT" => KeyCode::KeyT,
-        "Space" => KeyCode::Space, "ShiftLeft" => KeyCode::ShiftLeft, "ControlLeft" => KeyCode::ControlLeft,
+        "Space" => KeyCode::Space,
+        "ShiftLeft" => KeyCode::ShiftLeft, "ShiftRight" => KeyCode::ShiftRight,
+        "ControlLeft" => KeyCode::ControlLeft, "ControlRight" => KeyCode::ControlRight,
         "Slash" => KeyCode::Slash,
         _ => return Err(ConfigError::Message(format!("unsupported key `{key}` for `{action}`"))),
     };

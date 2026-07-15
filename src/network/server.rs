@@ -746,13 +746,26 @@ impl HeadlessServer {
             state.yaw = input.yaw;
             state.pitch = input.pitch;
             state.player.sneaking = input.sneak;
-            if input.jump && state.player.on_ground {
-                state.player.vy = JUMP_SPEED;
-                state.player.on_ground = false;
-            }
-            let speed = if input.sneak { SNEAK_SPEED } else if input.sprint { WALK_SPEED * SPRINT_MULT } else { WALK_SPEED };
             let dt = 0.05;
-            state.player.vy = (state.player.vy + GRAVITY * dt).max(crate::player::TERMINAL_VELOCITY);
+            let in_water = state.player.is_in_water(&self.world);
+            if in_water {
+                state.player.update_water_vertical_velocity(input.jump, input.sneak, dt);
+            } else {
+                if input.jump && state.player.on_ground {
+                    state.player.vy = JUMP_SPEED;
+                    state.player.on_ground = false;
+                }
+                state.player.vy = (state.player.vy + GRAVITY * dt).max(crate::player::TERMINAL_VELOCITY);
+            }
+            let speed = if in_water {
+                crate::player::SWIM_SPEED
+            } else if input.sneak {
+                SNEAK_SPEED
+            } else if input.sprint {
+                WALK_SPEED * SPRINT_MULT
+            } else {
+                WALK_SPEED
+            };
             state.player.try_move_with_difficulty(
                 input.movement[0] * speed * dt,
                 state.player.vy * dt,
@@ -1410,11 +1423,9 @@ mod tests {
 
         for _ in 0..100 {
             server.poll().unwrap();
-            if server.connected_sessions() == 1 {
-                break;
-            }
             thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(server.connected_sessions(), 1);
         assert_eq!(
             read_message(&mut client),
             ServerMessage::Welcome {
@@ -1432,11 +1443,11 @@ mod tests {
         client
             .write_all(&encode_client(&ClientMessage::KeepAlive { nonce: 9 }).unwrap())
             .unwrap();
+        // A connected session does not prove that its newly written frame was
+        // accepted and echoed. Poll long enough for the nonblocking server to
+        // read and flush this specific request before attempting the read.
         for _ in 0..100 {
             server.poll().unwrap();
-            if server.connected_sessions() == 1 {
-                break;
-            }
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(
@@ -1490,11 +1501,9 @@ mod tests {
         client.write_all(&hello).unwrap();
         for _ in 0..100 {
             server.poll().unwrap();
-            if server.connected_sessions() == 1 {
-                break;
-            }
             thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(server.connected_sessions(), 1);
         let _welcome = read_message(&mut client);
         let _inventory = read_message(&mut client);
         let _spawn = read_message(&mut client);
@@ -1611,11 +1620,9 @@ mod tests {
             .unwrap();
         for _ in 0..100 {
             server.poll().unwrap();
-            if server.connected_sessions() == 1 {
-                break;
-            }
             thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(server.connected_sessions(), 1);
         let _welcome = read_message(&mut client);
         let _initial_inventory = read_message(&mut client);
         let _spawn = read_message(&mut client);

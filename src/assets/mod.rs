@@ -3,6 +3,7 @@ pub mod model;
 pub mod texture_map;
 pub mod reader;
 pub mod gui_atlas;
+pub mod item_atlas;
 pub mod lang;
 
 use std::collections::HashMap;

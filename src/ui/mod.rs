@@ -40,6 +40,9 @@ pub struct UiSlot {
     pub empty: bool,
     pub selected: bool,
     pub hint: u32,
+    /// When Some([top, front, right]), the item is a block and should be drawn
+    /// as an isometric 3D cube using the terrain atlas tiles.
+    pub block_tiles: Option<[u32; 3]>,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +94,15 @@ pub enum UiCommand {
         count: u16,
         hint: u32,
     },
+    IsometricBlock {
+        x: f32,
+        y: f32,
+        size: f32,
+        count: u16,
+        top_tile: u32,
+        front_tile: u32,
+        right_tile: u32,
+    },
     NineSlice {
         sprite: String,
         x: f32,
@@ -125,6 +137,7 @@ pub struct UiState {
     pub connect_username: String,
     pub connect_field: usize,
     pub loading_progress: f32,
+    pub blur_intensity: f32,
 }
 
 impl Default for UiState {
@@ -146,17 +159,43 @@ impl Default for UiState {
             connect_username: "Player".to_string(),
             connect_field: 0,
             loading_progress: 0.0,
+            blur_intensity: 3.0,
         }
     }
 }
 
+const GUI_SCALE_VALUES: &[f32] = &[1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0];
+
 impl UiState {
+    fn next_gui_scale(&mut self) {
+        if let Some(pos) = GUI_SCALE_VALUES.iter().position(|&s| (s - self.gui_scale).abs() < f32::EPSILON) {
+            self.gui_scale = GUI_SCALE_VALUES[(pos + 1) % GUI_SCALE_VALUES.len()];
+        } else {
+            self.gui_scale = GUI_SCALE_VALUES[0];
+        }
+    }
+    fn prev_gui_scale(&mut self) {
+        if let Some(pos) = GUI_SCALE_VALUES.iter().position(|&s| (s - self.gui_scale).abs() < f32::EPSILON) {
+            self.gui_scale = GUI_SCALE_VALUES[(pos + GUI_SCALE_VALUES.len() - 1) % GUI_SCALE_VALUES.len()];
+        } else {
+            self.gui_scale = GUI_SCALE_VALUES[GUI_SCALE_VALUES.len() - 1];
+        }
+    }
     pub fn new(render_distance: i32, graphics_vibrant: bool, screen_height: f32) -> Self {
-        let auto_scale = if screen_height >= 1080.0 { 3 } else if screen_height >= 720.0 { 2 } else { 1 };
+        // Pick closest GUI scale from available values based on screen height.
+        // Minecraft formula: scale = floor(min(width, height) / 427), but we snap to our discrete set.
+        let ideal = (screen_height / 360.0).round().max(1.0);
+        let auto_scale = GUI_SCALE_VALUES
+            .iter()
+            .copied()
+            .min_by(|a, b| {
+                (a - ideal).abs().partial_cmp(&(b - ideal).abs()).unwrap()
+            })
+            .unwrap_or(2.0);
         Self {
             render_distance,
             graphics_vibrant,
-            gui_scale: auto_scale as f32,
+            gui_scale: auto_scale,
             ..Self::default()
         }
     }
@@ -205,14 +244,19 @@ impl UiState {
         match self.screen {
             UiScreen::Playing => self.open_pause(),
             UiScreen::Inventory | UiScreen::Pause => self.close_to_gameplay(),
-            UiScreen::Options | UiScreen::Controls | UiScreen::Accessibility => {
-                self.screen = UiScreen::Pause;
+            UiScreen::Options | UiScreen::Controls => {
+                self.screen = self.prev_screen.unwrap_or(UiScreen::Pause);
+                self.prev_screen = None;
+                self.selected = 0;
+                self.keyboard_focus = None;
+            }
+            UiScreen::Accessibility => {
+                self.screen = UiScreen::Options;
                 self.selected = 0;
                 self.keyboard_focus = None;
             }
             UiScreen::Connect => {
-                self.screen = self.prev_screen.unwrap_or(UiScreen::Pause);
-                self.prev_screen = None;
+                self.screen = UiScreen::Title;
                 self.selected = 0;
                 self.keyboard_focus = None;
             }
@@ -237,10 +281,11 @@ impl UiState {
             .iter()
             .enumerate()
             .find(|(_, rect)| contains(**rect, x, y))
-            .map(|(index, _)| {
+            .map(|(index, rect)| {
+                let left = x < (rect.0 + rect.2 * 0.5);
                 self.selected = index;
                 self.keyboard_focus = None;
-                self.activate(index)
+                self.activate_with_direction(index, left)
             })
             .unwrap_or(UiAction::None)
     }
@@ -248,7 +293,7 @@ impl UiState {
     fn button_count(&self) -> usize {
         match self.screen {
             UiScreen::Pause => 4,
-            UiScreen::Options => 7,
+            UiScreen::Options => 9,
             UiScreen::Controls => 2,
             UiScreen::Accessibility => 5,
             UiScreen::Connect => 2,
@@ -258,6 +303,10 @@ impl UiState {
     }
 
     fn activate(&mut self, index: usize) -> UiAction {
+        self.activate_with_direction(index, false)
+    }
+
+    fn activate_with_direction(&mut self, index: usize, left: bool) -> UiAction {
         match self.screen {
             UiScreen::Pause => match index {
                 0 => {
@@ -265,6 +314,7 @@ impl UiState {
                     UiAction::Resume
                 }
                 1 => {
+                    self.prev_screen = Some(self.screen);
                     self.screen = UiScreen::Options;
                     self.selected = 0;
                     self.keyboard_focus = None;
@@ -285,11 +335,15 @@ impl UiState {
                     UiAction::ToggleGraphics
                 }
                 1 => {
-                    if self.render_distance > 2 { self.render_distance -= 1; }
-                    UiAction::DecreaseRenderDistance
+                    if self.render_distance > 2 && left {
+                        self.render_distance -= 1;
+                    } else if self.render_distance < 32 && !left {
+                        self.render_distance += 1;
+                    }
+                    if left { UiAction::DecreaseRenderDistance } else { UiAction::IncreaseRenderDistance }
                 }
                 2 => {
-                    self.gui_scale = if self.gui_scale >= 3.0 { 1.0 } else { self.gui_scale + 1.0 };
+                    if left { self.prev_gui_scale(); } else { self.next_gui_scale(); }
                     UiAction::ToggleGuiScale
                 }
                 3 => {
@@ -301,13 +355,22 @@ impl UiState {
                     UiAction::None
                 }
                 5 => {
+                    if left {
+                        self.blur_intensity = (self.blur_intensity - 1.0).max(0.0);
+                    } else {
+                        self.blur_intensity = (self.blur_intensity + 1.0).min(10.0);
+                    }
+                    UiAction::None
+                }
+                6 => {
                     self.screen = UiScreen::Accessibility;
                     self.selected = 0;
                     self.keyboard_focus = None;
                     UiAction::None
                 }
-                6 => {
-                    self.screen = UiScreen::Pause;
+                7 => {
+                    self.screen = self.prev_screen.unwrap_or(UiScreen::Pause);
+                    self.prev_screen = None;
                     self.selected = 0;
                     self.keyboard_focus = None;
                     UiAction::None
@@ -328,7 +391,7 @@ impl UiState {
                     UiAction::None
                 }
                 3 => {
-                    self.gui_scale = if self.gui_scale >= 3.0 { 1.0 } else { self.gui_scale + 1.0 };
+                    if left { self.prev_gui_scale(); } else { self.next_gui_scale(); }
                     UiAction::ToggleGuiScale
                 }
                 4 => {
@@ -342,7 +405,8 @@ impl UiState {
             UiScreen::Controls => match index {
                 0 => UiAction::None,
                 1 => {
-                    self.screen = UiScreen::Pause;
+                    self.screen = self.prev_screen.unwrap_or(UiScreen::Pause);
+                    self.prev_screen = None;
                     self.selected = 0;
                     self.keyboard_focus = None;
                     UiAction::None
@@ -355,13 +419,13 @@ impl UiState {
                     UiAction::StartGame
                 }
                 1 => {
-                    self.prev_screen = Some(self.screen);
                     self.screen = UiScreen::Connect;
                     self.selected = 0;
                     self.keyboard_focus = None;
                     UiAction::None
                 }
                 2 => {
+                    self.prev_screen = Some(self.screen);
                     self.screen = UiScreen::Options;
                     self.selected = 0;
                     self.keyboard_focus = None;
@@ -373,8 +437,7 @@ impl UiState {
             UiScreen::Connect => match index {
                 0 => UiAction::ConnectServer,
                 1 => {
-                    self.screen = self.prev_screen.unwrap_or(UiScreen::Pause);
-                    self.prev_screen = None;
+                    self.screen = UiScreen::Title;
                     self.selected = 0;
                     self.keyboard_focus = None;
                     UiAction::None
@@ -394,6 +457,20 @@ impl UiState {
             KeyCode::ArrowDown => {
                 self.move_focus(1);
                 UiAction::None
+            }
+            KeyCode::ArrowLeft => {
+                if self.screen == UiScreen::Options {
+                    self.activate_with_direction(self.selected, true)
+                } else {
+                    UiAction::None
+                }
+            }
+            KeyCode::ArrowRight => {
+                if self.screen == UiScreen::Options {
+                    self.activate_with_direction(self.selected, false)
+                } else {
+                    UiAction::None
+                }
             }
             KeyCode::Tab => {
                 if self.screen == UiScreen::Connect {
@@ -438,7 +515,7 @@ impl UiState {
     }
 
     fn button_rects(&self, width: f32, height: f32) -> Vec<(f32, f32, f32, f32)> {
-        let button_w = (width * 0.34).clamp(240.0, 420.0);
+        let button_w = self.button_width(width);
         let button_h = 20.0 * self.gui_scale;
         let gap = 4.0 * self.gui_scale;
         let left = (width - button_w) * 0.5;
@@ -451,6 +528,16 @@ impl UiState {
                 (left, y, button_w, button_h)
             })
             .collect()
+    }
+
+    /// The authored widget is 200×20. Keep that aspect ratio at every GUI
+    /// scale so large UI uses a larger whole texture rather than a narrow,
+    /// horizontally stretched nine-slice button.
+    fn button_width(&self, viewport_width: f32) -> f32 {
+        let scale = self.gui_scale;
+        let desired = 200.0 * scale;
+        let available = (viewport_width - 32.0 * scale).max(1.0);
+        desired.min(available)
     }
 
     pub fn frame(
@@ -616,6 +703,41 @@ fn draw_loading(frame: &mut UiFrame, width: f32, height: f32, scale: f32, progre
     });
 }
 
+// Vanilla slots are 18px with a beveled inner area of about 16px.
+// A 12px icon occupies ~75% of the inner area and leaves consistent padding.
+const ITEM_ICON_SIZE: f32 = 14.0;
+
+fn draw_slot_item(frame: &mut UiFrame, x: f32, y: f32, scale: f32, item: &UiSlot) {
+    if item.empty {
+        return;
+    }
+    let inset = (16.0 - ITEM_ICON_SIZE) * 0.5 * scale;
+    if let Some([top, front, right]) = item.block_tiles {
+        // Isometric 3D block rendering using terrain atlas tiles
+        let s = ITEM_ICON_SIZE * scale;
+        frame.commands.push(UiCommand::IsometricBlock {
+            x: x + inset + s * 0.5,
+            y: y + inset + s * 0.5,
+            size: s,
+            count: item.count,
+            top_tile: top,
+            front_tile: front,
+            right_tile: right,
+        });
+    } else {
+        // Flat 2D sprite
+        frame.commands.push(UiCommand::Item {
+            x: x + inset,
+            y: y + inset,
+            size: ITEM_ICON_SIZE * scale,
+            name: item.name.clone(),
+            sprite: item.sprite.clone(),
+            count: item.count,
+            hint: item.hint,
+        });
+    }
+}
+
 fn draw_hud(frame: &mut UiFrame, width: f32, height: f32, scale: f32, hotbar: &[UiSlot], health: f32, hunger: f32, armor: f32, experience: f32, _selected_item_name: &str, show_crosshair: bool) {
     let bar_w = 182.0 * scale;
     let bar_h = 22.0 * scale;
@@ -645,88 +767,109 @@ fn draw_hud(frame: &mut UiFrame, width: f32, height: f32, scale: f32, hotbar: &[
         color: [1.0, 1.0, 1.0, 1.0],
     });
     for index in 0..9 {
-        let x = left + index as f32 * 20.0 * scale - 1.0 * scale;
+        let slot_left = left + (index as f32 * 20.0 + 3.0) * scale;
         if hotbar.get(index).map(|item| item.selected).unwrap_or(false) {
             frame.commands.push(UiCommand::Sprite {
                 name: "hud/hotbar_selection".to_string(),
-                x,
-                y: top - 0.5 * scale,
+                x: slot_left - 3.0 * scale,
+                y: top - 1.0 * scale,
                 w: 24.0 * scale,
-                h: 23.0 * scale,
+                h: 24.0 * scale,
                 color: [1.0, 1.0, 1.0, 1.0],
             });
         }
         if let Some(item) = hotbar.get(index).filter(|item| !item.empty) {
-            frame.commands.push(UiCommand::Item {
-                x: left + (2.0 + index as f32 * 20.0) * scale,
-                y: top + 3.0 * scale,
-                size: 16.0 * scale,
-                name: item.name.clone(),
-                sprite: item.sprite.clone(),
-                count: item.count,
-                hint: item.hint,
-            });
+            draw_slot_item(frame, slot_left, top + 3.0 * scale, scale, item);
         }
     }
 
     // Status bars row: health left, armor middle, food right
-    let status_y = top - 11.0 * scale;
+    let status_y = top - 13.0 * scale;
     let half_width = 91.0 * scale;
 
-    // Health bar (left side)
+    // Health bar (left side) - always render container background then fill/half overlay
     let health_left = width * 0.5 - half_width;
     for index in 0..10 {
-        let health_sprite = if health >= index as f32 * 2.0 + 2.0 {
-            "hud/heart/full"
-        } else if health > index as f32 * 2.0 {
-            "hud/heart/half"
-        } else {
-            "hud/heart/container"
-        };
+        let hx = health_left + index as f32 * 8.0 * scale;
+        // Background container (always same size)
         frame.commands.push(UiCommand::Sprite {
-            name: health_sprite.to_string(),
-            x: health_left + index as f32 * 9.0 * scale,
+            name: "hud/heart/container".to_string(),
+            x: hx,
             y: status_y,
             w: 9.0 * scale,
             h: 9.0 * scale,
             color: [1.0, 1.0, 1.0, 1.0],
         });
+        // Fill/half overlay
+        if health >= index as f32 * 2.0 + 2.0 {
+            frame.commands.push(UiCommand::Sprite {
+                name: "hud/heart/full".to_string(),
+                x: hx,
+                y: status_y,
+                w: 9.0 * scale,
+                h: 9.0 * scale,
+                color: [1.0, 1.0, 1.0, 1.0],
+            });
+        } else if health > index as f32 * 2.0 {
+            frame.commands.push(UiCommand::Sprite {
+                name: "hud/heart/half".to_string(),
+                x: hx,
+                y: status_y,
+                w: 9.0 * scale,
+                h: 9.0 * scale,
+                color: [1.0, 1.0, 1.0, 1.0],
+            });
+        }
     }
 
     // Armor bar (between health and food) - rendered as colored rects
     // since armor sprites may not be available in all asset packs
     if armor > 0.0 {
         let armor_icons = (armor / 2.0).ceil() as usize;
-        let armor_width = armor_icons as f32 * 9.0 * scale;
+        let armor_width = armor_icons as f32 * 8.0 * scale;
         let armor_left = (width - armor_width) * 0.5;
         for index in 0..armor_icons {
             let filled = armor >= index as f32 * 2.0 + 2.0;
             let color = if filled { [0.35, 0.50, 0.70, 1.0] } else { [0.15, 0.20, 0.30, 0.8] };
-            rect(frame, armor_left + index as f32 * 9.0 * scale, status_y, 9.0 * scale, 9.0 * scale, color);
+            rect(frame, armor_left + index as f32 * 8.0 * scale, status_y, 9.0 * scale, 9.0 * scale, color);
             if !filled {
-                rect(frame, armor_left + index as f32 * 9.0 * scale + 1.0, status_y + 1.0, 7.0 * scale, 7.0 * scale, [0.0, 0.0, 0.0, 0.5]);
+                rect(frame, armor_left + index as f32 * 8.0 * scale + 1.0, status_y + 1.0, 7.0 * scale, 7.0 * scale, [0.0, 0.0, 0.0, 0.5]);
             }
         }
     }
 
     // Food bar (right side)
-    let food_left = width * 0.5 + half_width - 9.0 * 9.0 * scale;
+    let food_left = width * 0.5 + half_width - 81.0 * scale;
     for index in 0..10 {
-        let hunger_sprite = if hunger >= index as f32 * 2.0 + 2.0 {
-            "hud/food_full"
+        let fx = food_left + index as f32 * 8.0 * scale;
+        // Determine which food sprites to use
+        let (fill_sprite, show_fill) = if hunger >= index as f32 * 2.0 + 2.0 {
+            ("hud/food_full", true)
         } else if hunger > index as f32 * 2.0 {
-            "hud/food_half"
+            ("hud/food_half", true)
         } else {
-            "hud/food_empty"
+            ("", false)
         };
+        // Background empty sprite
         frame.commands.push(UiCommand::Sprite {
-            name: hunger_sprite.to_string(),
-            x: food_left + index as f32 * 9.0 * scale,
+            name: "hud/food_empty".to_string(),
+            x: fx,
             y: status_y,
             w: 9.0 * scale,
             h: 9.0 * scale,
             color: [1.0, 1.0, 1.0, 1.0],
         });
+        if show_fill {
+            // Foreground fill
+            frame.commands.push(UiCommand::Sprite {
+                name: fill_sprite.to_string(),
+                x: fx,
+                y: status_y,
+                w: 9.0 * scale,
+                h: 9.0 * scale,
+                color: [1.0, 1.0, 1.0, 1.0],
+            });
+        }
     }
 
     if show_crosshair {
@@ -783,7 +926,7 @@ fn draw_inventory(frame: &mut UiFrame, width: f32, height: f32, scale: f32, slot
     }
     if let Some(item) = carried.filter(|item| !item.empty) {
         if let Some((x, y)) = cursor {
-            frame.commands.push(UiCommand::Item { x: x - 8.0 * scale, y: y - 8.0 * scale, size: 16.0 * scale, name: item.name.clone(), sprite: item.sprite.clone(), count: item.count, hint: item.hint });
+            draw_slot_item(frame, x - 8.0 * scale, y - 8.0 * scale, scale, item);
         }
     }
     if let Some((x, y)) = cursor {
@@ -796,21 +939,33 @@ fn draw_inventory(frame: &mut UiFrame, width: f32, height: f32, scale: f32, slot
                 };
                 let text_size = 8.0 * scale;
                 let pad = 4.0 * scale;
-                let tooltip_w = (label.chars().count() as f32 * text_size * 0.6 + pad * 2.0).min(width - 24.0);
-                let tooltip_h = text_size + pad * 1.5;
-                let tooltip_x = (x + 8.0 * scale).clamp(8.0, width - tooltip_w - 8.0);
+                let max_tooltip_w = (width - 16.0).max(pad * 2.0 + text_size);
+                // A bitmap glyph can occupy its full cell, so reserve one
+                // cell per character instead of using an average-width guess.
+                let max_chars = ((max_tooltip_w - pad * 2.0) / text_size).floor().max(1.0) as usize;
+                let label = if label.chars().count() > max_chars {
+                    if max_chars <= 3 {
+                        label.chars().take(max_chars).collect()
+                    } else {
+                        let visible = max_chars - 3;
+                        format!("{}...", label.chars().take(visible).collect::<String>())
+                    }
+                } else {
+                    label
+                };
+                let tooltip_w = (label.chars().count() as f32 * text_size + pad * 2.0).min(max_tooltip_w);
+                let tooltip_h = text_size + pad * 2.0;
+                let tooltip_x = (x + 8.0 * scale).clamp(8.0, (width - tooltip_w - 8.0).max(8.0));
                 let tooltip_y = (y - tooltip_h - 4.0 * scale).max(8.0);
                 nine_slice(frame, "popup/background", tooltip_x, tooltip_y, tooltip_w, tooltip_h, 6.0, [1.0, 1.0, 1.0, 1.0]);
-                text(frame, tooltip_x + pad, tooltip_y + pad * 0.75, text_size, label, [1.0, 1.0, 1.0, 1.0]);
+                text(frame, tooltip_x + pad, tooltip_y + pad, text_size, label, [1.0, 1.0, 1.0, 1.0]);
             }
         }
     }
 }
 
 fn draw_inventory_item(frame: &mut UiFrame, x: f32, y: f32, scale: f32, item: &UiSlot) {
-    if !item.empty {
-        frame.commands.push(UiCommand::Item { x, y, size: 16.0 * scale, name: item.name.clone(), sprite: item.sprite.clone(), count: item.count, hint: item.hint });
-    }
+    draw_slot_item(frame, x, y, scale, item);
 }
 
 fn draw_chat(frame: &mut UiFrame, _width: f32, height: f32, lines: &[String], opacity: f32) {
@@ -834,8 +989,8 @@ fn draw_menu(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, curs
     panel(frame, width, height, state.high_contrast);
     let rects = state.button_rects(width, height);
     let first_button_y = rects.first().map(|r| r.1).unwrap_or(0.0);
-    let title_size = 8.0 * state.gui_scale;
-    centered_text(frame, width * 0.5, first_button_y - 20.0 * state.gui_scale, title_size, title, [1.0, 1.0, 1.0, 1.0]);
+    let title_size = 12.0 * state.gui_scale;
+    centered_text(frame, width * 0.5, first_button_y - title_size * 1.8, title_size, title, [1.0, 1.0, 1.0, 1.0]);
     for (index, label) in labels.iter().enumerate() {
         if let Some(&(x, y, w, h)) = rects.get(index) {
             let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
@@ -847,8 +1002,8 @@ fn draw_menu(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, curs
 fn draw_connect(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>, feedback: Option<&str>) {
     panel(frame, width, height, state.high_contrast);
     let title = "Join Server";
-    let title_size = 8.0 * state.gui_scale;
-    centered_text(frame, width * 0.5, height * 0.14, title_size, title, [1.0, 1.0, 1.0, 1.0]);
+    let title_size = 12.0 * state.gui_scale;
+    centered_text(frame, width * 0.5, height * 0.14 + title_size * 0.5, title_size, title, [1.0, 1.0, 1.0, 1.0]);
     let input_w = (width * 0.34).clamp(240.0, 420.0);
     let input_h = 20.0;
     let input_x = (width - input_w) * 0.5;
@@ -882,22 +1037,24 @@ fn draw_options(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, c
     panel(frame, width, height, state.high_contrast);
     let rects = state.button_rects(width, height);
     let first_y = rects.first().map(|r| r.1).unwrap_or(0.0);
-    let title_size = 8.0 * state.gui_scale;
+    let title_size = 12.0 * state.gui_scale;
     let t = "Options";
-    centered_text(frame, width * 0.5, first_y - 20.0 * state.gui_scale, title_size, t, [1.0, 1.0, 1.0, 1.0]);
+    centered_text(frame, width * 0.5, first_y - title_size * 1.8, title_size, t, [1.0, 1.0, 1.0, 1.0]);
     let labels = [
         format!("Graphics: {}", if state.graphics_vibrant { "Fabulous!" } else { "Fancy" }),
-        format!("Render Distance: {}", state.render_distance),
-        format!("GUI Scale: {}", state.gui_scale as i32),
+        format!("Render Distance: {} chunks", state.render_distance),
+        format!("GUI Scale: {}", if state.gui_scale.fract() == 0.0 { format!("{}", state.gui_scale as i32) } else { format!("{:.1}", state.gui_scale) }),
         format!("View Bobbing: {}", if state.view_bobbing { "ON" } else { "OFF" }),
         format!("Auto-Jump: {}", if state.auto_jump { "ON" } else { "OFF" }),
+        format!("Pause Blur: {:.0}%", state.blur_intensity * 10.0),
         "Accessibility Settings...".to_string(),
         "Done".to_string(),
     ];
     for (index, label) in labels.iter().enumerate() {
-        let (x, y, w, h) = rects[index];
-        let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
-        minecraft_button(frame, x, y, w, h, label, state.keyboard_focus == Some(index), hovered);
+        if let Some(&(x, y, w, h)) = rects.get(index) {
+            let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
+            minecraft_button(frame, x, y, w, h, label, state.keyboard_focus == Some(index), hovered);
+        }
     }
 }
 
@@ -905,9 +1062,9 @@ fn draw_controls(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, 
     panel(frame, width, height, state.high_contrast);
     let rects = state.button_rects(width, height);
     let first_y = rects.first().map(|r| r.1).unwrap_or(0.0);
-    let title_size = 8.0 * state.gui_scale;
+    let title_size = 12.0 * state.gui_scale;
     let t = "Controls";
-    centered_text(frame, width * 0.5, first_y - 20.0 * state.gui_scale, title_size, t, [1.0, 1.0, 1.0, 1.0]);
+    centered_text(frame, width * 0.5, first_y - title_size * 1.8, title_size, t, [1.0, 1.0, 1.0, 1.0]);
     let lines = [
         ("WASD", "Move"),
         ("Space", "Jump"),
@@ -919,12 +1076,14 @@ fn draw_controls(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, 
         ("F", "Toggle Flight"),
         ("Esc", "Pause / Menu"),
     ];
-    let text_size = 12.0 * state.gui_scale;
-    let col1_x = width * 0.5 - 200.0 * state.gui_scale;
-    let col2_x = width * 0.5 - 60.0 * state.gui_scale;
-    let start_y = height * 0.25;
+    let text_size = 11.0 * state.gui_scale;
+    let col_w = (width * 0.34).clamp(240.0, 420.0);
+    let left = (width - col_w) * 0.5;
+    let col1_x = left + col_w * 0.1;
+    let col2_x = left + col_w * 0.45;
+    let start_y = first_y + 10.0 * state.gui_scale;
     for (index, (key, action)) in lines.iter().enumerate() {
-        let y = start_y + index as f32 * 22.0 * state.gui_scale;
+        let y = start_y + index as f32 * 20.0 * state.gui_scale;
         text(frame, col1_x, y, text_size, *key, [0.55, 0.43, 0.18, 1.0]);
         text(frame, col2_x, y, text_size, *action, [1.0, 1.0, 1.0, 1.0]);
     }
@@ -940,14 +1099,14 @@ fn draw_accessibility(frame: &mut UiFrame, width: f32, height: f32, state: &UiSt
     panel(frame, width, height, state.high_contrast);
     let rects = state.button_rects(width, height);
     let first_y = rects.first().map(|r| r.1).unwrap_or(0.0);
-    let title_size = 8.0 * state.gui_scale;
+    let title_size = 12.0 * state.gui_scale;
     let t = "Accessibility";
-    centered_text(frame, width * 0.5, first_y - 20.0 * state.gui_scale, title_size, t, [1.0, 1.0, 1.0, 1.0]);
+    centered_text(frame, width * 0.5, first_y - title_size * 1.8, title_size, t, [1.0, 1.0, 1.0, 1.0]);
     let labels = [
         format!("High Contrast: {}", if state.high_contrast { "ON" } else { "OFF" }),
         format!("Reduced Motion: {}", if state.reduced_motion { "ON" } else { "OFF" }),
         format!("Chat Opacity: {:.0}%", state.chat_opacity * 100.0),
-        format!("GUI Scale: {}", state.gui_scale as i32),
+        format!("GUI Scale: {}", if state.gui_scale.fract() == 0.0 { format!("{}", state.gui_scale as i32) } else { format!("{:.1}", state.gui_scale) }),
         "Done".to_string(),
     ];
     for (index, label) in labels.iter().enumerate() {
@@ -960,19 +1119,16 @@ fn draw_accessibility(frame: &mut UiFrame, width: f32, height: f32, state: &UiSt
 fn draw_title_screen(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>) {
     panel(frame, width, height, state.high_contrast);
 
-    // Title text rendered with the Minecraft font (gold color, large)
+    // Minecraft-style title: large gold text with shadow
     let title = "Vibecraft";
-    let title_size = 36.0 * state.gui_scale;
-    let title_y = (height * 0.10).max(24.0);
+    let title_size = (56.0 * state.gui_scale).min(width * 0.15).max(24.0);
+    let title_y = (height * 0.08).max(20.0);
+
+    // Main title (gold gradient effect)
     centered_text(frame, width * 0.5, title_y, title_size, title, [1.0, 0.84, 0.0, 1.0]);
 
-    // Subtitle in smaller text
-    let subtitle = "A Minecraft-inspired game";
-    let sub_size = 14.0 * state.gui_scale;
-    centered_text(frame, width * 0.5, title_y + title_size * 1.1, sub_size, subtitle, [0.6, 0.6, 0.6, 1.0]);
-
     // Buttons: Singleplayer, Multiplayer, Options..., Quit
-    let button_w = (width * 0.34).clamp(240.0, 420.0);
+    let button_w = state.button_width(width);
     let button_h = 20.0 * state.gui_scale;
     let gap = 3.0 * state.gui_scale;
     let count = 4;
@@ -1111,5 +1267,35 @@ mod tests {
         assert_eq!(inventory_slot_at(width, height, scale, left + 77.0 + slot * 0.5, top + 61.0 + slot * 0.5), Some(40));
         assert_eq!(player_crafting_slot_at(width, height, scale, left + 89.0 + slot * 0.5, top + 19.0 + slot * 0.5), Some(0));
         assert!(player_crafting_result_at(width, height, scale, left + 145.0 + slot * 0.5, top + 28.0 + slot * 0.5));
+    }
+
+    #[test]
+    fn hotbar_icons_are_centered_within_slots() {
+        let item = UiSlot {
+            name: "Stone".to_string(),
+            sprite: "block/stone".to_string(),
+            count: 64,
+            empty: false,
+            selected: true,
+            hint: 0,
+            block_tiles: None,
+        };
+        let mut frame = UiFrame::default();
+        draw_hud(&mut frame, 400.0, 240.0, 1.0, &[item], 20.0, 20.0, 0.0, 0.0, "", true);
+        let icon = frame.commands.iter().find_map(|command| match command {
+            UiCommand::Item { x, y, size, .. } => Some((*x, *y, *size)),
+            _ => None,
+        }).unwrap();
+        assert_eq!(icon.0, (400.0 - 182.0) * 0.5 + 4.0);
+        assert_eq!(icon.1, 240.0 - 22.0 - 8.0 + 4.0);
+        assert_eq!(icon.2, ITEM_ICON_SIZE);
+    }
+
+    #[test]
+    fn menu_buttons_scale_the_authored_200px_width() {
+        let mut ui = UiState::default();
+        ui.gui_scale = 3.0;
+        assert_eq!(ui.button_width(1920.0), 600.0);
+        assert_eq!(ui.button_width(500.0), 404.0);
     }
 }

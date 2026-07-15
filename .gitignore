@@ -5,3 +5,6 @@
 
 # Embedded asset symlink (only needed for `bundled` builds).
 /embeds_minecraft
+
+# Generated world data.
+world/chunks/

@@ -706,6 +706,31 @@ impl ItemRegistry {
         id != AIR && self.items.get(id as usize).is_some_and(|definition| definition.max_stack > 0)
     }
 
+    /// Returns the canonical vanilla item texture stem for a non-block item.
+    /// Block items resolve through their BlockId and `textures/block` instead.
+    pub fn texture_stem(&self, id: ItemId) -> Option<String> {
+        if !self.is_valid(id) || self.block_from_item(id).is_some() {
+            return None;
+        }
+        let stem = match self.name(id) {
+            // Shield visuals are authored as entity-model textures, not as a
+            // standalone 16px item PNG. It intentionally uses the atlas's
+            // diagnostic sprite until item-model rendering exists.
+            "Shield" => return None,
+            "Enchanted Apple" => "golden_apple".to_string(),
+            "Steak" => "cooked_beef".to_string(),
+            "Mushroom Stew" => "mushroom_stew".to_string(),
+            "Redstone Dust" => "redstone".to_string(),
+            "Compass" => "compass_00".to_string(),
+            "Clock" => "clock_00".to_string(),
+            name if name.starts_with("Chain ") => name
+                .replacen("Chain ", "chainmail_", 1)
+                .to_ascii_lowercase(),
+            name => name.to_ascii_lowercase().replace([' ', '-'], "_"),
+        };
+        Some(stem)
+    }
+
     pub fn item_id_from_block(&self, block: BlockId) -> ItemId {
         self.block_to_item[block as usize]
     }
@@ -729,5 +754,31 @@ impl ItemRegistry {
 
     pub fn is_golden_apple(&self, id: ItemId) -> bool {
         id == GOLDEN_APPLE || id == ENCHANTED_APPLE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texture_stems_match_special_vanilla_assets() {
+        let registry = ItemRegistry::new();
+        assert_eq!(
+            registry.texture_stem(registry.id_by_name("Steak").unwrap()).as_deref(),
+            Some("cooked_beef")
+        );
+        assert_eq!(
+            registry.texture_stem(registry.id_by_name("Redstone Dust").unwrap()).as_deref(),
+            Some("redstone")
+        );
+        assert_eq!(
+            registry.texture_stem(registry.id_by_name("Compass").unwrap()).as_deref(),
+            Some("compass_00")
+        );
+        assert_eq!(
+            registry.texture_stem(registry.item_id_from_block(BlockId::Stone)),
+            None
+        );
     }
 }

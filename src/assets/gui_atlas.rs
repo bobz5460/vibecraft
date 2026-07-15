@@ -60,19 +60,6 @@ impl GuiAtlas {
             Self::load_pngs(reader, "textures/gui/sprites/popup", &mut entries, "popup/");
         }
 
-        // Item icons are part of the official GUI presentation. Keep them in
-        // the same nearest-filtered atlas as HUD and container sprites so the
-        // UI never falls back to terrain-only placeholders for known items.
-        if reader.exists("textures/item") {
-            Self::load_pngs(reader, "textures/item", &mut entries, "item/");
-        }
-
-        // Block-backed inventory stacks use the authored block face texture,
-        // matching the terrain and dropped-block presentation.
-        if reader.exists("textures/block") {
-            Self::load_pngs(reader, "textures/block", &mut entries, "block/");
-        }
-
         // Mob effect icons
         if reader.exists("textures/mob_effect") {
             Self::load_pngs(reader, "textures/mob_effect", &mut entries, "mob_effect/");
@@ -354,17 +341,13 @@ impl GuiAtlas {
         color: [f32; 4],
     ) -> Option<(Vec<TextVertex>, Vec<u32>)> {
         let uv = self.get_uv(name)?;
-        let [u0, v0, u1, v1] = uv;
+        let [_, v0, _, v1] = uv;
 
         // Source sprite pixel size from atlas UV
         let af = self.atlas_size as f32;
-        let src_w = (u1 - u0) * af;
         let src_h = (v1 - v0) * af;
 
-        // Scale border proportionally to the larger of the two scaling factors
-        let scale_x = w / src_w;
-        let scale_y = h / src_h;
-        let bp = border * scale_x.max(scale_y);
+        let bp = Self::nine_slice_destination_border(src_h, w, h, border);
 
         let (um, vm) = Self::nine_slice_uv_boundaries(uv, af, border)?;
 
@@ -408,6 +391,15 @@ impl GuiAtlas {
             return None;
         }
         Some(([u0, u0 + border_uv, u1 - border_uv, u1], [v0, v0 + border_uv, v1 - border_uv, v1]))
+    }
+
+    fn nine_slice_destination_border(src_h: f32, w: f32, h: f32, border: f32) -> f32 {
+        if src_h <= 0.0 || w <= 0.0 || h <= 0.0 || border <= 0.0 {
+            return 0.0;
+        }
+        // Corners scale with source height (the GUI scale), never responsive
+        // width. This keeps the button edge thickness stable at every width.
+        (border * h / src_h).min(w * 0.5).min(h * 0.5)
     }
 
     /// Build vertex data using a white reference pixel for solid color quads
@@ -485,5 +477,13 @@ mod tests {
         assert!(sprites.contains_key(&sprite_id("widget/button")));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nine_slice_border_uses_height_scale_not_width_scale() {
+        // A 200px-wide source stretched to 400px must retain its 3px corners
+        // when the 20px source height is unchanged.
+        assert_eq!(GuiAtlas::nine_slice_destination_border(20.0, 400.0, 20.0, 3.0), 3.0);
+        assert_eq!(GuiAtlas::nine_slice_destination_border(20.0, 400.0, 40.0, 3.0), 6.0);
     }
 }

@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use crate::assets::reader::AssetReader;
 use crate::engine::text::TextVertex;
 
+/// Project-bundled logo image embedded at compile time so it survives
+/// asset directory changes. Replace `assets/logo/vibecraft.png` and rebuild.
+static PROJECT_LOGO: &[u8] = include_bytes!("../../assets/logo/vibecraft.png");
+
 fn sprite_id(name: &str) -> u64 {
     let mut h = 0x9e3779b97f4a7c15u64;
     for b in name.bytes() {
@@ -86,6 +90,14 @@ impl GuiAtlas {
 
         // Add white reference pixel for colored quads (synthetic 1x1 white sprite)
         entries.push(("_white".to_string(), image::RgbaImage::from_pixel(1, 1, image::Rgba([255u8, 255, 255, 255]))));
+
+        // Project-bundled title logo (stored in assets/logo/vibecraft.png)
+        if let Ok(logo_img) = image::load_from_memory(PROJECT_LOGO) {
+            entries.push(("title/vibecraft".to_string(), logo_img.into_rgba8()));
+            log::info!("Loaded project logo: assets/logo/vibecraft.png");
+        } else {
+            log::warn!("Project logo is not a valid PNG");
+        }
 
         // Pack into atlas
         let atlas_size = Self::find_atlas_size(&entries, device.limits().max_texture_dimension_2d);

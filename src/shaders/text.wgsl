@@ -30,5 +30,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let tex = textureSample(font, font_sampler, input.uv);
-    return vec4<f32>(input.color.rgb * tex.rgb, tex.a * input.color.a);
+    // Bitmap fonts use alpha as their glyph mask. Sampling RGB here corrupts
+    // colored text and can make dark shadows appear as white glyphs.
+    return vec4<f32>(input.color.rgb, tex.a * input.color.a);
 }

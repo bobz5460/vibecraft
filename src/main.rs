@@ -835,6 +835,8 @@ async fn run(config: AppConfig) {
 
     let mut break_progress: f32 = 0.0;
     let mut break_target: Option<(i32, i32, i32)> = None;
+    let mut hurt_timer: f32 = 0.0;
+    let mut stable_target_hit: Option<world::raycast::RaycastHit> = None;
 
     let mut experience = level.experience;
 
@@ -1911,7 +1913,7 @@ async fn run(config: AppConfig) {
                     );
                     profiler::end("player_movement");
                 }
-                let mut hit = None;
+                let mut hit = stable_target_hit.clone();
                 for _ in 0..simulation_steps {
                     let dt = world::simulation::SIMULATION_DT;
                     simulation_tick = simulation_tick.wrapping_add(1);
@@ -1929,6 +1931,9 @@ async fn run(config: AppConfig) {
                         let weapon_speed = item_registry.def(held_id).attack_speed;
                         player.tick_attack_cooldown(dt, weapon_speed);
                     }
+
+                    // Track health for hurt flash/shake
+                    let health_before = player.health;
 
                     // Status effect tick
                     if game_mode.takes_damage() && player.is_alive() {
@@ -1957,6 +1962,13 @@ async fn run(config: AppConfig) {
                     if game_mode.takes_damage() && player.is_alive() {
                         player.tick_damage(dt, &chunk_manager, difficulty.damage_multiplier());
                         renderer.gui_dirty = true;
+                    }
+
+                    // Hurt flash/shake on damage taken
+                    if player.health < health_before {
+                        hurt_timer = 0.5;
+                    } else if hurt_timer > 0.0 {
+                        hurt_timer = (hurt_timer - dt).max(0.0);
                     }
 
                     // Respawn if dead
@@ -1999,7 +2011,26 @@ async fn run(config: AppConfig) {
                 // Raycast for block targeting and highlight
                 let (origin, dir) = camera.get_ray();
                 let reach = if game_mode == GameMode::Creative { 5.0 } else { 4.5 };
-                hit = chunk_manager.raycast(origin, dir, reach);
+                let raw_hit = chunk_manager.raycast(origin, dir, reach);
+                // Hysteresis: hold the last stable hit so the "Looking at" text
+                // does not flicker between a block name and "nothing" when
+                // sub-pixel camera movement causes the DDA ray to land exactly
+                // on a block corner or gap.
+                if raw_hit.is_some() {
+                    stable_target_hit = raw_hit.clone();
+                } else {
+                    // Only clear the stable cache when the camera has moved
+                    // far enough that the cached position is clearly stale.
+                    if let Some(ref cached) = stable_target_hit {
+                        let dx = cached.x as f32 - origin.x;
+                        let dy = cached.y as f32 - origin.y;
+                        let dz = cached.z as f32 - origin.z;
+                        if dx * dx + dy * dy + dz * dz > reach * reach {
+                            stable_target_hit = None;
+                        }
+                    }
+                }
+                hit = if raw_hit.is_some() { raw_hit } else { stable_target_hit.clone() };
                 profiler::end("raycast");
 
                 // Update highlight and break overlay (only recreate when target changes)
@@ -2011,11 +2042,10 @@ async fn run(config: AppConfig) {
                     last_hit_pos = hit_pos;
                 }
 
-                // Update break overlay (only recreate when break target changes)
-                let prev_break_overlay_pos = break_target;
-                if prev_break_overlay_pos != last_break_overlay_pos {
-                    last_break_overlay_pos = prev_break_overlay_pos;
-                    if break_target.is_some() && !game_mode.instant_break() {
+                // Update break overlay (recreate when target or visibility changes)
+                if break_target != last_break_overlay_pos || break_progress <= 0.0 {
+                    last_break_overlay_pos = break_target;
+                    if break_target.is_some() && break_progress > 0.0 && !game_mode.instant_break() {
                         if let Some((bx, by, bz)) = break_target {
                             break_overlay = Some(renderer.create_break_overlay(bx as f32, by as f32, bz as f32));
                         }
@@ -2861,6 +2891,7 @@ async fn run(config: AppConfig) {
                         toast,
                         cursor,
                         gameplay_input,
+                        hurt_timer,
                     );
                     // Build nametags: project remote player head positions to screen
                     let mut nametags = Vec::new();

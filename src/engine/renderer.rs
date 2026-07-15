@@ -196,6 +196,7 @@ pub struct Uniforms {
     pub shadow_vp_matrix: [[f32; 4]; 4],
     pub inv_vp_matrix: [[f32; 4]; 4],
     pub fog_params: [f32; 4],
+    pub time: [f32; 4],
 }
 
 #[repr(C)]
@@ -1970,6 +1971,7 @@ impl Renderer {
         shadow_vp: &[[f32; 4]; 4],
         light_dir: &nalgebra::Vector3<f32>,
         fog_params: [f32; 4],
+        time: f32,
     ) {
         let vp: [[f32; 4]; 4] = camera.vp_matrix().into();
         let vp_mat = nalgebra::Matrix4::from(vp);
@@ -1982,6 +1984,7 @@ impl Renderer {
             shadow_vp_matrix: *shadow_vp,
             inv_vp_matrix: inv_vp.into(),
             fog_params,
+            time: [time, 0.0, 0.0, 0.0],
         };
         self.queue.write_buffer(
             &self.uniform_buffer,
@@ -2193,7 +2196,7 @@ impl Renderer {
                         append_ui_geometry(&mut batches, UiBatchKind::Sprite, quad, quad_indices);
                     }
                 }
-                UiCommand::Item { x, y, size, name: _, sprite, count, hint } => {
+                UiCommand::Item { x, y, size, name: _, sprite, hint } => {
                     if let Some((quad, quad_indices)) = self.item_atlas.build_sprite(sprite, *x, *y, *size, *size, [1.0, 1.0, 1.0, 1.0]) {
                         append_ui_geometry(&mut batches, UiBatchKind::Item, quad, quad_indices);
                     } else {
@@ -2202,26 +2205,8 @@ impl Renderer {
                         let (quad, quad_indices) = self.font.build_colored_rect(*x, *y, *size, *size, color);
                         append_ui_geometry(&mut batches, UiBatchKind::Text, quad, quad_indices);
                     }
-                    if *count > 1 {
-                        let count_text = count.to_string();
-                        let cw = *size * 0.5;
-                        let shadow_offset = 1.0;
-                        let count_w = self.font.measure_text(&count_text, cw);
-                        let cx = *x + *size - count_w - shadow_offset;
-                        let cy = *y + *size - cw - shadow_offset;
-                        let (mut shadow_vertices, shadow_indices) = self.font.build_text(&count_text, cx + shadow_offset, cy + shadow_offset, cw);
-                        for vertex in &mut shadow_vertices {
-                            vertex.color = [0.0, 0.0, 0.0, 1.0];
-                        }
-                        append_ui_geometry(&mut batches, UiBatchKind::Text, shadow_vertices, shadow_indices);
-                        let (mut count_vertices, count_indices) = self.font.build_text(&count_text, cx, cy, cw);
-                        for vertex in &mut count_vertices {
-                            vertex.color = [1.0, 1.0, 1.0, 1.0];
-                        }
-                        append_ui_geometry(&mut batches, UiBatchKind::Text, count_vertices, count_indices);
-                    }
                 }
-                UiCommand::IsometricBlock { x, y, size, count, top_tile, front_tile, right_tile } => {
+                UiCommand::IsometricBlock { x, y, size, top_tile, front_tile, right_tile } => {
                     let s = *size;
                     let cx = *x;
                     let cy = *y;
@@ -2260,38 +2245,39 @@ impl Renderer {
                     let (r1x, r1y) = project(0.5, 0.5, 0.5);    // v6
                     let (r2x, r2y) = project(0.5, -0.5, 0.5);   // v5
                     let (r3x, r3y) = project(0.5, -0.5, -0.5);  // v1
+                    let top_color = [1.0; 4];
+                    let front_color = [0.8, 0.8, 0.8, 1.0];
+                    let right_color = [0.6, 0.6, 0.6, 1.0];
                     let iso_verts = vec![
-                        TextVertex { pos: [t0x, t0y], uv: [top_uv[0], top_uv[3]], color: [1.0; 4] },
-                        TextVertex { pos: [t1x, t1y], uv: [top_uv[0], top_uv[1]], color: [1.0; 4] },
-                        TextVertex { pos: [t2x, t2y], uv: [top_uv[2], top_uv[1]], color: [1.0; 4] },
-                        TextVertex { pos: [t3x, t3y], uv: [top_uv[2], top_uv[3]], color: [1.0; 4] },
-                        TextVertex { pos: [f0x, f0y], uv: [f_uv[0], f_uv[1]], color: [1.0; 4] },
-                        TextVertex { pos: [f1x, f1y], uv: [f_uv[2], f_uv[1]], color: [1.0; 4] },
-                        TextVertex { pos: [f2x, f2y], uv: [f_uv[2], f_uv[3]], color: [1.0; 4] },
-                        TextVertex { pos: [f3x, f3y], uv: [f_uv[0], f_uv[3]], color: [1.0; 4] },
-                        TextVertex { pos: [r0x, r0y], uv: [r_uv[0], r_uv[1]], color: [1.0; 4] },
-                        TextVertex { pos: [r1x, r1y], uv: [r_uv[2], r_uv[1]], color: [1.0; 4] },
-                        TextVertex { pos: [r2x, r2y], uv: [r_uv[2], r_uv[3]], color: [1.0; 4] },
-                        TextVertex { pos: [r3x, r3y], uv: [r_uv[0], r_uv[3]], color: [1.0; 4] },
+                        TextVertex { pos: [t0x, t0y], uv: [top_uv[0], top_uv[3]], color: top_color },
+                        TextVertex { pos: [t1x, t1y], uv: [top_uv[0], top_uv[1]], color: top_color },
+                        TextVertex { pos: [t2x, t2y], uv: [top_uv[2], top_uv[1]], color: top_color },
+                        TextVertex { pos: [t3x, t3y], uv: [top_uv[2], top_uv[3]], color: top_color },
+                        TextVertex { pos: [f0x, f0y], uv: [f_uv[0], f_uv[1]], color: front_color },
+                        TextVertex { pos: [f1x, f1y], uv: [f_uv[2], f_uv[1]], color: front_color },
+                        TextVertex { pos: [f2x, f2y], uv: [f_uv[2], f_uv[3]], color: front_color },
+                        TextVertex { pos: [f3x, f3y], uv: [f_uv[0], f_uv[3]], color: front_color },
+                        TextVertex { pos: [r0x, r0y], uv: [r_uv[0], r_uv[1]], color: right_color },
+                        TextVertex { pos: [r1x, r1y], uv: [r_uv[2], r_uv[1]], color: right_color },
+                        TextVertex { pos: [r2x, r2y], uv: [r_uv[2], r_uv[3]], color: right_color },
+                        TextVertex { pos: [r3x, r3y], uv: [r_uv[0], r_uv[3]], color: right_color },
                     ];
                     let iso_indices: Vec<u32> = (0..3).flat_map(|f| {
                         let b = f as u32 * 4;
                         vec![b, b + 1, b + 2, b, b + 2, b + 3]
                     }).collect();
                     append_ui_geometry(&mut batches, UiBatchKind::IsometricBlock, iso_verts, iso_indices);
-                    if *count > 1 {
-                        let count_text = count.to_string();
-                        let cw = s * 0.5;
-                        let shadow_offset = 1.0;
-                        let count_w = self.font.measure_text(&count_text, cw);
-                        let isox = cx + s * 0.5 - count_w - shadow_offset;
-                        let isoy = cy + s * 0.5 - cw - shadow_offset;
-                        let (mut sh_vert, sh_idx) = self.font.build_text(&count_text, isox + shadow_offset, isoy + shadow_offset, cw);
-                        for v in &mut sh_vert { v.color = [0.0, 0.0, 0.0, 1.0]; }
-                        append_ui_geometry(&mut batches, UiBatchKind::Text, sh_vert, sh_idx);
-                        let (mut fg_vert, fg_idx) = self.font.build_text(&count_text, isox, isoy, cw);
-                        for v in &mut fg_vert { v.color = [1.0; 4]; }
-                        append_ui_geometry(&mut batches, UiBatchKind::Text, fg_vert, fg_idx);
+                }
+                UiCommand::TitleLogo { sprite, center_x, y, pixel_height } => {
+                    let (sprite_w, sprite_h) = self.gui_atlas.sprite_size(sprite);
+                    if sprite_w > 0.0 && sprite_h > 0.0 {
+                        let scale = *pixel_height / sprite_h;
+                        let render_w = sprite_w * scale;
+                        let render_h = sprite_h * scale;
+                        let x = *center_x - render_w * 0.5;
+                        if let Some((quad, quad_indices)) = self.gui_atlas.build_sprite(sprite, x, *y, render_w, render_h, [1.0, 1.0, 1.0, 1.0]) {
+                            append_ui_geometry(&mut batches, UiBatchKind::Sprite, quad, quad_indices);
+                        }
                     }
                 }
             }
@@ -2736,6 +2722,7 @@ impl Renderer {
             ctx.shadow_vp,
             ctx.light_dir,
             ctx.fog_params,
+            ctx.game_time,
         );
 
         let break_uniforms = BreakUniforms {

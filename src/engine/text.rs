@@ -5,6 +5,7 @@ const ASCII_FIRST: u32 = 32;
 const ASCII_LAST: u32 = 126;
 const ASCII_GLYPH_COUNT: usize = (ASCII_LAST - ASCII_FIRST + 1) as usize;
 const GLYPH_SIZE: f32 = 8.0;
+const SHADOW_BRIGHTNESS: f32 = 0.25;
 
 pub struct FontTexture {
     #[allow(dead_code)]
@@ -338,10 +339,11 @@ impl FontTexture {
         // offset with larger labels left a visible gap between the glyph and
         // its shadow.
         let shadow_offset = 1.0;
+        let shadow_color = Self::shadow_color(color);
         let (shadow_verts, shadow_idx) = self.build_text(text, x + shadow_offset, y + shadow_offset, size);
         let shadow_verts: Vec<TextVertex> = shadow_verts
             .into_iter()
-            .map(|mut v| { v.color = [0.0, 0.0, 0.0, 1.0]; v })
+            .map(|mut v| { v.color = shadow_color; v })
             .collect();
         let base = shadow_verts.len() as u32;
         let (fg_verts, fg_idx) = self.build_text(text, x, y, size);
@@ -388,6 +390,15 @@ impl FontTexture {
         (ASCII_FIRST..=ASCII_LAST)
             .contains(&code)
             .then(|| self.glyph_advances[(code - ASCII_FIRST) as usize])
+    }
+
+    fn shadow_color(color: [f32; 4]) -> [f32; 4] {
+        [
+            color[0] * SHADOW_BRIGHTNESS,
+            color[1] * SHADOW_BRIGHTNESS,
+            color[2] * SHADOW_BRIGHTNESS,
+            color[3],
+        ]
     }
 
     fn glyph_advances(img: &image::RgbaImage) -> [f32; ASCII_GLYPH_COUNT] {
@@ -470,5 +481,10 @@ mod tests {
     #[test]
     fn ascii_uvs_match_the_official_bitmap_provider_layout() {
         assert_eq!(FontTexture::glyph_uv('A' as u32, 128.0, 128.0), Some([8.0 / 128.0, 32.0 / 128.0, 16.0 / 128.0, 40.0 / 128.0]));
+    }
+
+    #[test]
+    fn shadow_color_uses_minecraft_style_quarter_brightness() {
+        assert_eq!(FontTexture::shadow_color([0.8, 0.4, 0.2, 0.5]), [0.2, 0.1, 0.05, 0.5]);
     }
 }

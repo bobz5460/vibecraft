@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::net::SocketAddr;
 use winit::keyboard::KeyCode;
 
-const DEFAULT_CONFIG_PATH: &str = "vibecraft.json";
 const MIN_RENDER_DISTANCE: i32 = 2;
 const MAX_RENDER_DISTANCE: i32 = 32;
 
@@ -131,6 +130,30 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+fn default_config_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("VIBECRAFT_CONFIG") {
+        return PathBuf::from(path);
+    }
+    let base = if cfg!(target_os = "linux") {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME").unwrap_or_default();
+                PathBuf::from(home).join(".config")
+            })
+    } else if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        PathBuf::from(home).join("Library/Application Support")
+    } else if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        PathBuf::from(".")
+    };
+    base.join("vibecraft").join("vibecraft.json")
+}
+
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_args(std::env::args().skip(1))
@@ -138,9 +161,7 @@ impl AppConfig {
 
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Self, ConfigError> {
         let args: Vec<_> = args.into_iter().collect();
-        let mut config_path = std::env::var_os("VIBECRAFT_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+        let mut config_path = default_config_path();
 
         for index in 0..args.len() {
             if args[index] == "--config" {
@@ -287,8 +308,8 @@ fn parse_key(action: &str, key: &str) -> Result<KeyCode, ConfigError> {
     Ok(code)
 }
 
-pub fn usage() -> &'static str {
-    "Usage: vibecraft [--config PATH] [--seed U64] [--world-dir PATH] [--server IP:PORT] [--username NAME] [--render-distance 2..32] [--graphics regular|vibrant] [--keybind ACTION=KEY]\n\nConfiguration is JSON (default: vibecraft.json). Supported actions: forward, back, left, right, jump, sneak, sprint, inventory, drop_item, chat, command."
+pub fn usage() -> String {
+    format!("Usage: vibecraft [--config PATH] [--seed U64] [--world-dir PATH] [--server IP:PORT] [--username NAME] [--render-distance 2..32] [--graphics regular|vibrant] [--keybind ACTION=KEY]\n\nConfiguration is JSON (default: {}). Supported actions: forward, back, left, right, jump, sneak, sprint, inventory, drop_item, chat, command.", default_config_path().display())
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ struct Uniforms {
     shadow_vp_matrix: mat4x4<f32>,
     inv_vp_matrix: mat4x4<f32>,
     fog_params: vec4<f32>,
+    time: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -153,7 +154,11 @@ fn fs_shadow(input: ShadowOutput) {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let tile_uv = get_tile_uv(input.uv, input.tex_index);
+    var tile_uv = get_tile_uv(input.uv, input.tex_index);
+    // Water UV scrolling animation (slow downward flow)
+    if is_water_tile(input.tex_index) {
+        tile_uv.y += uniforms.time.x * 0.03;
+    }
     var color = textureSample(atlas, atlas_sampler, tile_uv);
 
     // Cutout blocks write depth only for opaque texels. Without this, foliage

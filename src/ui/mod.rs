@@ -138,6 +138,8 @@ pub struct UiState {
     pub connect_field: usize,
     pub loading_progress: f32,
     pub blur_intensity: f32,
+    pub frame_count: u64,
+    pub connecting: bool,
 }
 
 impl Default for UiState {
@@ -160,6 +162,8 @@ impl Default for UiState {
             connect_field: 0,
             loading_progress: 0.0,
             blur_intensity: 3.0,
+            frame_count: 0,
+            connecting: false,
         }
     }
 }
@@ -198,6 +202,10 @@ impl UiState {
             gui_scale: auto_scale,
             ..Self::default()
         }
+    }
+
+    pub fn tick(&mut self) {
+        self.frame_count = self.frame_count.wrapping_add(1);
     }
 
     pub fn open_inventory(&mut self) {
@@ -277,6 +285,20 @@ impl UiState {
     }
 
     pub fn click(&mut self, width: f32, height: f32, x: f32, y: f32) -> UiAction {
+        if self.screen == UiScreen::Connect {
+            let scale = self.gui_scale;
+            let input_w = (width * 0.34).clamp(240.0 * scale, 420.0 * scale);
+            let input_h = 20.0 * scale;
+            let input_x = (width - input_w) * 0.5;
+            let field_gap = 18.0 * scale;
+            let address_y = height * 0.26;
+            let username_y = address_y + input_h + field_gap;
+            if contains((input_x, address_y, input_w, input_h), x, y) {
+                self.connect_field = 0;
+            } else if contains((input_x, username_y, input_w, input_h), x, y) {
+                self.connect_field = 1;
+            }
+        }
         self.button_rects(width, height)
             .iter()
             .enumerate()
@@ -578,7 +600,7 @@ impl UiState {
             UiScreen::Accessibility => draw_accessibility(&mut frame, width, height, self, cursor),
             UiScreen::Connect => draw_connect(&mut frame, width, height, self, cursor, feedback),
             UiScreen::Title => draw_title_screen(&mut frame, width, height, self, cursor),
-            UiScreen::Loading => draw_loading(&mut frame, width, height, self.gui_scale, self.loading_progress),
+            UiScreen::Loading => draw_loading(&mut frame, width, height, self.gui_scale, self.loading_progress, self.connecting),
         }
         frame
     }
@@ -677,9 +699,10 @@ fn minecraft_button(frame: &mut UiFrame, x: f32, y: f32, w: f32, h: f32, label: 
     centered_text(frame, x + w * 0.5, text_y, text_size, label, [1.0, 1.0, 1.0, 1.0]);
 }
 
-fn draw_loading(frame: &mut UiFrame, width: f32, height: f32, scale: f32, progress: f32) {
+fn draw_loading(frame: &mut UiFrame, width: f32, height: f32, scale: f32, progress: f32, connecting: bool) {
     rect(frame, 0.0, 0.0, width, height, [0.0, 0.0, 0.0, 1.0]);
-    centered_text(frame, width * 0.5, height * 0.5 - 8.0 * scale, 8.0 * scale, "Loading terrain...", [1.0, 1.0, 1.0, 1.0]);
+    let label = if connecting { "Connecting to server..." } else { "Loading terrain..." };
+    centered_text(frame, width * 0.5, height * 0.5 - 8.0 * scale, 8.0 * scale, label, [1.0, 1.0, 1.0, 1.0]);
     let bar_w = 182.0 * scale;
     let bar_h = 5.0 * scale;
     let bar_x = (width - bar_w) * 0.5;
@@ -771,7 +794,7 @@ fn draw_hud(frame: &mut UiFrame, width: f32, height: f32, scale: f32, hotbar: &[
         if hotbar.get(index).map(|item| item.selected).unwrap_or(false) {
             frame.commands.push(UiCommand::Sprite {
                 name: "hud/hotbar_selection".to_string(),
-                x: slot_left - 3.0 * scale,
+                x: slot_left - 2.0 * scale,
                 y: top - 1.0 * scale,
                 w: 24.0 * scale,
                 h: 24.0 * scale,
@@ -779,7 +802,7 @@ fn draw_hud(frame: &mut UiFrame, width: f32, height: f32, scale: f32, hotbar: &[
             });
         }
         if let Some(item) = hotbar.get(index).filter(|item| !item.empty) {
-            draw_slot_item(frame, slot_left, top + 3.0 * scale, scale, item);
+            draw_slot_item(frame, slot_left + 2.0 * scale, top + 3.0 * scale, scale, item);
         }
     }
 
@@ -1004,24 +1027,38 @@ fn draw_connect(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, c
     let title = "Join Server";
     let title_size = 12.0 * state.gui_scale;
     centered_text(frame, width * 0.5, height * 0.14 + title_size * 0.5, title_size, title, [1.0, 1.0, 1.0, 1.0]);
-    let input_w = (width * 0.34).clamp(240.0, 420.0);
-    let input_h = 20.0;
+    let scale = state.gui_scale;
+    let input_w = (width * 0.34).clamp(240.0 * scale, 420.0 * scale);
+    let input_h = 20.0 * scale;
     let input_x = (width - input_w) * 0.5;
+    let label_size = 12.0 * scale;
+    let text_size = 12.0 * scale;
+    let pad_x = 6.0 * scale;
+    let pad_y = 4.0 * scale;
 
     let address_y = height * 0.26;
-    text(frame, input_x, address_y - 22.0, 12.0, "Server Address", [0.82, 0.82, 0.88, 1.0]);
+    text(frame, input_x, address_y - label_size - pad_y, label_size, "Server Address", [0.82, 0.82, 0.88, 1.0]);
     nine_slice(frame, "widget/text_field", input_x, address_y, input_w, input_h, 3.0, [1.0, 1.0, 1.0, 1.0]);
-    let addr_color = if state.connect_field == 0 { [1.0, 1.0, 1.0, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
-    text(frame, input_x + 6.0, address_y + 4.0, 12.0, &state.server_address, addr_color);
+    text(frame, input_x + pad_x, address_y + pad_y, text_size, &state.server_address,
+         if state.connect_field == 0 { [1.0, 1.0, 1.0, 1.0] } else { [0.6, 0.6, 0.6, 1.0] });
+    if state.connect_field == 0 && state.frame_count % 60 < 30 {
+        let text_end = input_x + pad_x + state.server_address.chars().count() as f32 * text_size * 0.75;
+        rect(frame, text_end, address_y + pad_y, 2.0 * scale, text_size, [1.0, 1.0, 1.0, 0.8]);
+    }
 
-    let username_y = address_y + input_h + 18.0;
-    text(frame, input_x, username_y - 22.0, 12.0, "Username", [0.82, 0.82, 0.88, 1.0]);
+    let field_gap = 18.0 * scale;
+    let username_y = address_y + input_h + field_gap;
+    text(frame, input_x, username_y - label_size - pad_y, label_size, "Username", [0.82, 0.82, 0.88, 1.0]);
     nine_slice(frame, "widget/text_field", input_x, username_y, input_w, input_h, 3.0, [1.0, 1.0, 1.0, 1.0]);
-    let name_color = if state.connect_field == 1 { [1.0, 1.0, 1.0, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
-    text(frame, input_x + 6.0, username_y + 4.0, 12.0, &state.connect_username, name_color);
+    text(frame, input_x + pad_x, username_y + pad_y, text_size, &state.connect_username,
+         if state.connect_field == 1 { [1.0, 1.0, 1.0, 1.0] } else { [0.6, 0.6, 0.6, 1.0] });
+    if state.connect_field == 1 && state.frame_count % 60 < 30 {
+        let text_end = input_x + pad_x + state.connect_username.chars().count() as f32 * text_size * 0.75;
+        rect(frame, text_end, username_y + pad_y, 2.0 * scale, text_size, [1.0, 1.0, 1.0, 0.8]);
+    }
 
     if let Some(feedback) = feedback.filter(|text| !text.is_empty()) {
-        text(frame, input_x, username_y + input_h + 6.0, 11.0, feedback, [1.0, 0.55, 0.45, 1.0]);
+        text(frame, input_x, username_y + input_h + 6.0 * scale, 11.0 * scale, feedback, [1.0, 0.55, 0.45, 1.0]);
     }
     let labels = ["Connect", "Back"];
     let rects = state.button_rects(width, height);
@@ -1286,7 +1323,7 @@ mod tests {
             UiCommand::Item { x, y, size, .. } => Some((*x, *y, *size)),
             _ => None,
         }).unwrap();
-        assert_eq!(icon.0, (400.0 - 182.0) * 0.5 + 4.0);
+        assert_eq!(icon.0, (400.0 - 182.0) * 0.5 + 6.0);
         assert_eq!(icon.1, 240.0 - 22.0 - 8.0 + 4.0);
         assert_eq!(icon.2, ITEM_ICON_SIZE);
     }

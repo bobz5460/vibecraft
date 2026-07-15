@@ -898,6 +898,7 @@ async fn run(config: AppConfig) {
     let mut network_last_held_slot = inventory.held_slot;
     let mut network_reconnect_timer = 0.0f32;
     let mut network_connect_request: Option<String> = None;
+    let mut server_connect_timer = 0.0f32;
     let mut remote_players: HashMap<u64, RemotePlayerVisual> = HashMap::new();
 
     #[allow(deprecated)]
@@ -1030,6 +1031,8 @@ async fn run(config: AppConfig) {
                                         if ui_state.handle_key(KeyCode::Enter) == UiAction::ConnectServer {
                                             network_username = ui_state.connect_username.clone();
                                             network_connect_request = Some(ui_state.server_address.clone());
+                                            ui_state.screen = ui::UiScreen::Loading;
+                                            ui_state.connecting = true;
                                         }
                                         renderer.gui_dirty = true;
                                     }
@@ -1111,10 +1114,13 @@ async fn run(config: AppConfig) {
                                            if action == UiAction::ToggleGraphics {
                                                render_quality = if ui_state.graphics_vibrant { GraphicsQuality::Vibrant } else { GraphicsQuality::Regular };
                                            }
-                                            if action == UiAction::ConnectServer {
-                                                network_connect_request = Some(ui_state.server_address.clone());
-                                            }
-                                            if action == UiAction::StartGame {
+                                              if action == UiAction::ConnectServer {
+                                                  network_username = ui_state.connect_username.clone();
+                                                  network_connect_request = Some(ui_state.server_address.clone());
+                                                  ui_state.screen = ui::UiScreen::Loading;
+                                                  ui_state.connecting = true;
+                                              }
+                                             if action == UiAction::StartGame {
                                                 loading_started = Some(std::time::Instant::now());
                                                 ui_state.loading_progress = 0.0;
                                                 break_target = None;
@@ -1360,6 +1366,12 @@ async fn run(config: AppConfig) {
                                     let _ = window.set_cursor_grab(CursorGrabMode::None);
                                     ui_state.open_title();
                                 }
+                                 if action == UiAction::ConnectServer {
+                                     network_username = ui_state.connect_username.clone();
+                                     network_connect_request = Some(ui_state.server_address.clone());
+                                     ui_state.screen = ui::UiScreen::Loading;
+                                     ui_state.connecting = true;
+                                 }
                                 if !ui_state.is_menu_open() {
                                     grabbed = true;
                                     input.mouse_grabbed = true;
@@ -1496,11 +1508,15 @@ async fn run(config: AppConfig) {
                     let address_text = address_text.trim();
                     match resolve_server_address(address_text) {
                         Err(error) => {
+                            ui_state.screen = ui::UiScreen::Connect;
+                            ui_state.connecting = false;
                             command_feedback = format!("Invalid server address: {error}");
                             command_feedback_timer = 5.0;
                         }
                         Ok(address) => match ClientTransport::connect(address, network_username.clone()) {
                             Err(error) => {
+                                ui_state.screen = ui::UiScreen::Connect;
+                                ui_state.connecting = false;
                                 command_feedback = format!("Could not connect: {error}");
                                 command_feedback_timer = 5.0;
                             }
@@ -1528,17 +1544,26 @@ async fn run(config: AppConfig) {
                                 all_chunk_data.clear();
                                 border_data = None;
                                 border_needs_rebuild = true;
-                                ui_state.close_to_gameplay();
-                                grabbed = true;
-                                input.mouse_grabbed = true;
-                                window.set_cursor_visible(false);
-                                let _ = window.set_cursor_grab(CursorGrabMode::Locked);
-                                command_feedback = format!("Connecting to {address}");
+                                ui_state.loading_progress = 0.0;
+                                server_connect_timer = 5.0;
                                 command_feedback_timer = 5.0;
                             }
                         },
                     }
                     renderer.gui_dirty = true;
+                }
+
+                if server_connect_timer > 0.0 {
+                    server_connect_timer = (server_connect_timer - frame_dt).max(0.0);
+                    ui_state.loading_progress = 1.0 - (server_connect_timer / 5.0);
+                    if server_connect_timer == 0.0 {
+                        ui_state.connecting = false;
+                        ui_state.close_to_gameplay();
+                        grabbed = true;
+                        input.mouse_grabbed = true;
+                        window.set_cursor_visible(false);
+                        let _ = window.set_cursor_grab(CursorGrabMode::Locked);
+                    }
                 }
 
                 if ui_state.render_distance != render_distance {
@@ -2818,6 +2843,7 @@ async fn run(config: AppConfig) {
                     let toast = if feedback_visible && !show_debug { Some(command_feedback.as_str()) } else { None };
                     let selected_stack = inventory.selected_stack();
                     let selected_item_name = if selected_stack.is_empty() { String::new() } else { item_registry.name(selected_stack.id).to_string() };
+                    ui_state.tick();
                     let ui_frame = ui_state.frame(
                         renderer.size.0.max(1) as f32,
                         renderer.size.1.max(1) as f32,

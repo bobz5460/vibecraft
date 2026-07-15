@@ -48,13 +48,17 @@ pub struct Player {
     pub vy: f32,
     pub on_ground: bool,
     pub health: f32,
+    pub prev_health: f32,
     pub last_vy: f32,
     pub sneaking: bool,
     pub swimming: bool,
     pub oxygen: f32,
     pub hunger: f32,
+    pub prev_hunger: f32,
     pub saturation: f32,
     pub exhaustion: f32,
+    pub health_blink_timer: f32,
+    pub hunger_shake_timer: f32,
     pub attack_cooldown: f32,
     pub armor_points: f32,
     pub armor_toughness: f32,
@@ -73,13 +77,17 @@ impl Player {
             vy: 0.0,
             on_ground: false,
             health: MAX_HEALTH,
+            prev_health: MAX_HEALTH,
             last_vy: 0.0,
             sneaking: false,
             swimming: false,
             oxygen: MAX_OXYGEN,
             hunger: MAX_FOOD,
+            prev_hunger: MAX_FOOD,
             saturation: MAX_SATURATION,
             exhaustion: 0.0,
+            health_blink_timer: 0.0,
+            hunger_shake_timer: 0.0,
             attack_cooldown: 1.0,
             armor_points: 0.0,
             armor_toughness: 0.0,
@@ -155,6 +163,7 @@ impl Player {
         if remaining > 0.0 {
             self.health = (self.health - remaining).max(0.0);
             self.damage_cooldown = 0.5;
+            self.health_blink_timer = 1.0;
         }
         final_damage
     }
@@ -177,6 +186,7 @@ impl Player {
                 self.saturation = (self.saturation - 1.0).max(0.0);
             } else if self.hunger > 0.0 {
                 self.hunger = (self.hunger - 1.0).max(0.0);
+                self.hunger_shake_timer = 0.5;
             }
         }
     }
@@ -313,6 +323,13 @@ impl Player {
         }
     }
 
+    pub fn tick_animation_timers(&mut self, dt: f32) {
+        self.health_blink_timer = (self.health_blink_timer - dt).max(0.0);
+        self.hunger_shake_timer = (self.hunger_shake_timer - dt).max(0.0);
+        self.prev_health = self.health;
+        self.prev_hunger = self.hunger;
+    }
+
     pub fn get_speed_multiplier(&self) -> f32 {
         self.effects.speed_multiplier()
     }
@@ -387,12 +404,15 @@ impl Player {
     }
 
     pub fn is_suffocating(&self, cm: &ChunkManager) -> bool {
-        let min_y = self.y.floor() as i32;
-        let max_y = (self.y + self.current_height()).ceil() as i32;
-        let min_x = (self.x - HALF_WIDTH).floor() as i32;
-        let max_x = (self.x + HALF_WIDTH).floor() as i32;
-        let min_z = (self.z - HALF_WIDTH).floor() as i32;
-        let max_z = (self.z + HALF_WIDTH).floor() as i32;
+        // Vanilla checks a small 0.1×0.1×0.1 box at eye position.
+        let eye_y = self.y + STANDING_EYE_HEIGHT;
+        let margin = 0.05;
+        let min_x = ((self.x - margin).floor()) as i32;
+        let max_x = ((self.x + margin).floor()) as i32;
+        let min_y = ((eye_y - margin).floor()) as i32;
+        let max_y = ((eye_y + margin).floor()) as i32;
+        let min_z = ((self.z - margin).floor()) as i32;
+        let max_z = ((self.z + margin).floor()) as i32;
         for bx in min_x..=max_x {
             for by in min_y..=max_y {
                 for bz in min_z..=max_z {

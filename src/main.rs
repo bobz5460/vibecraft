@@ -62,6 +62,25 @@ fn nearby_chunks_ready(chunk_manager: &ChunkManager, x: f32, z: f32) -> bool {
     })
 }
 
+fn loading_progress(chunk_manager: &ChunkManager, x: f32, z: f32, render_distance: i32) -> f32 {
+    let cx = (x.floor() as i32).div_euclid(CHUNK_SIZE as i32);
+    let cz = (z.floor() as i32).div_euclid(CHUNK_SIZE as i32);
+    let mut ready = 0u32;
+    let mut total = 0u32;
+    for dx in -render_distance..=render_distance {
+        for dz in -render_distance..=render_distance {
+            total += 1;
+            if chunk_manager
+                .get_chunk(cx + dx, cz + dz)
+                .is_some_and(|chunk| chunk.has_mesh && !chunk.light_dirty)
+            {
+                ready += 1;
+            }
+        }
+    }
+    if total == 0 { 0.0 } else { ready as f32 / total as f32 }
+}
+
 fn inventory_block_sprites(reader: &vibecraft::assets::reader::AssetReader) -> HashMap<BlockId, String> {
     (0..=413u16)
         .filter_map(|raw_id| {
@@ -398,16 +417,6 @@ fn update_local_player_movement(
             player.vy = player::JUMP_SPEED * player.get_jump_multiplier();
             player.jump_exhaustion();
         }
-        if !in_water
-            && !touching_climbable
-            && input.is_key_pressed(bindings.jump)
-            && !player.on_ground
-            && player.vy > 0.0
-        {
-            let reduced_gravity = player::GRAVITY * 0.55;
-            player.vy += (reduced_gravity - player::GRAVITY) * dt;
-        }
-
         camera.position = player.eye_position();
     }
 }
@@ -1877,10 +1886,10 @@ async fn run(config: AppConfig) {
                     rebuild_render_data(&mut chunk_render_data, &mut all_chunk_data, &mut render_cache, &chunk_manager, &renderer, &camera);
 
                     if let Some(started) = loading_started {
-                        ui_state.loading_progress = (now.duration_since(started).as_secs_f32() / 5.0).min(1.0);
-                        if now.duration_since(started) >= std::time::Duration::from_secs(5)
-                            && !new_player
+                        ui_state.loading_progress = loading_progress(&chunk_manager, player.x, player.z, render_distance);
+                        if !new_player
                             && nearby_chunks_ready(&chunk_manager, player.x, player.z)
+                            && now.duration_since(started) >= std::time::Duration::from_millis(500)
                         {
                             loading_started = None;
                             break_target = None;
@@ -1917,6 +1926,7 @@ async fn run(config: AppConfig) {
                 for _ in 0..simulation_steps {
                     let dt = world::simulation::SIMULATION_DT;
                     simulation_tick = simulation_tick.wrapping_add(1);
+                    player.tick_animation_timers(dt);
                 if do_daylight_cycle {
                     game_time = (game_time + dt).rem_euclid(1200.0);
                 }
@@ -2037,7 +2047,8 @@ async fn run(config: AppConfig) {
                 let hit_pos = hit.as_ref().map(|h| (h.x, h.y, h.z));
                 if hit_pos != last_hit_pos {
                     highlight = hit.as_ref().map(|h| {
-                        renderer.create_cube_outline(h.x as f32, h.y as f32, h.z as f32)
+                        let (bmin, bmax) = h.block.selection_box();
+                        renderer.create_cube_outline(h.x as f32, h.y as f32, h.z as f32, bmin, bmax)
                     });
                     last_hit_pos = hit_pos;
                 }
@@ -2223,7 +2234,14 @@ async fn run(config: AppConfig) {
                                 let py = h.y + h.normal.1;
                                 let pz = h.z + h.normal.2;
                                 let existing = chunk_manager.get_block(px, py, pz);
-                                if existing.is_air() && !matches!(block_id, BlockId::Air | BlockId::Water | BlockId::Lava) {
+                                // Don't place inside the player's AABB
+                                let place_inside_player = player.x + player::HALF_WIDTH > px as f32
+                                    && player.x - player::HALF_WIDTH < (px + 1) as f32
+                                    && player.y + player.current_height() > py as f32
+                                    && player.y < (py + 1) as f32
+                                    && player.z + player::HALF_WIDTH > pz as f32
+                                    && player.z - player::HALF_WIDTH < (pz + 1) as f32;
+                                if existing.is_air() && !matches!(block_id, BlockId::Air | BlockId::Water | BlockId::Lava) && !place_inside_player {
                                         if chunk_manager.place_block(px, py, pz, block_id) {
                                             mark_neighbors_dirty(&mut chunk_manager, &mut render_cache, px, py, pz);
                                             // Survival: consume item
@@ -2423,13 +2441,10 @@ async fn run(config: AppConfig) {
                     || input.is_key_pressed(bindings.left)
                     || input.is_key_pressed(bindings.back)
                     || input.is_key_pressed(bindings.right);
-                let target_fov = if sprinting && moving { base_fov * 1.1 } else { base_fov };
-                let fov_speed = 10.0 * frame_dt;
-                if (camera.fov - target_fov).abs() > fov_speed {
-                    camera.fov += (target_fov - camera.fov).signum() * fov_speed;
-                } else {
-                    camera.fov = target_fov;
-                }
+                let target_fov = if sprinting && moving { base_fov * 1.05 } else { base_fov };
+                // Exponential smoothing — frame-rate-independent, ~0.4s to settle
+                let lerp_factor = 1.0 - (-6.0 * frame_dt).exp();
+                camera.fov += (target_fov - camera.fov) * lerp_factor;
 
                 let world_billboards: Vec<_> = dropped_items
                     .iter()
@@ -2792,7 +2807,18 @@ async fn run(config: AppConfig) {
                 } else {
                     0.5
                 };
-                let fog_params = [view_distance * 0.72, view_distance, display_brightness, 0.0];
+                let eye_block = chunk_manager.get_block(
+                    camera.position.x.floor() as i32,
+                    camera.position.y.floor() as i32,
+                    camera.position.z.floor() as i32,
+                ).id;
+                let underwater = eye_block == BlockId::Water;
+                let fog_params = if underwater {
+                    // Underwater: dense blue fog, very short range
+                    [1.0, 8.0, display_brightness, 1.0]
+                } else {
+                    [view_distance * 0.72, view_distance, display_brightness, 0.0]
+                };
 
                 if auto_screenshot_frame > 0 {
                     auto_screenshot_frame -= 1;
@@ -2884,6 +2910,8 @@ async fn run(config: AppConfig) {
                         ui_carried.as_ref(),
                         player.health,
                         player.hunger,
+                        player.saturation,
+                        player.absorption_health,
                         player.armor_points,
                         experience as f32 / 100.0,
                         &selected_item_name,
@@ -2892,6 +2920,13 @@ async fn run(config: AppConfig) {
                         cursor,
                         gameplay_input,
                         hurt_timer,
+                        player.health_blink_timer,
+                        player.hunger_shake_timer,
+                        player.effects.has(player::StatusEffect::Regeneration),
+                        player.effects.has(player::StatusEffect::Poison),
+                        player.effects.has(player::StatusEffect::Wither),
+                        player.effects.has(player::StatusEffect::Hunger),
+                        simulation_tick,
                     );
                     // Build nametags: project remote player head positions to screen
                     let mut nametags = Vec::new();

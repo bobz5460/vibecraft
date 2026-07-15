@@ -3,9 +3,9 @@
   "data_version": 5,
   "kind": "player",
   "data": {
-    "x": -6.0465336,
-    "y": 66.0,
-    "z": -2.664921,
+    "x": -3.91842,
+    "y": 65.0,
+    "z": 7.319239,
     "vy": 0.0,
     "on_ground": true,
     "health": 20.0,
@@ -26,8 +26,8 @@
     "inventory": {
       "slots": [
         {
-          "id": 0,
-          "count": 0,
+          "id": 8,
+          "count": 13,
           "damage": 0
         },
         {

@@ -224,6 +224,14 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 
 **Purpose:** make the Overworld generate and evolve like the target version.
 
+### 2026-07-15: Restore and stabilize biome-column terrain
+- Owner: OpenCode
+- Scope: Shelve the experimental density generator, restore the existing biome-column terrain, and fix deterministic surface/feature generation without cross-chunk writes or Java seed compatibility.
+- Depends on: Current async chunk-generation contract
+- Acceptance: The prior generator remains active; surface material and shoreline decisions are deterministic across chunk borders; decoration, structure, and ocean feature RNG streams are independent; generation order does not alter a chunk's result.
+- Status: complete
+- Notes: The removed density prototype is retained in Git stash `shelved-continuous-terrain-2026-07-15`. The restored generator now uses deterministic surface-material tie-breaking, world-space shoreline queries, and salted per-stage RNG streams. Exact noise-router, aquifer, cave-biome, and cross-chunk feature parity remain M4 work.
+
 - [ ] Port or faithfully reproduce target-version biome, density, surface, aquifer, cave, ore, and feature rules using reference seeds for comparison.
 - [ ] Add missing overworld biomes and biome-dependent colors, precipitation, features, and spawn rules.
 - [ ] Add naturally generated structures in dependency order: small features/geodes, villages/outposts, dungeons/mineshafts, temples, monuments, strongholds, ancient cities, trail ruins, and trial chambers.
@@ -298,6 +306,14 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 - Acceptance: Escape opens a navigable pause screen, supported menu actions work with mouse and keyboard, inventory clicks use the rendered slot layout, chat/cursor focus does not rotate or move the player, and UI rendering survives resize.
 - Status: partial
 - Notes: HUD, inventory backgrounds, status icons, crosshair, and known item icons now come from the official 1.21.1 asset checkout through the GUI atlas. Hotbar now includes experience bar, armor bar, and selected item name above the bar, matching vanilla layout. Settings screens (options, controls, accessibility) have been updated with more Minecraft-like button layouts and additional options (view bobbing, auto-jump). Title/world-select/multiplayer screen lifecycle, runtime key rebinding, and full localization remain follow-up work.
+
+### 2026-07-15: Java-style chat and command interaction
+- Owner: OpenCode
+- Scope: Replace the fixed chat overlay with bounded, wrapped, scrollable history, sent-entry recall, text editing, and command suggestions; align the supported singleplayer command surface with Java Edition syntax and add only operations backed by current simulation state. Server-authoritative command execution, text components, signed chat, clickable/hoverable chat, weather simulation, and unsupported command families remain out of scope.
+- Depends on: GUI frame/input plumbing; native multiplayer authority boundary
+- Acceptance: `T` and `/` open a 256-character editor without gameplay input; chat wraps to the viewport, retains 100 entries, scrolls and recalls sent input; Tab completes supported commands/arguments; supported Java-style commands validate syntax and mutate the correct local state, while network clients cannot mutate local authority through slash commands.
+- Status: complete
+- Notes: Chat now has a bounded Unicode editor, message and sent-entry history, cursor editing, wrapping, scrollback, contextual Tab suggestions, and correctly retained cursor focus. Supported local commands gained Java-style `/teleport`, `/setblock`, `/fill`, `/clear`, `/experience`, `/time query`, coordinates, and namespace-aware lookup. Native multiplayer intentionally rejects slash commands until server-side command requests and authorization exist; text components, signed chat, and command families without current simulation support remain deferred.
 
 ### M9: Multiplayer Demo And External Compatibility
 

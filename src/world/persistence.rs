@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Native on-disk envelope format. This is unrelated to Minecraft's save format.
 pub const FORMAT_VERSION: u32 = 1;
 /// Version of the native game data encoded inside each envelope.
-pub const DATA_VERSION: u32 = 5;
+pub const DATA_VERSION: u32 = 6;
 
 const LEVEL_FILE: &str = "level.json";
 const PLAYER_FILE: &str = "player.json";
@@ -33,6 +33,15 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct LevelData {
+    /// User-facing save name. The directory remains a separate safe identifier.
+    #[serde(default = "default_world_name")]
+    pub name: String,
+    /// UTC milliseconds since the Unix epoch. Zero identifies migrated legacy worlds.
+    #[serde(default)]
+    pub created_at: u64,
+    /// UTC milliseconds since the Unix epoch. Updated after a world is entered.
+    #[serde(default)]
+    pub last_played: u64,
     pub seed: u64,
     pub tick: u64,
     pub game_time: u64,
@@ -55,6 +64,25 @@ pub struct LevelData {
     pub xp_orbs: Vec<XpOrbData>,
     #[serde(default)]
     pub players: Vec<NamedPlayerData>,
+}
+
+fn default_world_name() -> String {
+    "New World".to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorldSummary {
+    pub path: PathBuf,
+    pub name: String,
+    pub gamemode: String,
+    pub hardcore: bool,
+    pub last_played: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorldDiscovery {
+    pub worlds: Vec<WorldSummary>,
+    pub rejected: Vec<(PathBuf, String)>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -720,6 +748,58 @@ impl WorldStorage {
     }
 }
 
+/// Lists the configured legacy root when it is a valid world, followed by valid
+/// immediate child worlds. Discovery never creates or repairs save data.
+pub fn discover_worlds(root: &Path) -> Result<WorldDiscovery, StorageError> {
+    let mut discovery = WorldDiscovery::default();
+    let root_storage = WorldStorage::new(root);
+    if root_storage.level_path().is_file() {
+        match root_storage.load_level() {
+            Ok(level) => discovery.worlds.push(world_summary(root.to_path_buf(), level)),
+            Err(error) => discovery.rejected.push((root.to_path_buf(), error.to_string())),
+        }
+    }
+
+    let entries = fs::read_dir(root).map_err(|source| StorageError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| StorageError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|source| StorageError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let storage = WorldStorage::new(&path);
+        if !storage.level_path().is_file() {
+            continue;
+        }
+        match storage.load_level() {
+            Ok(level) => discovery.worlds.push(world_summary(path, level)),
+            Err(error) => discovery.rejected.push((path, error.to_string())),
+        }
+    }
+    discovery.worlds.sort_by(|a, b| b.last_played.cmp(&a.last_played).then_with(|| a.name.cmp(&b.name)));
+    Ok(discovery)
+}
+
+fn world_summary(path: PathBuf, level: LevelData) -> WorldSummary {
+    WorldSummary {
+        path,
+        name: level.name,
+        gamemode: level.gamemode,
+        hardcore: level.hardcore,
+        last_played: level.last_played,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum FileKind {
@@ -793,6 +873,9 @@ impl Validate for LevelData {
                 return Err(corrupt(path, "level contains an invalid or duplicate player name"));
             }
             named.player.validate(path)?;
+        }
+        if self.name.trim().is_empty() || self.name.chars().count() > 64 || self.name.chars().any(char::is_control) {
+            return Err(corrupt(path, "level has an invalid display name"));
         }
         Ok(())
     }
@@ -884,6 +967,23 @@ fn migrate_data(
                     .or_insert(Value::Bool(false));
             }
             (4, FileKind::Player | FileKind::Chunk) => {}
+            (5, FileKind::Level) => {
+                let object = data
+                    .as_object_mut()
+                    .ok_or_else(|| corrupt(path, "level data must be a JSON object"))?;
+                let legacy_name = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("New World");
+                object
+                    .entry("name".to_string())
+                    .or_insert_with(|| Value::String(legacy_name.to_string()));
+                object.entry("created_at".to_string()).or_insert(Value::from(0));
+                object.entry("last_played".to_string()).or_insert(Value::from(0));
+            }
+            (5, FileKind::Player | FileKind::Chunk) => {}
             _ => {
                 return Err(StorageError::Version {
                     path: path.to_path_buf(),
@@ -1143,6 +1243,9 @@ mod tests {
 
     fn level(seed: u64) -> LevelData {
         LevelData {
+            name: "Fixture World".to_string(),
+            created_at: 100,
+            last_played: 200,
             seed,
             tick: 42,
             game_time: 84,
@@ -1319,6 +1422,25 @@ mod tests {
             Err(StorageError::Json { .. })
         ));
         assert_eq!(fs::read(path).unwrap(), corrupt_json);
+    }
+
+    #[test]
+    fn discovery_lists_valid_child_worlds_and_rejects_corrupt_ones() {
+        let root = TempWorld::new();
+        let legacy = WorldStorage::new(&root.path);
+        legacy.save_level(&level(1)).unwrap();
+        let child_path = root.path.join("child");
+        let child = WorldStorage::new(&child_path);
+        child.save_level(&level(2)).unwrap();
+        let corrupt_path = root.path.join("corrupt");
+        fs::create_dir(&corrupt_path).unwrap();
+        fs::write(corrupt_path.join(LEVEL_FILE), b"invalid").unwrap();
+
+        let discovery = discover_worlds(&root.path).unwrap();
+        assert_eq!(discovery.worlds.len(), 2);
+        assert_eq!(discovery.worlds[0].name, "Fixture World");
+        assert_eq!(discovery.rejected.len(), 1);
+        assert_eq!(discovery.rejected[0].0, corrupt_path);
     }
 
     #[test]

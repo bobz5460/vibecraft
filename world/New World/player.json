@@ -1,0 +1,237 @@
+{
+  "format_version": 1,
+  "data_version": 6,
+  "kind": "player",
+  "data": {
+    "x": -29.785446,
+    "y": 47.46408,
+    "z": 777.0766,
+    "vy": -3.2117927,
+    "on_ground": false,
+    "health": 20.0,
+    "last_vy": -3.2117927,
+    "sneaking": false,
+    "swimming": false,
+    "oxygen": 15.0,
+    "hunger": 20.0,
+    "saturation": 20.0,
+    "exhaustion": 0.2,
+    "attack_cooldown": 1.0,
+    "armor_points": 0.0,
+    "armor_toughness": 0.0,
+    "absorption_health": 0.0,
+    "damage_cooldown": 0.0,
+    "fall_flying": false,
+    "effects": [],
+    "inventory": {
+      "slots": [
+        {
+          "id": 1,
+          "count": 64,
+          "damage": 0
+        },
+        {
+          "id": 2,
+          "count": 64,
+          "damage": 0
+        },
+        {
+          "id": 3,
+          "count": 64,
+          "damage": 0
+        },
+        {
+          "id": 4,
+          "count": 64,
+          "damage": 0
+        },
+        {
+          "id": 15,
+          "count": 64,
+          "damage": 0
+        },
+        {
+          "id": 13,
+          "count": 64,
+          "damage": 0
+        },
+        {
+          "id": 411,
+          "count": 16,
+          "damage": 0
+        },
+        {
+          "id": 412,
+          "count": 64,
+          "damage": 0
+        },
+        {
+          "id": 413,
+          "count": 64,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        },
+        {
+          "id": 0,
+          "count": 0,
+          "damage": 0
+        }
+      ],
+      "held_slot": 0
+    }
+  }
+}

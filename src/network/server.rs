@@ -229,6 +229,9 @@ impl HeadlessServer {
         let storage = WorldStorage::new(config.world_dir.clone());
         let requested_seed = config.seed.unwrap_or_else(random_seed);
         let level = storage.load_or_create_level(LevelData {
+            name: "Server World".to_string(),
+            created_at: 0,
+            last_played: 0,
             seed: requested_seed,
             tick: 0,
             game_time: 9_000,

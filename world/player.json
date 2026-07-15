@@ -1,11 +1,11 @@
 {
   "format_version": 1,
-  "data_version": 5,
+  "data_version": 6,
   "kind": "player",
   "data": {
-    "x": 1.8999386,
-    "y": 63.003075,
-    "z": 27.517952,
+    "x": -9.680936,
+    "y": 65.022804,
+    "z": 11.686348,
     "vy": 0.0,
     "on_ground": true,
     "health": 20.0,
@@ -14,8 +14,8 @@
     "swimming": false,
     "oxygen": 15.0,
     "hunger": 20.0,
-    "saturation": 12.962439,
-    "exhaustion": 3.925206,
+    "saturation": 11.962439,
+    "exhaustion": 1.2653962,
     "attack_cooldown": 1.0,
     "armor_points": 0.0,
     "armor_toughness": 0.0,
@@ -231,7 +231,7 @@
           "damage": 0
         }
       ],
-      "held_slot": 0
+      "held_slot": 6
     }
   }
 }

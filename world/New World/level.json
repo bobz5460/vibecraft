@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "data_version": 6,
+  "kind": "level",
+  "data": {
+    "name": "New World",
+    "created_at": 1784136037212,
+    "last_played": 1784136160423,
+    "seed": 245245,
+    "tick": 2278,
+    "game_time": 11277,
+    "spawn": [
+      0,
+      75,
+      0
+    ],
+    "gamemode": "creative",
+    "difficulty": "normal",
+    "hardcore": false,
+    "do_daylight_cycle": true,
+    "keep_inventory": false,
+    "experience": 0,
+    "scheduled_ticks": [],
+    "dropped_items": [],
+    "xp_orbs": [],
+    "players": []
+  }
+}

@@ -1,11 +1,11 @@
 {
   "format_version": 1,
-  "data_version": 5,
+  "data_version": 6,
   "kind": "player",
   "data": {
-    "x": 28.947523,
-    "y": 79.7,
-    "z": -16.690178,
+    "x": 26.403074,
+    "y": 81.299995,
+    "z": -21.655058,
     "vy": 0.0,
     "on_ground": false,
     "health": 20.0,

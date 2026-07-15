@@ -1,6 +1,6 @@
 # Vibecraft Commands And Arguments
 
-This document describes the commands currently implemented by the native prototype. Commands are local singleplayer/debug commands, not Java Edition protocol commands.
+This document describes commands implemented by the native prototype. They use Java Edition-inspired syntax where the matching simulation behavior exists; they are not Java protocol commands.
 
 ## Launch Arguments
 
@@ -14,103 +14,56 @@ vibecraft [--config PATH] [--seed U64] [--world-dir PATH]
 | Argument | Value | Behavior |
 |---|---|---|
 | `--help`, `-h` | none | Print launch usage and exit. |
-| `--config` | `PATH` | Load JSON configuration from `PATH`. The default path is `vibecraft.json`; `VIBECRAFT_CONFIG` can select a different default. Command-line values override file values. |
-| `--seed` | unsigned 64-bit integer | Select the deterministic world-generation seed. Without this option or a JSON `seed`, startup creates a time-based seed. Use `/seed` in game to display it. |
-| `--world-dir` | `PATH` | Create and select a native world directory for level, player, and chunk save data. |
-| `--server` | `IP:PORT` | Store a native server endpoint for the networking work in progress. The windowed client does not connect yet. |
-| `--username` | `NAME` | Set the future network username. |
-| `--render-distance` | integer `2` through `32` | Set the chunk radius loaded around the player. |
-| `--graphics` | `regular` or `vibrant` | Set the initial render quality. `F4` toggles it while running. |
-| `--keybind` | `ACTION=KEY` | Override one core binding. This option can be specified more than once. |
+| `--config` | `PATH` | Load JSON configuration. Command-line values override it. |
+| `--seed` | unsigned 64-bit integer | Select the deterministic generation seed. |
+| `--world-dir` | `PATH` | Select a native world directory. |
+| `--server` | `IP:PORT` | Connect to a native Vibecraft server, not a Java Edition server. |
+| `--username` | `NAME` | Set the native multiplayer username. |
+| `--render-distance` | integer `2` through `32` | Set the loaded chunk radius. |
+| `--graphics` | `regular` or `vibrant` | Set initial render quality. |
+| `--keybind` | `ACTION=KEY` | Override a core key binding. |
 
 `VIBECRAFT_ASSETS` must point to an asset root containing `assets/minecraft`. It defaults to `/tmp/opencode/minecraft-assets`.
 
-The JSON schema and defaults are shown in `vibecraft.example.json`.
+## Chat
 
-### Keybinding Actions
+Press the configured command key (`/` by default) to open chat with a slash already entered. Press the configured chat key (`T` by default) to open an empty editor.
 
-Supported actions are `forward`, `back`, `left`, `right`, `jump`, `sneak`, `sprint`, `inventory`, `drop_item`, `chat`, and `command`.
+The editor supports up to 256 characters, 100 stored messages, viewport wrapping, mouse-wheel scrollback, Up/Down sent-entry recall, cursor editing, and Tab completion for supported commands and arguments. Chat components, links, hover/click events, text filtering, and signing are not implemented.
 
-Supported key names are `KeyW`, `KeyA`, `KeyS`, `KeyD`, `KeyE`, `KeyQ`, `KeyT`, `Space`, `ShiftLeft`, `ControlLeft`, and `Slash`. Invalid actions or key names stop startup with an error.
-
-Examples:
-
-```sh
-cargo run --release -- --seed 42 --render-distance 8 --graphics vibrant
-cargo run -- --keybind forward=KeyD --keybind right=KeyW
-```
+While connected to a native server, regular messages are sent to the server. Slash commands are rejected locally because the native protocol has no server command-request message and a client must not mutate authority.
 
 ## In-Game Commands
 
-Press the configured command key (`/` by default) to open command input. Press the configured chat key (`T` by default) to open chat input; a message beginning with `/` is executed as a command.
+All commands below are local singleplayer/debug commands. Item and block IDs accept an optional `minecraft:` namespace when supported by the current registry.
 
-### Player And World State
-
-| Command | Aliases | Arguments | Behavior |
-|---|---|---|---|
-| `/gamemode [mode]` | `/gm` | `survival`, `creative`, `adventure`, or `spectator` | With no mode, display the current mode. Hardcore prevents changing away from Survival. |
-| `/difficulty [difficulty]` | `/d` | `peaceful`, `easy`, `normal`, or `hard` | With no argument, display the current difficulty. Hardcore locks it to Hard. |
-| `/hardcore` | `/hc` | none | Enable Hardcore, set Hard difficulty, and set Survival mode. This cannot be undone during the session. |
-| `/time set <time>` | none | `day`, `noon`, `night`, `midnight`, or a number | Set time modulo 1200 seconds. `day=300`, `noon=450`, `night=900`, and `midnight=0`. |
-| `/seed` | none | none | Display the active generation seed. |
-| `/xp [amount]` | none | non-negative integer | With no amount, display total XP. Otherwise add the amount. |
-| `/kill [target]` | none | omitted, `@s`, or `player` | Kill the local player. Other targets are rejected because there is no general entity system. |
-| `/weather <type>` | none | `clear`, `rain`, `rainy`, `thunder`, or `storm` | Reports the requested weather, but weather simulation and visuals are not implemented. |
-| `/gamerule doDaylightCycle <true\|false>` | `/g` | one supported rule and Boolean value | Reports the requested value only. Gamerule storage/enforcement is not implemented. |
-| `/save` | none | none | Save the current native world immediately. |
-| `/quit` | none | none | Save and exit. A failed save prevents exit so it can be retried. |
-| `/help` | `/?`, `/h` | none | Print the compact in-game command list. |
-
-### Inventory And Player Values
-
-| Command | Aliases | Arguments | Behavior |
-|---|---|---|---|
-| `/give <block> [count]` | none | a supported block name; optional integer | Add up to 64 items to inventory. The count defaults to 1; a full inventory may accept fewer. Item lookup currently supports the block names recognized by `BlockId::from_name`, not every Java Edition item. |
-| `/hotbar <block>` | `/hb` | a supported block name | Replace all nine hotbar slots with stacks of 64 of that block. |
-| `/clearinventory` | `/ci` | none | Clear all inventory slots. |
-| `/heal` | none | none | Restore health, hunger, and saturation; remove absorption health. |
-| `/feed` | `/eat` | none | Restore hunger and saturation. |
-| `/armor [points] [toughness]` | none | floating-point values | With no values, display current armor and toughness. With `points`, set armor; an optional valid toughness value replaces toughness. |
-| `/effect <effect> [duration] [amplifier]` | `/ef` | effect name, seconds, and zero-based amplifier | Apply an effect. Duration defaults to 30 seconds and amplifier defaults to 0. `/effect clear` and `/effect remove_all` remove every active effect. |
-
-Supported effect names:
-
-```text
-speed, slowness (slow), haste, mining_fatigue (fatigue), strength (str),
-jump_boost (jump), regeneration (regen), resistance (resist),
-fire_resistance (fire_resist), water_breathing (water_breath),
-night_vision (nv), invisibility (invis), absorption (abs),
-slow_falling (slowfall), dolphin_grace (dolphin), weakness, poison, wither,
-hunger, nausea, blindness (blind), levitation (levi), darkness (dark),
-instant_health (insta_heal), instant_damage (insta_dmg),
-health_boost (hp_boost), saturation (sat), fatal_poison (fatal),
-bad_omen (omen), hero_of_the_village (hero), wind_charged (wind),
-infested, oozing (ooze), weaving (weave)
-```
-
-### Structure Placement
-
-These commands require targeting a loaded block. The structure is placed at the targeted block coordinates. They use session-random layout details, so they are not deterministic fixture generators.
-
-| Form | Accepted structure names |
+| Command | Supported behavior |
 |---|---|
-| `/summon <structure>` | all names below |
-| `/place <structure>` | all names below |
-| `/<structure>` | all names below |
+| `/gamemode [mode]` | Query or set `survival`, `creative`, `adventure`, or `spectator`. `/gm` remains a prototype alias. |
+| `/difficulty [value]` | Query or set `peaceful`, `easy`, `normal`, or `hard`. `/d` remains a prototype alias. |
+| `/hardcore` | Enable hardcore, Hard difficulty, and Survival mode for this session. |
+| `/time set <value>` | Set `day`, `noon`, `night`, `midnight`, or a numeric local time. |
+| `/time query <value>` | Query `daytime` or `gametime`. |
+| `/teleport [@s] <x> <y> <z>` | Teleport the local player. `/tp` is an alias. Absolute values and `~` relative coordinates work. |
+| `/setblock <x> <y> <z> <block>` | Replace one loaded block and immediately rebuild affected chunks. |
+| `/fill <from> <to> <block> [mode]` | Fill up to 32,768 blocks. `keep` works; `replace` and `destroy` currently both replace because command drops are unsupported. |
+| `/setworldspawn [x y z]` | Set persistent world spawn at the player or an explicit position. |
+| `/seed` | Display the active generation seed. |
+| `/experience add <amount> [points]` | Add experience. `/xp <amount>` remains supported as a compact legacy form. |
+| `/give <item> [count]` | Give up to 64 supported items or blocks. |
+| `/clear [@s] [item]` | Clear the inventory or matching local item stacks. `/clearinventory` and `/ci` remain prototype aliases. |
+| `/effect <effect> [seconds] [amplifier]` | Apply a supported status effect. `/effect clear` clears all active effects. |
+| `/gamerule <rule> [value]` | Query or set `doDaylightCycle` and `keepInventory`. |
+| `/kill [@s]` | Kill the local player. Other targets need the general entity platform. |
+| `/save` | Save the native world immediately. |
+| `/quit` | Save then exit; a failed save prevents exit. |
+| `/help` | Show the compact supported command list. |
 
-| Structure | Accepted names |
-|---|---|
-| Dungeon | `dungeon`, `d` |
-| Ruined portal | `portal`, `ruined_portal`, `p` |
-| Lava pool | `lava`, `lava_pool`, `l` |
-| Giant mushroom | `mushroom`, `giant_mushroom`, `m` |
-| Oak tree | `tree`, `oak`, `t` |
-| Igloo | `igloo`, `i` |
-| Swamp hut | `swamp_hut`, `hut`, `sh` |
-| Desert well | `well`, `desert_well`, `w` |
-| Ocean ruin | `ruin`, `ocean_ruin`, `r` |
+`/weather` accepts `clear`, `rain`, and `thunder`, but weather simulation and visuals do not yet exist. `/armor`, `/heal`, `/feed`, `/hotbar`, and the structure shortcuts below are prototype debugging aids, not Java Edition command compatibility.
 
-Examples:
+## Legacy Structure Shortcuts
+
+These commands require targeting a loaded block and are debug-only. They do not match Java Edition's entity `/summon` or configured-feature `/place` semantics.
 
 ```text
 /summon dungeon
@@ -118,9 +71,9 @@ Examples:
 /tree
 ```
 
-## Runtime Shortcuts
+Supported shortcut names: `dungeon`, `ruined_portal`, `lava_pool`, `giant_mushroom`, `tree`, `igloo`, `swamp_hut`, `desert_well`, and `ocean_ruin`.
 
-These are not slash commands, but are useful while testing:
+## Runtime Shortcuts
 
 | Key | Behavior |
 |---|---|
@@ -131,4 +84,4 @@ These are not slash commands, but are useful while testing:
 | `F5` | Toggle the profiler; toggling it off saves profiler output. |
 | `F` | Toggle flight in a fly-capable game mode. |
 | `1` through `9` | Select hotbar slot. |
-| `Escape` | Exit the application. |
+| `Escape` | Open or close the pause menu. |

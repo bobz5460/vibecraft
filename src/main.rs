@@ -1,4 +1,5 @@
 use vibecraft::config::{AppConfig, GraphicsQuality, ResolvedKeyBindings};
+use vibecraft::chat;
 use vibecraft::engine;
 use vibecraft::gamemode::{Difficulty, GameMode};
 use vibecraft::inventory;
@@ -31,9 +32,43 @@ use world::chunk_manager::ChunkManager;
 use world::dropped_item::{xp_orbs_to_mesh, DroppedItem, XpOrb};
 use world::entity::{EntityKind, EntityStore, Transform};
 use world::mesh::{build_item_cube_mesh, build_player_mesh, PlayerMeshInstance};
-use world::persistence::{DroppedItemData, LevelData, PlayerData, StorageError, WorldStorage, XpOrbData};
+use world::persistence::{discover_worlds, DroppedItemData, LevelData, PlayerData, StorageError, WorldStorage, XpOrbData};
 use world::simulation::{ScheduledTick, ScheduledTickKind, TickScheduler};
 use vibecraft::ui::{self, UiAction, UiSlot};
+
+#[derive(Clone, Debug)]
+enum WorldOpenRequest {
+    Existing(std::path::PathBuf),
+    Create(ui::CreateWorldOptions),
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn unique_world_directory(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
+    let base: String = name
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | ' ' | '-' | '_' | '.' => character,
+            _ => '_',
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if base.is_empty() || base == "." || base == ".." {
+        return Err("World name must contain a usable folder name".to_string());
+    }
+    for index in 0..10_000 {
+        let folder = if index == 0 { base.clone() } else { format!("{base} ({index})") };
+        let path = root.join(folder);
+        if !path.exists() { return Ok(path); }
+    }
+    Err("Could not allocate a unique world folder".to_string())
+}
 
 /// Convert screen pixel position to inventory slot index.
 /// Returns None if the cursor is not over any slot.
@@ -50,11 +85,11 @@ fn screen_pos_to_inventory_slot(
     ui::inventory_slot_at(sw, sh, gui_scale, mx, my)
 }
 
-fn nearby_chunks_ready(chunk_manager: &ChunkManager, x: f32, z: f32) -> bool {
+fn nearby_chunks_ready(chunk_manager: &ChunkManager, x: f32, z: f32, radius: i32) -> bool {
     let cx = (x.floor() as i32).div_euclid(CHUNK_SIZE as i32);
     let cz = (z.floor() as i32).div_euclid(CHUNK_SIZE as i32);
-    (-1..=1).all(|dz| {
-        (-1..=1).all(|dx| {
+    (-radius..=radius).all(|dz| {
+        (-radius..=radius).all(|dx| {
             chunk_manager
                 .get_chunk(cx + dx, cz + dz)
                 .is_some_and(|chunk| chunk.has_mesh && !chunk.light_dirty)
@@ -685,9 +720,12 @@ async fn run(config: AppConfig) {
 
     profiler::reset();
 
-    let storage = WorldStorage::new(config.world_dir.clone());
+    let mut storage = WorldStorage::new(config.world_dir.clone());
     let requested_seed = config.resolved_seed();
     let level = match storage.load_or_create_level(LevelData {
+        name: "New World".to_string(),
+        created_at: unix_millis(),
+        last_played: unix_millis(),
         seed: requested_seed,
         tick: 0,
         game_time: 9_000,
@@ -716,7 +754,7 @@ async fn run(config: AppConfig) {
             level.seed
         );
     }
-    let seed = level.seed;
+    let mut seed = level.seed;
     log::info!(
         "starting world seed={seed} directory={} render_distance={render_distance} graphics={:?}",
         config.world_dir.display(), config.graphics
@@ -881,17 +919,15 @@ async fn run(config: AppConfig) {
     let mut render_quality = config.graphics;
     let screen_height = renderer.size.1 as f32;
     let mut ui_state = ui::UiState::new(render_distance, render_quality == GraphicsQuality::Vibrant, screen_height);
+    ui_state.glyph_advances.copy_from_slice(renderer.font.glyph_advances_slice());
     ui_state.screen = ui::UiScreen::Title;
     ui_state.connect_username = config.username.clone();
     if let Some(address) = network_address {
         ui_state.server_address = address.to_string();
     }
-    let mut command_mode = false;
-    let mut command_buffer = String::new();
     let mut command_feedback = String::new();
     let mut command_feedback_timer = 0.0f32;
-    let mut chat_messages: Vec<String> = Vec::new();
-    let mut chat_open = false;
+    let mut chat_state = chat::ChatState::default();
     let mut chat_timer: f32 = 0.0;
     let mut inventory_open = false;
     let mut player_crafting = CraftingGrid::player();
@@ -911,6 +947,8 @@ async fn run(config: AppConfig) {
     let mut network_connect_request: Option<String> = None;
     let mut server_connect_timer = 0.0f32;
     let mut remote_players: HashMap<u64, RemotePlayerVisual> = HashMap::new();
+    let mut pending_world_open: Option<WorldOpenRequest> = None;
+    let mut browser_paths: Vec<std::path::PathBuf> = Vec::new();
 
     #[allow(deprecated)]
     let _ = event_loop.run(move |event, target| {
@@ -944,45 +982,46 @@ async fn run(config: AppConfig) {
                     }
                     WindowEvent::KeyboardInput { event: key_event, .. } => {
                         if key_event.state == ElementState::Pressed {
-                            if command_mode {
+                            if chat_state.open {
                                 match &key_event.logical_key {
                                     Key::Named(NamedKey::Enter) => {
-                                        let cmd = command_buffer.trim().to_string();
-                                        if !cmd.is_empty() {
+                                        if let Some(cmd) = chat_state.submit() {
                                             if cmd.starts_with('/') {
-                                                let was_gm = game_mode;
-                                                execute_command(&cmd, &mut chunk_manager, &mut render_cache, &last_hit_pos, &mut command_feedback, &mut save_requested, &mut quit_requested, &mut game_mode, &mut difficulty, &mut hardcore, &mut game_time, &mut do_daylight_cycle, &mut keep_inventory, &mut world_spawn, &mut dropped_items, &camera, seed, &mut experience, &mut player, &mut inventory, &item_registry);
-                                                if was_gm != game_mode {
-                                                    flying = game_mode.can_fly();
-                                                }
-                                                if save_requested {
-                                                    let saved = if network_mode {
-                                                        false
-                                                    } else {
-                                                        save_world(
+                                                if network_mode {
+                                                    command_feedback = "Commands are server-owned while connected.".to_string();
+                                                } else {
+                                                    let was_gm = game_mode;
+                                                    execute_command(&cmd, &mut chunk_manager, &mut render_cache, &last_hit_pos, &mut command_feedback, &mut save_requested, &mut quit_requested, &mut game_mode, &mut difficulty, &mut hardcore, &mut game_time, &mut do_daylight_cycle, &mut keep_inventory, &mut world_spawn, &mut dropped_items, &mut camera, seed, &mut experience, &mut player, &mut inventory, &item_registry);
+                                                    if was_gm != game_mode {
+                                                        flying = game_mode.can_fly();
+                                                    }
+                                                    if save_requested {
+                                                        let saved = save_world(
                                                             &storage, seed, &mut chunk_manager, &player, &inventory,
                                                             game_mode, difficulty, hardcore, game_time, simulation_tick,
                                                             world_spawn, do_daylight_cycle, keep_inventory, experience, &tick_scheduler,
                                                             &dropped_items, &xp_orbs,
-                                                        )
-                                                    };
-                                                    if network_mode {
-                                                        command_feedback = "Saving is server-owned while connected".to_string();
-                                                    }
-                                                    last_save = std::time::Instant::now();
-                                                    save_requested = false;
-                                                    if quit_requested && saved {
-                                                        target.exit();
-                                                    } else if quit_requested {
-                                                        command_feedback = "Save failed; refusing to quit so world data can be retried.".to_string();
-                                                        quit_requested = false;
-                                                    } else if saved {
-                                                        command_feedback = "World saved.".to_string();
-                                                    } else {
-                                                        command_feedback = "World save failed; see log for details.".to_string();
+                                                        );
+                                                        last_save = std::time::Instant::now();
+                                                        save_requested = false;
+                                                        if quit_requested && saved {
+                                                            target.exit();
+                                                        } else if quit_requested {
+                                                            command_feedback = "Save failed; refusing to quit so world data can be retried.".to_string();
+                                                            quit_requested = false;
+                                                        } else if saved {
+                                                            command_feedback = "World saved.".to_string();
+                                                        } else {
+                                                            command_feedback = "World save failed; see log for details.".to_string();
+                                                        }
                                                     }
                                                 }
-                                                command_feedback_timer = 5.0;
+                                                if !command_feedback.is_empty() {
+                                                    chat_state.add_message(command_feedback.clone());
+                                                    chat_timer = 5.0;
+                                                    command_feedback.clear();
+                                                    command_feedback_timer = 0.0;
+                                                }
                                             } else {
                                                 if network_mode {
                                                     if let Some(transport) = client_transport.as_mut() {
@@ -992,16 +1031,12 @@ async fn run(config: AppConfig) {
                                                         }
                                                     }
                                                 } else {
-                                                    chat_messages.push(format!("<Player> {}", cmd));
-                                                    if chat_messages.len() > 100 {
-                                                        chat_messages.remove(0);
-                                                    }
+                                                    chat_state.add_message(format!("<Player> {cmd}"));
+                                                    chat_timer = 3.0;
                                                 }
                                             }
                                         }
-                                        command_mode = false;
-                                        chat_open = false;
-                                        command_buffer.clear();
+                                        chat_state.close();
                                         if !ui_state.is_menu_open() && !inventory_open {
                                             grabbed = true;
                                             input.mouse_grabbed = true;
@@ -1011,9 +1046,7 @@ async fn run(config: AppConfig) {
                                         renderer.gui_dirty = true;
                                     }
                                     Key::Named(NamedKey::Escape) => {
-                                        command_mode = false;
-                                        chat_open = false;
-                                        command_buffer.clear();
+                                        chat_state.close();
                                         if !ui_state.is_menu_open() && !inventory_open {
                                             grabbed = true;
                                             input.mouse_grabbed = true;
@@ -1023,15 +1056,42 @@ async fn run(config: AppConfig) {
                                         renderer.gui_dirty = true;
                                     }
                                     Key::Named(NamedKey::Backspace) => {
-                                        command_buffer.pop();
+                                        chat_state.backspace();
                                         renderer.gui_dirty = true;
                                     }
+                                    Key::Named(NamedKey::Delete) => { chat_state.delete(); renderer.gui_dirty = true; }
+                                    Key::Named(NamedKey::ArrowLeft) => {
+                                        let shift = input.is_key_pressed(KeyCode::ShiftLeft) || input.is_key_pressed(KeyCode::ShiftRight);
+                                        chat_state.move_cursor(-1, shift);
+                                        renderer.gui_dirty = true;
+                                    }
+                                    Key::Named(NamedKey::ArrowRight) => {
+                                        let shift = input.is_key_pressed(KeyCode::ShiftLeft) || input.is_key_pressed(KeyCode::ShiftRight);
+                                        chat_state.move_cursor(1, shift);
+                                        renderer.gui_dirty = true;
+                                    }
+                                    Key::Named(NamedKey::Home) => {
+                                        let shift = input.is_key_pressed(KeyCode::ShiftLeft) || input.is_key_pressed(KeyCode::ShiftRight);
+                                        chat_state.move_to_start(shift);
+                                        renderer.gui_dirty = true;
+                                    }
+                                    Key::Named(NamedKey::End) => {
+                                        let shift = input.is_key_pressed(KeyCode::ShiftLeft) || input.is_key_pressed(KeyCode::ShiftRight);
+                                        chat_state.move_to_end(shift);
+                                        renderer.gui_dirty = true;
+                                    }
+                                    Key::Named(NamedKey::ArrowUp) => { chat_state.recall_previous(); renderer.gui_dirty = true; }
+                                    Key::Named(NamedKey::ArrowDown) => { chat_state.recall_next(); renderer.gui_dirty = true; }
+                                    Key::Named(NamedKey::Tab) => {
+                                        let suggestions = chat::command_suggestions(&chat_state.text);
+                                        if chat_state.complete(&suggestions) { renderer.gui_dirty = true; }
+                                    }
                                     Key::Named(NamedKey::Space) => {
-                                        command_buffer.push(' ');
+                                        chat_state.insert(" ");
                                         renderer.gui_dirty = true;
                                     }
                                     Key::Character(c) => {
-                                        command_buffer.push_str(c.as_ref());
+                                        chat_state.insert(c.as_ref());
                                         renderer.gui_dirty = true;
                                     }
                                     _ => {}
@@ -1063,16 +1123,78 @@ async fn run(config: AppConfig) {
                                         }
                                         renderer.gui_dirty = true;
                                     }
-                                    Key::Character(value) => {
-                                        if ui_state.connect_field == 0 {
-                                            ui_state.append_server_address(value.as_ref());
-                                        } else {
-                                            ui_state.append_connect_username(value.as_ref());
-                                        }
-                                        renderer.gui_dirty = true;
-                                    }
-                                    _ => {}
-                                }
+                                     Key::Named(NamedKey::Space) => {
+                                         if ui_state.connect_field == 0 {
+                                             ui_state.append_server_address(" ");
+                                         } else {
+                                             ui_state.append_connect_username(" ");
+                                         }
+                                         renderer.gui_dirty = true;
+                                     }
+                                     Key::Character(value) => {
+                                         if ui_state.connect_field == 0 {
+                                             ui_state.append_server_address(value.as_ref());
+                                         } else {
+                                             ui_state.append_connect_username(value.as_ref());
+                                         }
+                                         renderer.gui_dirty = true;
+                                     }
+                                     _ => {}
+                                 }
+                             } else if ui_state.screen == ui::UiScreen::CreateWorld {
+                                 match &key_event.logical_key {
+                                     Key::Named(NamedKey::Enter) => {
+                                         if ui_state.handle_key(KeyCode::Enter) == UiAction::CreateWorld {
+                                             pending_world_open = Some(WorldOpenRequest::Create(ui_state.create_options()));
+                                         }
+                                         renderer.gui_dirty = true;
+                                     }
+                                     Key::Named(NamedKey::Escape) => {
+                                         ui_state.handle_escape();
+                                         renderer.gui_dirty = true;
+                                     }
+                                     Key::Named(NamedKey::Tab) => {
+                                         ui_state.handle_key(KeyCode::Tab);
+                                         renderer.gui_dirty = true;
+                                     }
+                                     Key::Named(NamedKey::Backspace) => {
+                                         ui_state.backspace_create_text();
+                                         renderer.gui_dirty = true;
+                                     }
+                                     Key::Named(NamedKey::Delete) => {
+                                         ui_state.delete_create_text();
+                                         renderer.gui_dirty = true;
+                                     }
+                                     Key::Named(NamedKey::ArrowLeft) => {
+                                         let shift = input.is_key_pressed(KeyCode::ShiftLeft) || input.is_key_pressed(KeyCode::ShiftRight);
+                                         ui_state.move_create_cursor(-1, shift);
+                                         renderer.gui_dirty = true;
+                                     }
+                                     Key::Named(NamedKey::ArrowRight) => {
+                                         let shift = input.is_key_pressed(KeyCode::ShiftLeft) || input.is_key_pressed(KeyCode::ShiftRight);
+                                         ui_state.move_create_cursor(1, shift);
+                                         renderer.gui_dirty = true;
+                                     }
+                                     Key::Named(NamedKey::Home) => {
+                                         let shift = input.is_key_pressed(KeyCode::ShiftLeft) || input.is_key_pressed(KeyCode::ShiftRight);
+                                         ui_state.move_create_to_start(shift);
+                                         renderer.gui_dirty = true;
+                                     }
+                                     Key::Named(NamedKey::End) => {
+                                         let shift = input.is_key_pressed(KeyCode::ShiftLeft) || input.is_key_pressed(KeyCode::ShiftRight);
+                                         ui_state.move_create_to_end(shift);
+                                         renderer.gui_dirty = true;
+                                     }
+                                     Key::Named(NamedKey::Space) => {
+                                         ui_state.insert_create_text(" ");
+                                         renderer.gui_dirty = true;
+                                     }
+                                     Key::Character(value) => {
+                                         ui_state.insert_create_text(value.as_ref());
+                                         renderer.gui_dirty = true;
+                                     }
+                                     _ => {}
+                                 }
                             } else {
                                 match key_event.physical_key {
                                      PhysicalKey::Code(KeyCode::Escape) => {
@@ -1131,17 +1253,33 @@ async fn run(config: AppConfig) {
                                                   ui_state.screen = ui::UiScreen::Loading;
                                                   ui_state.connecting = true;
                                               }
-                                             if action == UiAction::StartGame {
-                                                loading_started = Some(std::time::Instant::now());
-                                                ui_state.loading_progress = 0.0;
-                                                break_target = None;
-                                                break_progress = 0.0;
-                                                right_was_pressed = false;
-                                                input.clear();
-                                                grabbed = false;
-                                                input.mouse_grabbed = false;
-                                                window.set_cursor_visible(true);
-                                                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                            if action == UiAction::OpenWorldSelect {
+                                                match discover_worlds(&config.world_dir) {
+                                                    Ok(discovery) => {
+                                                        for (path, error) in discovery.rejected {
+                                                            log::warn!("skipping invalid world {}: {error}", path.display());
+                                                        }
+                                                        browser_paths = discovery.worlds.iter().map(|world| world.path.clone()).collect();
+                                                        ui_state.open_world_select(discovery.worlds.into_iter().map(|world| ui::UiWorld {
+                                                            name: world.name,
+                                                            gamemode: world.gamemode,
+                                                            hardcore: world.hardcore,
+                                                            last_played: world.last_played,
+                                                        }).collect());
+                                                    }
+                                                    Err(error) => {
+                                                        command_feedback = format!("Could not list worlds: {error}");
+                                                        command_feedback_timer = 5.0;
+                                                    }
+                                                }
+                                            }
+                                            if action == UiAction::LoadSelectedWorld {
+                                                if let Some(path) = ui_state.selected_world.and_then(|index| browser_paths.get(index)).cloned() {
+                                                    pending_world_open = Some(WorldOpenRequest::Existing(path));
+                                                }
+                                            }
+                                            if action == UiAction::CreateWorld {
+                                                pending_world_open = Some(WorldOpenRequest::Create(ui_state.create_options()));
                                             }
                                            if action == UiAction::QuitToTitle {
                                                if !network_mode {
@@ -1217,11 +1355,9 @@ async fn run(config: AppConfig) {
                                      PhysicalKey::Code(KeyCode::KeyF) => {
                                          if !ui_state.captures_gameplay_input() && game_mode.can_fly() { flying = !flying; player.vy = 0.0; }
                                     },
-                                     PhysicalKey::Code(key) if key == bindings.command => {
-                                         if !ui_state.is_menu_open() {
-                                             command_mode = true;
-                                             chat_open = true;
-                                             command_buffer = "/".to_string();
+                                      PhysicalKey::Code(key) if key == bindings.command => {
+                                          if !ui_state.is_menu_open() {
+                                              chat_state.open_with("/");
                                              grabbed = false;
                                              input.mouse_grabbed = false;
                                              window.set_cursor_visible(true);
@@ -1229,11 +1365,9 @@ async fn run(config: AppConfig) {
                                              renderer.gui_dirty = true;
                                          }
                                      }
-                                     PhysicalKey::Code(key) if key == bindings.chat => {
-                                         if !ui_state.is_menu_open() {
-                                             command_mode = true;
-                                             chat_open = true;
-                                             command_buffer = String::new();
+                                      PhysicalKey::Code(key) if key == bindings.chat => {
+                                          if !ui_state.is_menu_open() {
+                                              chat_state.open_with("");
                                              grabbed = false;
                                              input.mouse_grabbed = false;
                                              window.set_cursor_visible(true);
@@ -1251,7 +1385,7 @@ async fn run(config: AppConfig) {
                                     PhysicalKey::Code(KeyCode::Digit8) => { inventory.held_slot = 7.min(inventory::HOTBAR_SLOTS - 1); }
                                     PhysicalKey::Code(KeyCode::Digit9) => { inventory.held_slot = 8.min(inventory::HOTBAR_SLOTS - 1); }
                                       PhysicalKey::Code(key) if key == bindings.inventory => {
-                                          if !command_mode {
+                                           if !chat_state.open {
                                               let was_open = inventory_open;
                                               if was_open || !ui_state.is_menu_open() {
                                                   inventory_open = !inventory_open;
@@ -1290,7 +1424,7 @@ async fn run(config: AppConfig) {
                                           }
                                      }
                                       PhysicalKey::Code(key) if key == bindings.drop_item => {
-                                          if !ui_state.captures_gameplay_input() && !command_mode && !inventory_open {
+                                           if !ui_state.captures_gameplay_input() && !chat_state.open && !inventory_open {
                                              if network_mode {
                                                  if let Some(transport) = client_transport.as_mut() {
                                                      let result = transport.send(ClientMessage::InventoryActionRequest {
@@ -1332,18 +1466,34 @@ async fn run(config: AppConfig) {
                                  if action == UiAction::ToggleGraphics {
                                      render_quality = if ui_state.graphics_vibrant { GraphicsQuality::Vibrant } else { GraphicsQuality::Regular };
                                  }
-                                 if action == UiAction::StartGame {
-                                     loading_started = Some(std::time::Instant::now());
-                                     ui_state.loading_progress = 0.0;
-                                     break_target = None;
-                                     break_progress = 0.0;
-                                     right_was_pressed = false;
-                                     input.clear();
-                                     grabbed = false;
-                                     input.mouse_grabbed = false;
-                                     window.set_cursor_visible(true);
-                                     let _ = window.set_cursor_grab(CursorGrabMode::None);
-                                 }
+                                 if action == UiAction::OpenWorldSelect {
+                                      match discover_worlds(&config.world_dir) {
+                                          Ok(discovery) => {
+                                              for (path, error) in discovery.rejected {
+                                                  log::warn!("skipping invalid world {}: {error}", path.display());
+                                              }
+                                              browser_paths = discovery.worlds.iter().map(|world| world.path.clone()).collect();
+                                              ui_state.open_world_select(discovery.worlds.into_iter().map(|world| ui::UiWorld {
+                                                  name: world.name,
+                                                  gamemode: world.gamemode,
+                                                  hardcore: world.hardcore,
+                                                  last_played: world.last_played,
+                                              }).collect());
+                                          }
+                                          Err(error) => {
+                                              command_feedback = format!("Could not list worlds: {error}");
+                                              command_feedback_timer = 5.0;
+                                          }
+                                      }
+                                  }
+                                  if action == UiAction::LoadSelectedWorld {
+                                      if let Some(path) = ui_state.selected_world.and_then(|index| browser_paths.get(index)).cloned() {
+                                          pending_world_open = Some(WorldOpenRequest::Existing(path));
+                                      }
+                                  }
+                                  if action == UiAction::CreateWorld {
+                                      pending_world_open = Some(WorldOpenRequest::Create(ui_state.create_options()));
+                                  }
                                 if action == UiAction::Quit {
                                     if !network_mode {
                                         save_world(
@@ -1478,7 +1628,10 @@ async fn run(config: AppConfig) {
                             winit::event::MouseScrollDelta::LineDelta(_, y) => *y as i32,
                             winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as i32,
                         };
-                        if amount > 0 {
+                        if chat_state.open {
+                            chat_state.scroll(amount);
+                            renderer.gui_dirty = true;
+                        } else if amount > 0 {
                             inventory.held_slot = (inventory.held_slot + inventory::HOTBAR_SLOTS - 1)
                                 % inventory::HOTBAR_SLOTS;
                         } else if amount < 0 {
@@ -1487,7 +1640,7 @@ async fn run(config: AppConfig) {
                     }
                     WindowEvent::Focused(focused) => {
                         if *focused && !grabbed {
-                            if !ui_state.is_menu_open() && !inventory_open {
+                            if !ui_state.is_menu_open() && !inventory_open && !chat_state.open {
                                 grabbed = true;
                                 input.mouse_grabbed = true;
                                 window.set_cursor_visible(false);
@@ -1514,6 +1667,173 @@ async fn run(config: AppConfig) {
                 let now = std::time::Instant::now();
                 let frame_dt = (now - last_time).as_secs_f32().min(0.25);
                 last_time = now;
+
+                if let Some(request) = pending_world_open.take() {
+                    if !network_mode && inventory_open {
+                        return_crafting_items(
+                            &mut player_crafting,
+                            &mut inventory,
+                            &mut carried_item,
+                            &mut dropped_items,
+                            player.x,
+                            player.y + player.current_eye_height(),
+                            player.z,
+                            &item_registry,
+                        );
+                    }
+                    if !network_mode && !save_world(
+                        &storage, seed, &mut chunk_manager, &player, &inventory,
+                        game_mode, difficulty, hardcore, game_time, simulation_tick,
+                        world_spawn, do_daylight_cycle, keep_inventory, experience,
+                        &tick_scheduler, &dropped_items, &xp_orbs,
+                    ) {
+                        command_feedback = "World save failed; current world remains loaded.".to_string();
+                        command_feedback_timer = 5.0;
+                    } else {
+                        let opened = match request {
+                            WorldOpenRequest::Existing(path) => {
+                                let storage = WorldStorage::new(path);
+                                storage.load_level().map(|level| (storage, level)).map_err(|error| error.to_string())
+                            }
+                            WorldOpenRequest::Create(options) => {
+                                let name = options.name.trim().to_string();
+                                let path = unique_world_directory(&config.world_dir, &name);
+                                path.and_then(|path| {
+                                    std::fs::create_dir(&path).map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+                                    let storage = WorldStorage::new(path);
+                                    let now = unix_millis();
+                                    let level = LevelData {
+                                        name,
+                                        created_at: now,
+                                        last_played: now,
+                                        seed: options.seed.unwrap_or_else(|| config.resolved_seed()),
+                                        tick: 0,
+                                        game_time: 9_000,
+                                        spawn: [0, 75, 0],
+                                        gamemode: options.gamemode.level_gamemode().to_string(),
+                                        difficulty: if options.gamemode.hardcore() { "hard" } else { "normal" }.to_string(),
+                                        hardcore: options.gamemode.hardcore(),
+                                        do_daylight_cycle: true,
+                                        keep_inventory: false,
+                                        experience: 0,
+                                        scheduled_ticks: Vec::new(),
+                                        dropped_items: Vec::new(),
+                                        xp_orbs: Vec::new(),
+                                        players: Vec::new(),
+                                    };
+                                    storage.load_or_create_level(level).map(|level| (storage, level)).map_err(|error| error.to_string())
+                                })
+                            }
+                        };
+                        match opened {
+                            Err(error) => {
+                                command_feedback = format!("Could not open world: {error}");
+                                command_feedback_timer = 5.0;
+                            }
+                            Ok((next_storage, mut next_level)) => {
+                                next_level.last_played = unix_millis();
+                                if let Err(error) = next_storage.save_level(&next_level) {
+                                    command_feedback = format!("Could not update world metadata: {error}");
+                                    command_feedback_timer = 5.0;
+                                    return;
+                                }
+                                let (next_player, next_inventory, is_new_player) = match next_storage.load_player() {
+                                    Ok(data) => match data.into_runtime() {
+                                        Ok((player, inventory)) => (player, inventory, false),
+                                        Err(error) => {
+                                            command_feedback = format!("Could not load player: {error}");
+                                            command_feedback_timer = 5.0;
+                                            return;
+                                        }
+                                    },
+                                    Err(StorageError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => (
+                                        Player::new(next_level.spawn[0] as f32, next_level.spawn[1] as f32, next_level.spawn[2] as f32),
+                                        Inventory::new(),
+                                        true,
+                                    ),
+                                    Err(error) => {
+                                        command_feedback = format!("Could not load player: {error}");
+                                        command_feedback_timer = 5.0;
+                                        return;
+                                    }
+                                };
+                                if let Some(transport) = client_transport.as_mut() { let _ = transport.disconnect(); }
+                                client_transport = None;
+                                network_address = None;
+                                network_mode = false;
+                                network_session_id = None;
+                                network_reconnect_timer = f32::INFINITY;
+                                network_connect_request = None;
+                                server_connect_timer = 0.0;
+                                remote_players.clear();
+                                network_inventory_revision = 0;
+                                network_request_id = 1;
+
+                                storage = next_storage;
+                                seed = next_level.seed;
+                                game_mode = GameMode::from_str(&next_level.gamemode).unwrap_or(GameMode::Survival);
+                                difficulty = Difficulty::from_str(&next_level.difficulty).unwrap_or(Difficulty::Normal);
+                                hardcore = next_level.hardcore;
+                                game_time = next_level.game_time as f32 / 20.0;
+                                simulation_tick = next_level.tick;
+                                do_daylight_cycle = next_level.do_daylight_cycle;
+                                keep_inventory = next_level.keep_inventory;
+                                world_spawn = next_level.spawn;
+                                flying = game_mode.can_fly();
+                                player = next_player;
+                                inventory = next_inventory;
+                                if is_new_player {
+                                    for (index, (id, count)) in [(1u16, 64), (2, 64), (3, 64), (4, 64), (15, 64), (13, 64), (BlockId::OakDoor as u16, 16), (BlockId::OakFence as u16, 64), (BlockId::RedstoneDust as u16, 64)].iter().enumerate() {
+                                        inventory.slots[inventory::HOTBAR_START + index] = inventory::ItemStack::new(*id, *count);
+                                    }
+                                }
+                                new_player = is_new_player;
+                                camera = Camera::new(player.eye_position(), renderer.size.0 as f32 / renderer.size.1 as f32);
+                                chunk_manager = ChunkManager::new(seed, render_distance);
+                                chunk_manager.set_storage(storage.clone());
+                                chunk_manager.update_chunks_async(
+                                    (player.x.floor() as i32).div_euclid(CHUNK_SIZE as i32),
+                                    (player.z.floor() as i32).div_euclid(CHUNK_SIZE as i32),
+                                );
+                                dropped_items = next_level.dropped_items.iter().filter_map(|data| dropped_item_from_data(data, &item_registry)).collect();
+                                xp_orbs = next_level.xp_orbs.iter().map(xp_orb_from_data).collect();
+                                entities = EntityStore::new();
+                                entities.spawn(EntityKind::TrainingDummy, Transform::new(nalgebra::Vector3::new(world_spawn[0] as f32 + 3.0, world_spawn[1] as f32, world_spawn[2] as f32)));
+                                experience = next_level.experience;
+                                tick_scheduler = TickScheduler::from_events(next_level.scheduled_ticks);
+                                simulation_clock = world::simulation::FixedStepClock::new();
+                                player_crafting = CraftingGrid::player();
+                                carried_item = None;
+                                inventory_open = false;
+                                chat_state.close();
+                                break_target = None;
+                                break_progress = 0.0;
+                                right_was_pressed = false;
+                                stable_target_hit = None;
+                                highlight = None;
+                                break_overlay = None;
+                                last_break_overlay_pos = None;
+                                last_hit_pos = None;
+                                chunk_render_data.clear();
+                                all_chunk_data.clear();
+                                render_cache.clear();
+                                border_data = None;
+                                border_needs_rebuild = true;
+                                loading_started = Some(now);
+                                last_save = now;
+                                ui_state.screen = ui::UiScreen::Loading;
+                                ui_state.loading_progress = 0.0;
+                                ui_state.connecting = false;
+                                input.clear();
+                                grabbed = false;
+                                input.mouse_grabbed = false;
+                                window.set_cursor_visible(true);
+                                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                            }
+                        }
+                    }
+                    renderer.gui_dirty = true;
+                }
 
                 if let Some(address_text) = network_connect_request.take() {
                     let address_text = address_text.trim();
@@ -1719,9 +2039,8 @@ async fn run(config: AppConfig) {
                                         }
                                     }
                                     ServerMessage::Chat { sender, message, .. } => {
-                                        chat_messages.push(format!("<{sender}> {message}"));
-                                        if chat_messages.len() > 100 { chat_messages.remove(0); }
-                                        chat_timer = 10.0;
+                                        chat_state.add_message(format!("<{sender}> {message}"));
+                                        chat_timer = 3.0;
                                         renderer.gui_dirty = true;
                                     }
                                     ServerMessage::KeepAlive { nonce } => {
@@ -1798,7 +2117,7 @@ async fn run(config: AppConfig) {
                     fps_timer = 0.0;
                 }
 
-                let gameplay_input = !ui_state.captures_gameplay_input() && !chat_open && !command_mode;
+                let gameplay_input = !ui_state.captures_gameplay_input() && !chat_state.open;
                 let (mouse_dx, mouse_dy) = input.consume_mouse_delta();
                 if gameplay_input {
                     camera.rotate(-mouse_dx * 0.003, mouse_dy * 0.003);
@@ -1887,8 +2206,8 @@ async fn run(config: AppConfig) {
 
                     if let Some(started) = loading_started {
                         ui_state.loading_progress = loading_progress(&chunk_manager, player.x, player.z, render_distance);
-                        if !new_player
-                            && nearby_chunks_ready(&chunk_manager, player.x, player.z)
+                        let min_chunks = if new_player { 2 } else { 1 };
+                        if nearby_chunks_ready(&chunk_manager, player.x, player.z, min_chunks)
                             && now.duration_since(started) >= std::time::Duration::from_millis(500)
                         {
                             loading_started = None;
@@ -2689,15 +3008,16 @@ async fn run(config: AppConfig) {
                 // Build hotbar / chat / inventory text
                 let hotbar: String;
                 let mut chat_lines: Vec<String> = Vec::new();
-                if chat_open {
-                    let visible = chat_messages.len().saturating_sub(10);
-                    for msg in &chat_messages[visible..] {
-                        chat_lines.push(msg.clone());
+                if chat_state.open {
+                    chat_lines.extend(chat_state.visible_messages(10).iter().cloned());
+                    let suggestions = chat::command_suggestions(&chat_state.text);
+                    if !suggestions.is_empty() {
+                        chat_lines.push(format!("[{}]", suggestions.into_iter().take(5).collect::<Vec<_>>().join(", ")));
                     }
-                    if command_mode {
-                        chat_lines.push(format!("> {}_", command_buffer));
+                    if chat_state.unread_messages > 0 {
+                        chat_lines.push(format!("{} new message(s)", chat_state.unread_messages));
                     }
-                    chat_timer = 10.0;
+                    chat_lines.push(chat_state.display_text().to_string());
                     hotbar = String::new();
                 } else if inventory_open {
                     // Inventory rendered graphically in the overlay pass
@@ -2705,15 +3025,9 @@ async fn run(config: AppConfig) {
                     hotbar = String::new();
                 } else {
                     chat_timer = (chat_timer - frame_dt).max(0.0);
-                    if chat_timer > 0.0 && !chat_messages.is_empty() {
-                        let visible = chat_messages.len().saturating_sub(5);
-                        for msg in &chat_messages[visible..] {
-                            chat_lines.push(msg.clone());
-                        }
+                    if chat_timer > 0.0 {
+                        chat_lines.extend(chat_state.recent_messages(5).iter().cloned());
                     }
-                    if command_mode {
-                        hotbar = format!("> {}_", command_buffer);
-                    } else {
                     // Build graphical hotbar with slot boxes
                     let mut h = String::new();
                     for i in 0..inventory::HOTBAR_SLOTS {
@@ -2737,7 +3051,6 @@ async fn run(config: AppConfig) {
                         }
                     }
                     hotbar = h;
-                    }
                 };
 
                 // Chunk border debug lines (only rebuild when chunks change)
@@ -2833,7 +3146,7 @@ async fn run(config: AppConfig) {
                 {
                     let _render_scope = profiler::Scope::new("render");
                     // Build hotbar items for graphical rendering
-                    let hotbar_items: Vec<engine::renderer::HotbarItem> = if !inventory_open && !chat_open {
+                    let hotbar_items: Vec<engine::renderer::HotbarItem> = if !inventory_open && !chat_state.open {
                         (0..inventory::HOTBAR_SLOTS).map(|i| {
                             let stack = inventory.hotbar_slot(i);
                              let tile = if !stack.is_empty() {
@@ -2900,6 +3213,12 @@ async fn run(config: AppConfig) {
                     let selected_stack = inventory.selected_stack();
                     let selected_item_name = if selected_stack.is_empty() { String::new() } else { item_registry.name(selected_stack.id).to_string() };
                     ui_state.tick();
+                    let chat_cursor_info = if chat_state.open {
+                        Some((chat_state.cursor_char_index(), chat_state.selection_range()))
+                    } else {
+                        None
+                    };
+                    let show_chat_cursor = chat_state.open && ui_state.frame_count % 60 < 30;
                     let ui_frame = ui_state.frame(
                         renderer.size.0.max(1) as f32,
                         renderer.size.1.max(1) as f32,
@@ -2927,6 +3246,8 @@ async fn run(config: AppConfig) {
                         player.effects.has(player::StatusEffect::Wither),
                         player.effects.has(player::StatusEffect::Hunger),
                         simulation_tick,
+                        chat_cursor_info,
+                        show_chat_cursor,
                     );
                     // Build nametags: project remote player head positions to screen
                     let mut nametags = Vec::new();
@@ -2979,7 +3300,7 @@ async fn run(config: AppConfig) {
                         health: player.health,
                         hunger: player.hunger,
                         ui_frame: Some(&ui_frame),
-                        ui_captures_gameplay: ui_state.captures_gameplay_input() || chat_open || command_mode,
+                        ui_captures_gameplay: ui_state.captures_gameplay_input() || chat_state.open,
                         nametags: &nametags,
                         world_billboards: &world_billboards,
                         blur_enabled: ui_state.screen == ui::UiScreen::Pause || ui_state.screen == ui::UiScreen::Options || ui_state.screen == ui::UiScreen::Controls || ui_state.screen == ui::UiScreen::Accessibility,
@@ -3049,7 +3370,14 @@ fn save_world(
 ) -> bool {
     let chunks_saved = chunk_manager.flush_saved_chunks();
     let player_saved = storage.save_player(&PlayerData::from_runtime(player, inventory));
+    let prior_level = storage.load_level().ok();
     let level_saved = storage.save_level(&LevelData {
+        name: prior_level
+            .as_ref()
+            .map(|level| level.name.clone())
+            .unwrap_or_else(|| "New World".to_string()),
+        created_at: prior_level.as_ref().map_or_else(unix_millis, |level| level.created_at),
+        last_played: unix_millis(),
         seed,
         tick: simulation_tick,
         game_time: (game_time.rem_euclid(1200.0) * 20.0).round() as u64,
@@ -3106,7 +3434,7 @@ fn execute_command(
     keep_inventory: &mut bool,
     world_spawn: &mut [i32; 3],
     _dropped_items: &mut Vec<DroppedItem>,
-    camera: &Camera,
+    camera: &mut Camera,
     seed: u64,
     experience: &mut u32,
     player: &mut Player,
@@ -3116,7 +3444,8 @@ fn execute_command(
     // Extract the command parts:
     //   /<action> [<subj> [<args>...]]
     let parts: Vec<&str> = cmd.trim_start_matches('/').split_whitespace().collect();
-    let action = parts.first().copied().unwrap_or("");
+    let action = parts.first().copied().unwrap_or("").to_ascii_lowercase();
+    let action = action.as_str();
     let subj = parts.get(1).copied().unwrap_or("");
     let rest: Vec<&str> = parts.get(2..).map(|s| s.to_vec()).unwrap_or_default();
 
@@ -3129,6 +3458,106 @@ fn execute_command(
         *save_requested = true;
         *quit_requested = true;
         *feedback = "Saving world and quitting...".to_string();
+        return;
+    }
+
+    if action == "tp" || action == "teleport" {
+        let coordinates = if subj == "@s" { &rest[..] } else { &parts[1..] };
+        if coordinates.len() != 3 {
+            *feedback = "Usage: /teleport [@s] <x> <y> <z>".to_string();
+            return;
+        }
+        let position = [
+            parse_command_coordinate(coordinates[0], player.x),
+            parse_command_coordinate(coordinates[1], player.y),
+            parse_command_coordinate(coordinates[2], player.z),
+        ];
+        if let [Some(x), Some(y), Some(z)] = position {
+            if !(0..384).contains(&y) {
+                *feedback = "Position is outside the world's build height.".to_string();
+                return;
+            }
+            player.x = x as f32;
+            player.y = y as f32;
+            player.z = z as f32;
+            player.vy = 0.0;
+            camera.position = player.eye_position();
+            *feedback = format!("Teleported to {x}, {y}, {z}");
+        } else {
+            *feedback = "Invalid position. Use absolute numbers or ~ relative coordinates.".to_string();
+        }
+        return;
+    }
+
+    if action == "setblock" {
+        if parts.len() < 5 {
+            *feedback = "Usage: /setblock <x> <y> <z> <block>".to_string();
+            return;
+        }
+        let position = [
+            parse_command_coordinate(parts[1], player.x),
+            parse_command_coordinate(parts[2], player.y),
+            parse_command_coordinate(parts[3], player.z),
+        ];
+        let block = command_block_id(parts[4]);
+        if let ([Some(x), Some(y), Some(z)], Some(block)) = (position, block) {
+            if !(0..384).contains(&y) {
+                *feedback = "Position is outside the world's build height.".to_string();
+                return;
+            }
+            cm.set_block(x, y, z, Block::new(block));
+            mark_neighbors_dirty(cm, cache, x, y, z);
+            *feedback = format!("Set block at {x}, {y}, {z}");
+        } else {
+            *feedback = "Invalid position or unsupported block identifier.".to_string();
+        }
+        return;
+    }
+
+    if action == "fill" {
+        if parts.len() < 8 {
+            *feedback = "Usage: /fill <from> <to> <block> [replace|keep|destroy]".to_string();
+            return;
+        }
+        let coordinates = [
+            parse_command_coordinate(parts[1], player.x), parse_command_coordinate(parts[2], player.y), parse_command_coordinate(parts[3], player.z),
+            parse_command_coordinate(parts[4], player.x), parse_command_coordinate(parts[5], player.y), parse_command_coordinate(parts[6], player.z),
+        ];
+        let Some(block) = command_block_id(parts[7]) else {
+            *feedback = "Unsupported block identifier.".to_string();
+            return;
+        };
+        let [Some(x0), Some(y0), Some(z0), Some(x1), Some(y1), Some(z1)] = coordinates else {
+            *feedback = "Invalid position. Use absolute numbers or ~ relative coordinates.".to_string();
+            return;
+        };
+        let (min_x, max_x) = (x0.min(x1), x0.max(x1));
+        let (min_y, max_y) = (y0.min(y1), y0.max(y1));
+        let (min_z, max_z) = (z0.min(z1), z0.max(z1));
+        let volume = (max_x - min_x + 1) as i64 * (max_y - min_y + 1) as i64 * (max_z - min_z + 1) as i64;
+        if !(0..384).contains(&min_y) || !(0..384).contains(&max_y) || volume > 32_768 {
+            *feedback = "Fill region is outside build height or exceeds 32768 blocks.".to_string();
+            return;
+        }
+        let keep = parts.get(8).is_some_and(|mode| *mode == "keep");
+        let mut dirty = HashSet::new();
+        let mut changed = 0;
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
+                for z in min_z..=max_z {
+                    if keep && !cm.get_block(x, y, z).is_air() {
+                        continue;
+                    }
+                    cm.set_block(x, y, z, Block::new(block));
+                    dirty.insert((x.div_euclid(CHUNK_SIZE as i32), z.div_euclid(CHUNK_SIZE as i32)));
+                    changed += 1;
+                }
+            }
+        }
+        for key in cm.rebuild_chunks_now(&dirty) {
+            cache.remove(&key);
+        }
+        *feedback = format!("Filled {changed} block(s).");
         return;
     }
 
@@ -3183,6 +3612,15 @@ fn execute_command(
     }
 
     // Handle time set command
+    if action == "time" && subj == "query" {
+        match rest.first().copied() {
+            Some("daytime") => *feedback = format!("The time is {:.0}", game_time.rem_euclid(1200.0)),
+            Some("gametime") => *feedback = format!("The game time is {:.0}", *game_time),
+            _ => *feedback = "Usage: /time query <daytime|gametime>".to_string(),
+        }
+        return;
+    }
+
     if action == "time" && subj == "set" {
         let arg = rest.first().copied().unwrap_or("");
         let new_time = match arg.to_lowercase().as_str() {
@@ -3202,11 +3640,29 @@ fn execute_command(
     }
 
     if action == "setworldspawn" {
-        *world_spawn = [
-            camera.position.x.floor() as i32,
-            camera.position.y.floor() as i32,
-            camera.position.z.floor() as i32,
-        ];
+        let position = if parts.len() == 1 {
+            Some([camera.position.x.floor() as i32, camera.position.y.floor() as i32, camera.position.z.floor() as i32])
+        } else if parts.len() == 4 {
+            match (
+                parse_command_coordinate(parts[1], player.x),
+                parse_command_coordinate(parts[2], player.y),
+                parse_command_coordinate(parts[3], player.z),
+            ) {
+                (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let Some(position) = position else {
+            *feedback = "Usage: /setworldspawn [x y z]".to_string();
+            return;
+        };
+        if !(0..384).contains(&position[1]) {
+            *feedback = "Position is outside the world's build height.".to_string();
+            return;
+        }
+        *world_spawn = position;
         *feedback = format!(
             "World spawn set to ({}, {}, {})",
             world_spawn[0], world_spawn[1], world_spawn[2]
@@ -3223,10 +3679,10 @@ fn execute_command(
             .unwrap_or(1)
             .min(64);
         // Try as block first, then as item
-        let item_id: Option<ItemId> = if let Some(bid) = BlockId::from_name(item_name) {
+        let item_id: Option<ItemId> = if let Some(bid) = command_block_id(item_name) {
             Some(item_registry.item_id_from_block(bid))
         } else {
-            None
+            item_id_from_command(item_registry, item_name)
         };
         if let Some(id) = item_id {
             let remaining = inventory.add_item(id, count, item_registry);
@@ -3248,14 +3704,15 @@ fn execute_command(
     }
 
     // Handle xp command
-    if action == "xp" {
-        if let Ok(amount) = subj.parse::<u32>() {
+    if action == "xp" || action == "experience" {
+        let amount_text = if subj == "add" { rest.first().copied().unwrap_or("") } else { subj };
+        if let Ok(amount) = amount_text.parse::<u32>() {
             *experience += amount;
             *feedback = format!("Gave {} experience (total: {})", amount, experience);
         } else if subj.is_empty() {
             *feedback = format!("Experience: {}", experience);
         } else {
-            *feedback = "Usage: /xp <amount>".to_string();
+            *feedback = "Usage: /experience add <amount> [points]".to_string();
         }
         return;
     }
@@ -3357,9 +3814,25 @@ fn execute_command(
     }
 
     // Handle /clearinventory command
-    if action == "clearinventory" || action == "ci" {
-        inventory.clear();
-        *feedback = "Inventory cleared.".to_string();
+    if action == "clear" || action == "clearinventory" || action == "ci" {
+        let item_name = if subj == "@s" { rest.first().copied() } else { (!subj.is_empty()).then_some(subj) };
+        if let Some(item_name) = item_name {
+            let Some(item_id) = command_block_id(item_name).map(|block| item_registry.item_id_from_block(block)).or_else(|| item_id_from_command(item_registry, item_name)) else {
+                *feedback = format!("Unknown item: {item_name}");
+                return;
+            };
+            let mut removed = 0u32;
+            for slot in &mut inventory.slots {
+                if slot.id == item_id {
+                    removed += slot.count as u32;
+                    *slot = inventory::EMPTY_STACK;
+                }
+            }
+            *feedback = format!("Cleared {removed} item(s).");
+        } else {
+            inventory.clear();
+            *feedback = "Cleared the inventory.".to_string();
+        }
         return;
     }
 
@@ -3446,7 +3919,7 @@ fn execute_command(
 
     // Handle /help (no target needed)
     if action == "help" || action == "?" || action == "h" {
-        *feedback = "Commands: /save, /quit, /gamemode, /difficulty, /hardcore, /time set, /setworldspawn, /give, /seed, /xp, /effect, /armor, /heal, /feed, /clearinventory, /hotbar, /weather, /kill, /gamerule, /summon <struct>".to_string();
+        *feedback = "Commands: /teleport, /setblock, /fill, /clear, /experience, /gamemode, /difficulty, /time, /weather, /gamerule, /give, /effect, /seed, /save, /quit. Tab completes supported syntax.".to_string();
         return;
     }
 
@@ -3514,6 +3987,31 @@ fn execute_command(
             *feedback = format!("Unknown: /{}. Try /help", structure);
         }
     }
+}
+
+fn parse_command_coordinate(value: &str, origin: f32) -> Option<i32> {
+    if let Some(offset) = value.strip_prefix('~') {
+        let offset = if offset.is_empty() { 0.0 } else { offset.parse::<f32>().ok()? };
+        return Some((origin + offset).floor() as i32);
+    }
+    value.parse::<f32>().ok().map(|coordinate| coordinate.floor() as i32)
+}
+
+fn command_block_id(value: &str) -> Option<BlockId> {
+    let name = value
+        .strip_prefix("minecraft:")
+        .unwrap_or(value)
+        .split_once('[')
+        .map_or(value.strip_prefix("minecraft:").unwrap_or(value), |(name, _)| name);
+    BlockId::from_name(name)
+}
+
+fn item_id_from_command(items: &ItemRegistry, value: &str) -> Option<ItemId> {
+    let requested = value.strip_prefix("minecraft:").unwrap_or(value).replace([' ', '-'], "_").to_ascii_lowercase();
+    (0..2048u16).find(|&id| {
+        items.is_valid(id)
+            && items.name(id).replace([' ', '-'], "_").to_ascii_lowercase() == requested
+    })
 }
 
 fn mark_block(cm: &mut ChunkManager, x: i32, y: i32, z: i32, id: BlockId) {

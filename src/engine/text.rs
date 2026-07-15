@@ -1,11 +1,11 @@
 use crate::assets::reader::AssetReader;
 use wgpu::*;
 
-const ASCII_FIRST: u32 = 32;
-const ASCII_LAST: u32 = 126;
-const ASCII_GLYPH_COUNT: usize = (ASCII_LAST - ASCII_FIRST + 1) as usize;
-const GLYPH_SIZE: f32 = 8.0;
-const SHADOW_BRIGHTNESS: f32 = 0.25;
+pub(crate) const ASCII_FIRST: u32 = 32;
+pub(crate) const ASCII_LAST: u32 = 126;
+pub(crate) const ASCII_GLYPH_COUNT: usize = (ASCII_LAST - ASCII_FIRST + 1) as usize;
+pub(crate) const GLYPH_SIZE: f32 = 8.0;
+
 
 pub struct FontTexture {
     #[allow(dead_code)]
@@ -385,6 +385,10 @@ impl FontTexture {
         self.build_text(text, center_x - self.measure_text(text, size) * 0.5, y, size)
     }
 
+    pub fn glyph_advances_slice(&self) -> &[f32; ASCII_GLYPH_COUNT] {
+        &self.glyph_advances
+    }
+
     fn glyph_advance(&self, ch: char) -> Option<f32> {
         let code = ch as u32;
         (ASCII_FIRST..=ASCII_LAST)
@@ -392,13 +396,8 @@ impl FontTexture {
             .then(|| self.glyph_advances[(code - ASCII_FIRST) as usize])
     }
 
-    fn shadow_color(color: [f32; 4]) -> [f32; 4] {
-        [
-            color[0] * SHADOW_BRIGHTNESS,
-            color[1] * SHADOW_BRIGHTNESS,
-            color[2] * SHADOW_BRIGHTNESS,
-            color[3],
-        ]
+    fn shadow_color(_color: [f32; 4]) -> [f32; 4] {
+        [0.05, 0.05, 0.05, 1.0]
     }
 
     fn glyph_advances(img: &image::RgbaImage) -> [f32; ASCII_GLYPH_COUNT] {
@@ -454,6 +453,16 @@ impl FontTexture {
     }
 }
 
+pub(crate) fn measure_text_width(text: &str, size: f32, glyph_advances: &[f32; ASCII_GLYPH_COUNT]) -> f32 {
+    text.chars()
+        .filter_map(|ch| {
+            let code = ch as u32;
+            (ASCII_FIRST..=ASCII_LAST).contains(&code).then(|| glyph_advances[(code - ASCII_FIRST) as usize])
+        })
+        .map(|advance| advance * size / GLYPH_SIZE)
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,7 +493,8 @@ mod tests {
     }
 
     #[test]
-    fn shadow_color_uses_minecraft_style_quarter_brightness() {
-        assert_eq!(FontTexture::shadow_color([0.8, 0.4, 0.2, 0.5]), [0.2, 0.1, 0.05, 0.5]);
+    fn shadow_color_is_fixed_dark_gray() {
+        assert_eq!(FontTexture::shadow_color([0.8, 0.4, 0.2, 0.5]), [0.05, 0.05, 0.05, 1.0]);
+        assert_eq!(FontTexture::shadow_color([1.0, 1.0, 1.0, 1.0]), [0.05, 0.05, 0.05, 1.0]);
     }
 }

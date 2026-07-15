@@ -74,6 +74,30 @@ impl WorldGenerator {
 
     const SEA_LEVEL: i32 = 63;
 
+    fn mix_seed(mut value: u64) -> u64 {
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58476d1ce4e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d049bb133111eb);
+        value ^ (value >> 31)
+    }
+
+    fn chunk_rng(&self, cx: i32, cz: i32, salt: u64) -> StdRng {
+        let seed = self.seed
+            ^ (cx as i64 as u64).wrapping_mul(0x9e3779b97f4a7c15)
+            ^ (cz as i64 as u64).wrapping_mul(0xbf58476d1ce4e5b9)
+            ^ salt;
+        StdRng::seed_from_u64(Self::mix_seed(seed))
+    }
+
+    fn column_chance(&self, wx: i64, wz: i64, salt: u64, chance: f64) -> bool {
+        let seed = self.seed
+            ^ (wx as u64).wrapping_mul(0x9e3779b97f4a7c15)
+            ^ (wz as u64).wrapping_mul(0xbf58476d1ce4e5b9)
+            ^ salt;
+        (Self::mix_seed(seed) >> 11) as f64 / ((1u64 << 53) as f64) < chance
+    }
+
     /// Get the "climate" noise vector at a point: (temp, humidity, continental, weirdness)
     fn climate_at(&self, wx: f64, wz: f64) -> (f64, f64, f64, f64) {
         let temp = self.temp_noise.get([wx * 0.0015, wz * 0.0015]);
@@ -335,20 +359,37 @@ impl WorldGenerator {
             *deep_w.entry(p.deep).or_insert(0.0) += w;
         }
 
-        let surface = surface_w.into_iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .map(|(k, _)| k)
-            .unwrap_or(BlockId::GrassBlock);
-        let subsurface = subsurface_w.into_iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .map(|(k, _)| k)
-            .unwrap_or(BlockId::Dirt);
-        let deep = deep_w.into_iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .map(|(k, _)| k)
-            .unwrap_or(BlockId::Stone);
+        let surface = Self::highest_weighted_block(surface_w, BlockId::GrassBlock);
+        let subsurface = Self::highest_weighted_block(subsurface_w, BlockId::Dirt);
+        let deep = Self::highest_weighted_block(deep_w, BlockId::Stone);
 
         (surface, subsurface, deep)
+    }
+
+    fn highest_weighted_block(weights: HashMap<BlockId, f64>, fallback: BlockId) -> BlockId {
+        weights
+            .into_iter()
+            .max_by(|(a_id, a_weight), (b_id, b_weight)| {
+                a_weight
+                    .total_cmp(b_weight)
+                    .then_with(|| (*a_id as u16).cmp(&(*b_id as u16)))
+            })
+            .map(|(id, _)| id)
+            .unwrap_or(fallback)
+    }
+
+    fn surface_water_near(&self, wx: f64, wz: f64, radius: i32) -> bool {
+        for distance in 1..=radius {
+            for (dx, dz) in [(-distance, 0), (distance, 0), (0, -distance), (0, distance)] {
+                let (height, _) = self.compute_height(wx + dx as f64, wz + dz as f64);
+                // Terrain fills ocean and river water only above surfaces below
+                // sea level; a dry y=63 column is not a shoreline source.
+                if height < Self::SEA_LEVEL {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn is_cave(&self, wx: f64, wy: f64, wz: f64) -> bool {
@@ -684,14 +725,6 @@ impl WorldGenerator {
         self.cache_base_x = base_x;
         self.cache_base_z = base_z;
 
-        let chunk_seed = self
-            .seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(chunk.cx as i64 as u64 ^ 0x9e3779b97f4a7c15)
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(chunk.cz as i64 as u64 ^ 0xbf58476d1ce4e5b9);
-        let mut rng = StdRng::seed_from_u64(chunk_seed);
-
         self.column_cache.clear();
         for x in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
@@ -704,7 +737,7 @@ impl WorldGenerator {
 
         for x in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
-                self.generate_terrain_column(chunk, x, z, &mut rng);
+                self.generate_terrain_column(chunk, x, z);
             }
         }
 
@@ -714,15 +747,18 @@ impl WorldGenerator {
         let center_wz = (base_z + 8i64) as f64;
         let (_center_h, center_biome) = self.get_height(center_wx, center_wz);
 
-        self.decorate_biome_features(chunk, &mut rng, base_x, base_z, center_biome);
-        self.place_structures(chunk, &mut rng, base_x, base_z, center_biome);
-        self.generate_ocean_flora(chunk, &mut rng, base_x, base_z);
+        let mut decoration_rng = self.chunk_rng(chunk.cx, chunk.cz, 0x6a09e667f3bcc909);
+        self.decorate_biome_features(chunk, &mut decoration_rng, base_x, base_z, center_biome);
+        let mut structure_rng = self.chunk_rng(chunk.cx, chunk.cz, 0xbb67ae8584caa73b);
+        self.place_structures(chunk, &mut structure_rng, base_x, base_z, center_biome);
+        let mut ocean_rng = self.chunk_rng(chunk.cx, chunk.cz, 0x3c6ef372fe94f82b);
+        self.generate_ocean_flora(chunk, &mut ocean_rng, base_x, base_z);
 
         chunk.recount_fluids();
         chunk.is_dirty = true;
     }
 
-    fn generate_terrain_column(&self, chunk: &mut Chunk, x: usize, z: usize, rng: &mut StdRng) {
+    fn generate_terrain_column(&self, chunk: &mut Chunk, x: usize, z: usize) {
         let base_x = chunk.cx as i64 * CHUNK_SIZE as i64;
         let base_z = chunk.cz as i64 * CHUNK_SIZE as i64;
         let wx = (base_x + x as i64) as f64;
@@ -814,50 +850,19 @@ impl WorldGenerator {
             && biome != Biome::Desert
         {
             if chunk.get_block(x, surface_idx, z).id == BlockId::GrassBlock {
-                let near_water = [
-                    (-1i32, 0i32), (1, 0), (0, -1), (0, 1),
-                    (2, 0), (-2, 0), (0, 2), (0, -2),
-                ]
-                .iter()
-                .any(|(dx, dz)| {
-                    let nx = x as i32 + dx;
-                    let nz = z as i32 + dz;
-                    if nx >= 0 && nx < CHUNK_SIZE as i32 && nz >= 0 && nz < CHUNK_SIZE as i32 {
-                        for wy in Self::SEA_LEVEL.saturating_sub(2)..=Self::SEA_LEVEL {
-                            let b = chunk.get_block(nx as usize, wy as usize, nz as usize);
-                            if b.id == BlockId::Water {
-                                return true;
-                            }
-                        }
-                    }
-                    false
-                });
-                if near_water {
+                if self.surface_water_near(wx, wz, 2) {
                     chunk.set_block(x, surface_idx, z, Block::new(BlockId::Sand));
                 }
             }
         }
 
         if surface_height >= Self::SEA_LEVEL - 2 && surface_height <= Self::SEA_LEVEL + 3 {
-            let near_water = [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)]
-                .iter()
-                .any(|(dx, dz)| {
-                    let nx = x as i32 + dx;
-                    let nz = z as i32 + dz;
-                    if nx >= 0 && nx < CHUNK_SIZE as i32 && nz >= 0 && nz < CHUNK_SIZE as i32 {
-                        for wy in (Self::SEA_LEVEL - 1)..=Self::SEA_LEVEL {
-                            let b = chunk.get_block(nx as usize, wy as usize, nz as usize);
-                            if b.id == BlockId::Water {
-                                return true;
-                            }
-                        }
-                    }
-                    false
-                });
-            if near_water {
+            if self.surface_water_near(wx, wz, 1) {
                 for by in (Self::SEA_LEVEL - 2).max(1)..=(surface_height - 1).min(Self::SEA_LEVEL + 1) {
                     let block = chunk.get_block(x, by as usize, z);
-                    if block.id == BlockId::Dirt && rng.random_bool(0.35) {
+                    if block.id == BlockId::Dirt
+                        && self.column_chance(wx as i64, wz as i64, by as u64 ^ 0x510e527fade682d1, 0.35)
+                    {
                         chunk.set_block(x, by as usize, z, Block::new(BlockId::Sand));
                     }
                 }
@@ -2561,6 +2566,36 @@ mod tests {
         assert_eq!(first.blocks, second.blocks);
         assert_eq!(first.water_count, second.water_count);
         assert_eq!(first.lava_count, second.lava_count);
+    }
+
+    #[test]
+    fn generation_is_independent_of_reused_generator_order() {
+        let seed = 0x5EED;
+        let mut expected = Chunk::new(7, -11);
+        WorldGenerator::new(seed).generate_chunk(&mut expected);
+
+        let mut generator = WorldGenerator::new(seed);
+        let mut first = Chunk::new(7, -11);
+        generator.generate_chunk(&mut first);
+        let mut unrelated = Chunk::new(-24, 19);
+        generator.generate_chunk(&mut unrelated);
+        let mut repeated = Chunk::new(7, -11);
+        generator.generate_chunk(&mut repeated);
+
+        assert_eq!(first.blocks, expected.blocks);
+        assert_eq!(repeated.blocks, expected.blocks);
+        assert_eq!(repeated.water_count, expected.water_count);
+        assert_eq!(repeated.lava_count, expected.lava_count);
+    }
+
+    #[test]
+    fn surface_blending_is_stable_after_other_chunk_generation() {
+        let mut generator = WorldGenerator::new(0x5EED);
+        let before = generator.surface_blocks_for(-17.0, 31.0, 64);
+        let mut unrelated = Chunk::new(3, -2);
+        generator.generate_chunk(&mut unrelated);
+        let after = generator.surface_blocks_for(-17.0, 31.0, 64);
+        assert_eq!(before, after);
     }
 }
 

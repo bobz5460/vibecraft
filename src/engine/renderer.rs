@@ -2205,6 +2205,14 @@ impl Renderer {
                         append_ui_geometry(&mut batches, UiBatchKind::Sprite, quad, quad_indices);
                     }
                 }
+                UiCommand::Cursor { x, y, h } => {
+                    let (quad, quad_indices) = self.font.build_colored_rect(*x, *y, 2.0, *h, [1.0, 1.0, 1.0, 1.0]);
+                    append_ui_geometry(&mut batches, UiBatchKind::Text, quad, quad_indices);
+                }
+                UiCommand::TextSelection { x, y, w, h } => {
+                    let (quad, quad_indices) = self.font.build_colored_rect(*x, *y, *w, *h, [0.3, 0.5, 1.0, 0.4]);
+                    append_ui_geometry(&mut batches, UiBatchKind::Text, quad, quad_indices);
+                }
                 UiCommand::Item { x, y, size, name: _, sprite, hint } => {
                     if let Some((quad, quad_indices)) = self.item_atlas.build_sprite(sprite, *x, *y, *size, *size, [1.0, 1.0, 1.0, 1.0]) {
                         append_ui_geometry(&mut batches, UiBatchKind::Item, quad, quad_indices);

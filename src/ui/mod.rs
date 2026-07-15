@@ -1,4 +1,11 @@
 use winit::keyboard::KeyCode;
+use crate::engine::text::{ASCII_GLYPH_COUNT, measure_text_width};
+
+fn char_byte_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(i, _)| i)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiScreen {
@@ -10,6 +17,8 @@ pub enum UiScreen {
     Accessibility,
     Connect,
     Title,
+    WorldSelect,
+    CreateWorld,
     Loading,
 }
 
@@ -19,7 +28,9 @@ pub enum UiAction {
     Resume,
     Quit,
     QuitToTitle,
-    StartGame,
+    OpenWorldSelect,
+    LoadSelectedWorld,
+    CreateWorld,
     ToggleGraphics,
     DecreaseRenderDistance,
     IncreaseRenderDistance,
@@ -30,6 +41,57 @@ pub enum UiAction {
     ToggleAutoJump,
     OpenConnect,
     ConnectServer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateGameMode {
+    Survival,
+    Hardcore,
+    Creative,
+}
+
+impl CreateGameMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Survival => Self::Hardcore,
+            Self::Hardcore => Self::Creative,
+            Self::Creative => Self::Survival,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Survival => "Survival",
+            Self::Hardcore => "Hardcore",
+            Self::Creative => "Creative",
+        }
+    }
+
+    pub const fn level_gamemode(self) -> &'static str {
+        match self {
+            Self::Creative => "creative",
+            Self::Survival | Self::Hardcore => "survival",
+        }
+    }
+
+    pub const fn hardcore(self) -> bool {
+        matches!(self, Self::Hardcore)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiWorld {
+    pub name: String,
+    pub gamemode: String,
+    pub hardcore: bool,
+    pub last_played: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateWorldOptions {
+    pub name: String,
+    pub seed: Option<u64>,
+    pub gamemode: CreateGameMode,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +181,17 @@ pub enum UiCommand {
         border: f32,
         color: [f32; 4],
     },
+    Cursor {
+        x: f32,
+        y: f32,
+        h: f32,
+    },
+    TextSelection {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -147,6 +220,17 @@ pub struct UiState {
     pub blur_intensity: f32,
     pub frame_count: u64,
     pub connecting: bool,
+    pub worlds: Vec<UiWorld>,
+    pub selected_world: Option<usize>,
+    pub world_name: String,
+    pub world_seed: String,
+    pub world_gamemode: CreateGameMode,
+    pub create_field: usize,
+    create_name_cursor: usize,
+    create_seed_cursor: usize,
+    create_name_selection: Option<usize>,
+    create_seed_selection: Option<usize>,
+    pub glyph_advances: [f32; ASCII_GLYPH_COUNT],
 }
 
 impl Default for UiState {
@@ -171,6 +255,21 @@ impl Default for UiState {
             blur_intensity: 3.0,
             frame_count: 0,
             connecting: false,
+            worlds: Vec::new(),
+            selected_world: None,
+            world_name: "New World".to_string(),
+            world_seed: String::new(),
+            world_gamemode: CreateGameMode::Survival,
+            create_field: 0,
+            create_name_cursor: 9,
+            create_seed_cursor: 0,
+            create_name_selection: None,
+            create_seed_selection: None,
+            glyph_advances: {
+                let mut a = [crate::engine::text::GLYPH_SIZE; ASCII_GLYPH_COUNT];
+                a[0] = 4.0;
+                a
+            },
         }
     }
 }
@@ -242,6 +341,36 @@ impl UiState {
         self.keyboard_focus = None;
     }
 
+    pub fn open_world_select(&mut self, worlds: Vec<UiWorld>) {
+        self.worlds = worlds;
+        self.selected_world = (!self.worlds.is_empty()).then_some(0);
+        self.screen = UiScreen::WorldSelect;
+        self.selected = 0;
+        self.keyboard_focus = None;
+    }
+
+    pub fn open_create_world(&mut self) {
+        self.screen = UiScreen::CreateWorld;
+        self.selected = 0;
+        self.keyboard_focus = None;
+        self.world_name = "New World".to_string();
+        self.world_seed.clear();
+        self.world_gamemode = CreateGameMode::Survival;
+        self.create_field = 0;
+        self.create_name_cursor = 9;
+        self.create_seed_cursor = 0;
+        self.create_name_selection = None;
+        self.create_seed_selection = None;
+    }
+
+    pub fn create_options(&self) -> CreateWorldOptions {
+        CreateWorldOptions {
+            name: self.world_name.trim().to_string(),
+            seed: parse_world_seed(&self.world_seed),
+            gamemode: self.world_gamemode,
+        }
+    }
+
     fn start_loading(&mut self) {
         self.screen = UiScreen::Loading;
         self.selected = 0;
@@ -276,6 +405,12 @@ impl UiState {
                 self.selected = 0;
                 self.keyboard_focus = None;
             }
+            UiScreen::WorldSelect => self.open_title(),
+            UiScreen::CreateWorld => {
+                self.screen = UiScreen::WorldSelect;
+                self.selected = 0;
+                self.keyboard_focus = None;
+            }
             UiScreen::Title => return UiAction::Quit,
             UiScreen::Loading => {}
         }
@@ -307,6 +442,25 @@ impl UiState {
                 self.connect_field = 1;
             }
         }
+        if self.screen == UiScreen::WorldSelect {
+            if let Some((index, _)) = world_row_rects(width, height, self.gui_scale, self.worlds.len())
+                .iter()
+                .enumerate()
+                .find(|(_, rect)| contains(**rect, x, y))
+            {
+                self.selected_world = Some(index);
+                self.keyboard_focus = None;
+                return UiAction::None;
+            }
+        }
+        if self.screen == UiScreen::CreateWorld {
+            let (name_rect, seed_rect) = create_field_rects(width, height, self.gui_scale);
+            if contains(name_rect, x, y) {
+                self.create_field = 0;
+            } else if contains(seed_rect, x, y) {
+                self.create_field = 1;
+            }
+        }
         self.button_rects(width, height)
             .iter()
             .enumerate()
@@ -328,6 +482,8 @@ impl UiState {
             UiScreen::Accessibility => 5,
             UiScreen::Connect => 2,
             UiScreen::Title => 4,
+            UiScreen::WorldSelect => 3,
+            UiScreen::CreateWorld => 3,
             _ => 0,
         }
     }
@@ -446,8 +602,7 @@ impl UiState {
             },
             UiScreen::Title => match index {
                 0 => {
-                    self.start_loading();
-                    UiAction::StartGame
+                    UiAction::OpenWorldSelect
                 }
                 1 => {
                     self.screen = UiScreen::Connect;
@@ -475,6 +630,32 @@ impl UiState {
                 }
                 _ => UiAction::None,
             },
+            UiScreen::WorldSelect => match index {
+                0 if self.selected_world.is_some() => UiAction::LoadSelectedWorld,
+                1 => {
+                    self.open_create_world();
+                    UiAction::None
+                }
+                2 => {
+                    self.open_title();
+                    UiAction::None
+                }
+                _ => UiAction::None,
+            },
+            UiScreen::CreateWorld => match index {
+                0 => {
+                    self.world_gamemode = self.world_gamemode.next();
+                    UiAction::None
+                }
+                1 if !self.world_name.trim().is_empty() => UiAction::CreateWorld,
+                2 => {
+                    self.screen = UiScreen::WorldSelect;
+                    self.selected = 0;
+                    self.keyboard_focus = None;
+                    UiAction::None
+                }
+                _ => UiAction::None,
+            },
             _ => UiAction::None,
         }
     }
@@ -492,6 +673,9 @@ impl UiState {
             KeyCode::ArrowLeft => {
                 if self.screen == UiScreen::Options {
                     self.activate_with_direction(self.selected, true)
+                } else if self.screen == UiScreen::WorldSelect {
+                    self.move_world_selection(-1);
+                    UiAction::None
                 } else {
                     UiAction::None
                 }
@@ -499,6 +683,9 @@ impl UiState {
             KeyCode::ArrowRight => {
                 if self.screen == UiScreen::Options {
                     self.activate_with_direction(self.selected, false)
+                } else if self.screen == UiScreen::WorldSelect {
+                    self.move_world_selection(1);
+                    UiAction::None
                 } else {
                     UiAction::None
                 }
@@ -506,6 +693,8 @@ impl UiState {
             KeyCode::Tab => {
                 if self.screen == UiScreen::Connect {
                     self.switch_connect_field();
+                } else if self.screen == UiScreen::CreateWorld {
+                    self.create_field = (self.create_field + 1) % 2;
                 }
                 UiAction::None
             }
@@ -545,6 +734,124 @@ impl UiState {
         }
     }
 
+    pub fn insert_create_text(&mut self, value: &str) {
+        if self.screen != UiScreen::CreateWorld { return; }
+        let cursor = if self.create_field == 0 { &mut self.create_name_cursor } else { &mut self.create_seed_cursor };
+        let selection = if self.create_field == 0 { &mut self.create_name_selection } else { &mut self.create_seed_selection };
+        let field = if self.create_field == 0 { &mut self.world_name } else { &mut self.world_seed };
+        if selection.is_some() {
+            let sel = selection.take().unwrap();
+            let start = sel.min(*cursor);
+            let end = sel.max(*cursor);
+            let byte_start = char_byte_index(field, start);
+            let byte_end = char_byte_index(field, end);
+            field.replace_range(byte_start..byte_end, "");
+            *cursor = start;
+        }
+        if field.chars().count() >= 64 || value.chars().any(char::is_control) {
+            return;
+        }
+        let byte_idx = char_byte_index(field, *cursor);
+        field.insert_str(byte_idx, value);
+        *cursor += value.chars().count();
+    }
+
+    pub fn backspace_create_text(&mut self) {
+        if self.screen != UiScreen::CreateWorld { return; }
+        let cursor = if self.create_field == 0 { &mut self.create_name_cursor } else { &mut self.create_seed_cursor };
+        let selection = if self.create_field == 0 { &mut self.create_name_selection } else { &mut self.create_seed_selection };
+        let field = if self.create_field == 0 { &mut self.world_name } else { &mut self.world_seed };
+        if let Some(sel) = selection.take() {
+            let start = sel.min(*cursor);
+            let end = sel.max(*cursor);
+            let byte_start = char_byte_index(field, start);
+            let byte_end = char_byte_index(field, end);
+            field.replace_range(byte_start..byte_end, "");
+            *cursor = start;
+            return;
+        }
+        if *cursor == 0 { return; }
+        let byte_start = char_byte_index(field, *cursor - 1);
+        let byte_end = char_byte_index(field, *cursor);
+        field.replace_range(byte_start..byte_end, "");
+        *cursor -= 1;
+    }
+
+    pub fn delete_create_text(&mut self) {
+        if self.screen != UiScreen::CreateWorld { return; }
+        let cursor = if self.create_field == 0 { &mut self.create_name_cursor } else { &mut self.create_seed_cursor };
+        let selection = if self.create_field == 0 { &mut self.create_name_selection } else { &mut self.create_seed_selection };
+        let field = if self.create_field == 0 { &mut self.world_name } else { &mut self.world_seed };
+        if let Some(sel) = selection.take() {
+            let start = sel.min(*cursor);
+            let end = sel.max(*cursor);
+            let byte_start = char_byte_index(field, start);
+            let byte_end = char_byte_index(field, end);
+            field.replace_range(byte_start..byte_end, "");
+            *cursor = start;
+            return;
+        }
+        if *cursor >= field.chars().count() { return; }
+        let byte_start = char_byte_index(field, *cursor);
+        let byte_end = char_byte_index(field, *cursor + 1);
+        field.replace_range(byte_start..byte_end, "");
+    }
+
+    pub fn move_create_cursor(&mut self, delta: i32, extend_selection: bool) {
+        if self.screen != UiScreen::CreateWorld { return; }
+        let cursor = if self.create_field == 0 { &mut self.create_name_cursor } else { &mut self.create_seed_cursor };
+        let selection = if self.create_field == 0 { &mut self.create_name_selection } else { &mut self.create_seed_selection };
+        let field = if self.create_field == 0 { &self.world_name } else { &self.world_seed };
+        let length = field.chars().count() as i32;
+        if !extend_selection {
+            *selection = None;
+        } else if selection.is_none() {
+            *selection = Some(*cursor);
+        }
+        *cursor = (*cursor as i32 + delta).clamp(0, length) as usize;
+    }
+
+    pub fn move_create_to_start(&mut self, extend_selection: bool) {
+        if self.screen != UiScreen::CreateWorld { return; }
+        let cursor = if self.create_field == 0 { &mut self.create_name_cursor } else { &mut self.create_seed_cursor };
+        let selection = if self.create_field == 0 { &mut self.create_name_selection } else { &mut self.create_seed_selection };
+        if !extend_selection {
+            *selection = None;
+        } else if selection.is_none() {
+            *selection = Some(*cursor);
+        }
+        *cursor = 0;
+    }
+
+    pub fn move_create_to_end(&mut self, extend_selection: bool) {
+        if self.screen != UiScreen::CreateWorld { return; }
+        let cursor = if self.create_field == 0 { &mut self.create_name_cursor } else { &mut self.create_seed_cursor };
+        let selection = if self.create_field == 0 { &mut self.create_name_selection } else { &mut self.create_seed_selection };
+        let field = if self.create_field == 0 { &self.world_name } else { &self.world_seed };
+        if !extend_selection {
+            *selection = None;
+        } else if selection.is_none() {
+            *selection = Some(*cursor);
+        }
+        *cursor = field.chars().count();
+    }
+
+    pub fn create_cursor_info(&self) -> Option<(usize, Option<(usize, usize)>)> {
+        if self.screen != UiScreen::CreateWorld { return None; }
+        let (cursor, selection) = if self.create_field == 0 {
+            (self.create_name_cursor, self.create_name_selection)
+        } else {
+            (self.create_seed_cursor, self.create_seed_selection)
+        };
+        Some((cursor, selection.map(|s| (s.min(cursor), s.max(cursor)))))
+    }
+
+    fn move_world_selection(&mut self, direction: i32) {
+        if self.worlds.is_empty() { return; }
+        let current = self.selected_world.unwrap_or(0) as i32;
+        self.selected_world = Some((current + direction).rem_euclid(self.worlds.len() as i32) as usize);
+    }
+
     fn button_rects(&self, width: f32, height: f32) -> Vec<(f32, f32, f32, f32)> {
         let button_w = self.button_width(width);
         let button_h = 20.0 * self.gui_scale;
@@ -555,6 +862,14 @@ impl UiState {
             // Title screen buttons follow the classic Minecraft layout:
             // virtual Y = height/4 + 48, then 24px spacing between tops.
             UiScreen::Title => height / 4.0 + 48.0 * self.gui_scale,
+            UiScreen::WorldSelect => height - 84.0 * self.gui_scale,
+            UiScreen::CreateWorld => {
+                let total_h = count as f32 * button_h + (count - 1) as f32 * gap;
+                let seed_bottom = height * 0.29 + 74.0 * self.gui_scale;
+                let from_bottom = height - 84.0 * self.gui_scale;
+                let max_top = (height - total_h).max(0.0);
+                from_bottom.max(seed_bottom).min(max_top)
+            }
             _ => {
                 let total_h = count as f32 * button_h + (count - 1) as f32 * gap;
                 (height - total_h) * 0.5 + 20.0 * self.gui_scale
@@ -606,12 +921,14 @@ impl UiState {
         has_wither: bool,
         has_hunger_effect: bool,
         tick: u64,
+        chat_cursor_info: Option<(usize, Option<(usize, usize)>)>,
+        show_chat_cursor: bool,
     ) -> UiFrame {
         let mut frame = UiFrame::default();
         match self.screen {
             UiScreen::Playing => {
                 draw_hud(&mut frame, width, height, self.gui_scale, hotbar, health, hunger, saturation, absorption, armor_points, experience, selected_item_name, show_crosshair, hurt_timer, health_blink_timer, hunger_shake_timer, has_regen, has_poison, has_wither, has_hunger_effect, tick);
-                draw_chat(&mut frame, width, height, chat_lines, self.chat_opacity);
+                draw_chat(&mut frame, width, height, chat_lines, self.chat_opacity, chat_cursor_info, &self.glyph_advances, show_chat_cursor);
                 if let Some(feedback) = feedback.filter(|text| !text.is_empty()) {
                     draw_toast(&mut frame, width, feedback);
                 }
@@ -626,6 +943,8 @@ impl UiState {
             UiScreen::Accessibility => draw_accessibility(&mut frame, width, height, self, cursor),
             UiScreen::Connect => draw_connect(&mut frame, width, height, self, cursor, feedback),
             UiScreen::Title => draw_title_screen(&mut frame, width, height, self, cursor),
+            UiScreen::WorldSelect => draw_world_select(&mut frame, width, height, self, cursor),
+            UiScreen::CreateWorld => draw_create_world(&mut frame, width, height, self, cursor),
             UiScreen::Loading => draw_loading(&mut frame, width, height, self.gui_scale, self.loading_progress, self.connecting),
         }
         frame
@@ -1129,14 +1448,90 @@ fn draw_inventory_item(frame: &mut UiFrame, x: f32, y: f32, scale: f32, item: &U
     draw_slot_item(frame, x, y, scale, item);
 }
 
-fn draw_chat(frame: &mut UiFrame, _width: f32, height: f32, lines: &[String], opacity: f32) {
+fn draw_chat(
+    frame: &mut UiFrame,
+    width: f32,
+    height: f32,
+    lines: &[String],
+    opacity: f32,
+    cursor_info: Option<(usize, Option<(usize, usize)>)>,
+    glyph_advances: &[f32; ASCII_GLYPH_COUNT],
+    show_cursor: bool,
+) {
     if lines.is_empty() { return; }
     let line_h = 18.0;
-    let top = height - 92.0 - lines.len().min(8) as f32 * line_h;
-    rect(frame, 8.0, top - 4.0, 520.0, lines.len().min(8) as f32 * line_h + 8.0, [0.0, 0.0, 0.0, opacity]);
-    for (index, line) in lines.iter().rev().take(8).enumerate() {
-        text(frame, 14.0, height - 28.0 - index as f32 * line_h, 14.0, line, [1.0, 1.0, 1.0, 1.0]);
+    let chat_width = (width * 0.45).clamp(240.0, 520.0);
+    let max_chars = ((chat_width - 20.0) / 7.0).floor().max(1.0) as usize;
+    let wrapped: Vec<String> = lines.iter().flat_map(|line| wrap_chat_line(line, max_chars)).collect();
+    let visible_start = wrapped.len().saturating_sub(10);
+    let visible = &wrapped[visible_start..];
+    let top = height - 34.0 - visible.len() as f32 * line_h;
+    rect(frame, 8.0, top - 4.0, chat_width, visible.len() as f32 * line_h + 8.0, [0.0, 0.0, 0.0, opacity]);
+    for (index, line) in visible.iter().enumerate() {
+        text(frame, 14.0, top + index as f32 * line_h, 14.0, line, [1.0, 1.0, 1.0, 1.0]);
     }
+    // Draw cursor and selection on the input line (last original line)
+    if let (Some((cursor_char, selection)), Some(input_text)) = (cursor_info, lines.last()) {
+        let input_line_index = visible.len() - 1;
+        let input_y = top + input_line_index as f32 * line_h;
+        let text_x = 14.0;
+        let text_size = 14.0;
+        if show_cursor {
+            if let Some((sel_start, sel_end)) = selection {
+                let sel_byte_start = char_byte_index(input_text, sel_start);
+                let sel_byte_end = char_byte_index(input_text, sel_end);
+                let sel_start_x = text_x + measure_text_width(&input_text[..sel_byte_start], text_size, glyph_advances);
+                let sel_w = measure_text_width(&input_text[sel_byte_start..sel_byte_end], text_size, glyph_advances);
+                frame.commands.push(UiCommand::TextSelection {
+                    x: sel_start_x,
+                    y: input_y,
+                    w: sel_w,
+                    h: text_size,
+                });
+            }
+            let cursor_byte = char_byte_index(input_text, cursor_char);
+            let cursor_x = text_x + measure_text_width(&input_text[..cursor_byte], text_size, glyph_advances);
+            frame.commands.push(UiCommand::Cursor {
+                x: cursor_x,
+                y: input_y,
+                h: text_size,
+            });
+        }
+    }
+}
+
+fn wrap_chat_line(line: &str, max_chars: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+    for word in line.split_whitespace() {
+        let required = word.chars().count() + usize::from(!current.is_empty());
+        if !current.is_empty() && current.chars().count() + required > max_chars {
+            wrapped.push(std::mem::take(&mut current));
+        }
+        if word.chars().count() > max_chars {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            for character in word.chars() {
+                if current.chars().count() == max_chars {
+                    wrapped.push(std::mem::take(&mut current));
+                }
+                current.push(character);
+            }
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        wrapped.push(current);
+    }
+    wrapped
 }
 
 fn draw_toast(frame: &mut UiFrame, width: f32, message: &str) {
@@ -1180,7 +1575,7 @@ fn draw_connect(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, c
     text(frame, input_x + pad_x, address_y + pad_y, text_size, &state.server_address,
          if state.connect_field == 0 { [1.0, 1.0, 1.0, 1.0] } else { [0.6, 0.6, 0.6, 1.0] });
     if state.connect_field == 0 && state.frame_count % 60 < 30 {
-        let text_end = input_x + pad_x + state.server_address.chars().count() as f32 * text_size * 0.75;
+        let text_end = input_x + pad_x + measure_text_width(&state.server_address, text_size, &state.glyph_advances);
         rect(frame, text_end, address_y + pad_y, 2.0 * scale, text_size, [1.0, 1.0, 1.0, 0.8]);
     }
 
@@ -1191,7 +1586,7 @@ fn draw_connect(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, c
     text(frame, input_x + pad_x, username_y + pad_y, text_size, &state.connect_username,
          if state.connect_field == 1 { [1.0, 1.0, 1.0, 1.0] } else { [0.6, 0.6, 0.6, 1.0] });
     if state.connect_field == 1 && state.frame_count % 60 < 30 {
-        let text_end = input_x + pad_x + state.connect_username.chars().count() as f32 * text_size * 0.75;
+        let text_end = input_x + pad_x + measure_text_width(&state.connect_username, text_size, &state.glyph_advances);
         rect(frame, text_end, username_y + pad_y, 2.0 * scale, text_size, [1.0, 1.0, 1.0, 0.8]);
     }
 
@@ -1330,6 +1725,118 @@ fn draw_title_screen(frame: &mut UiFrame, width: f32, height: f32, state: &UiSta
     centered_text(frame, width * 0.5, height - 18.0 * state.gui_scale, text_size, copyright, [0.5, 0.5, 0.5, 1.0]);
 }
 
+fn world_row_rects(width: f32, height: f32, scale: f32, count: usize) -> Vec<(f32, f32, f32, f32)> {
+    let row_w = (width - 48.0 * scale).min(460.0 * scale);
+    let row_h = 36.0 * scale;
+    let left = (width - row_w) * 0.5;
+    let top = height * 0.20;
+    (0..count.min(6))
+        .map(|index| (left, top + index as f32 * (row_h + 6.0 * scale), row_w, row_h))
+        .collect()
+}
+
+fn create_field_rects(width: f32, height: f32, scale: f32) -> ((f32, f32, f32, f32), (f32, f32, f32, f32)) {
+    let field_w = (width - 48.0 * scale).min(400.0 * scale);
+    let field_h = 20.0 * scale;
+    let left = (width - field_w) * 0.5;
+    let name_y = height * 0.29;
+    ((left, name_y, field_w, field_h), (left, name_y + 54.0 * scale, field_w, field_h))
+}
+
+fn draw_world_select(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>) {
+    panel(frame, width, height, state.high_contrast);
+    let scale = state.gui_scale;
+    centered_text(frame, width * 0.5, height * 0.10, 12.0 * scale, "Select World", [1.0, 1.0, 1.0, 1.0]);
+    if state.worlds.is_empty() {
+        centered_text(frame, width * 0.5, height * 0.34, 10.0 * scale, "No worlds found", [0.72, 0.72, 0.72, 1.0]);
+    }
+    for (index, ((x, y, w, h), world)) in world_row_rects(width, height, scale, state.worlds.len()).into_iter().zip(&state.worlds).enumerate() {
+        let selected = state.selected_world == Some(index);
+        let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
+        nine_slice(frame, if selected || hovered { "widget/button_highlighted" } else { "widget/button" }, x, y, w, h, 3.0, [1.0, 1.0, 1.0, 1.0]);
+        text(frame, x + 7.0 * scale, y + 5.0 * scale, 10.0 * scale, &world.name, [1.0, 1.0, 1.0, 1.0]);
+        let mode = if world.hardcore { "Hardcore" } else { &world.gamemode };
+        text(frame, x + 7.0 * scale, y + 19.0 * scale, 8.0 * scale, format!("{}  |  Last played {}", mode, world_time_label(world.last_played)), [0.72, 0.72, 0.72, 1.0]);
+    }
+    let labels = ["Play Selected World", "Create New World", "Cancel"];
+    for (index, label) in labels.iter().enumerate() {
+        if let Some(&(x, y, w, h)) = state.button_rects(width, height).get(index) {
+            let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
+            minecraft_button(frame, x, y, w, h, label, state.keyboard_focus == Some(index), hovered);
+        }
+    }
+}
+
+fn draw_create_world(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>) {
+    panel(frame, width, height, state.high_contrast);
+    let scale = state.gui_scale;
+    centered_text(frame, width * 0.5, height * 0.12, 12.0 * scale, "Create New World", [1.0, 1.0, 1.0, 1.0]);
+    let (name_rect, seed_rect) = create_field_rects(width, height, scale);
+    let show_create_cursor = state.frame_count % 60 < 30;
+    let name_cursor = if state.create_field == 0 { state.create_cursor_info() } else { None };
+    let seed_cursor = if state.create_field == 1 { state.create_cursor_info() } else { None };
+    draw_create_field(frame, "World Name", &state.world_name, name_rect, state.create_field == 0, scale, &state.glyph_advances, name_cursor, show_create_cursor);
+    draw_create_field(frame, "Seed for the world generator", &state.world_seed, seed_rect, state.create_field == 1, scale, &state.glyph_advances, seed_cursor, show_create_cursor);
+    let labels = [
+        format!("Game Mode: {}", state.world_gamemode.label()),
+        "Create New World".to_string(),
+        "Cancel".to_string(),
+    ];
+    for (index, label) in labels.iter().enumerate() {
+        if let Some(&(x, y, w, h)) = state.button_rects(width, height).get(index) {
+            let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
+            minecraft_button(frame, x, y, w, h, label, state.keyboard_focus == Some(index), hovered);
+        }
+    }
+}
+
+fn draw_create_field(frame: &mut UiFrame, label: &str, value: &str, (x, y, w, h): (f32, f32, f32, f32), active: bool, scale: f32, glyph_advances: &[f32; ASCII_GLYPH_COUNT], cursor_info: Option<(usize, Option<(usize, usize)>)>, show_cursor: bool) {
+    let label_size = 12.0 * scale;
+    let pad_y = 4.0 * scale;
+    text(frame, x, y - label_size - pad_y, label_size, label, [0.82, 0.82, 0.88, 1.0]);
+    nine_slice(frame, "widget/text_field", x, y, w, h, 3.0, [1.0, 1.0, 1.0, 1.0]);
+    let text_size = 12.0 * scale;
+    let pad_x = 6.0 * scale;
+    text(frame, x + pad_x, y + pad_y, text_size, value, if active { [1.0; 4] } else { [0.6, 0.6, 0.6, 1.0] });
+    if active && show_cursor {
+        if let Some((cursor_char, selection)) = cursor_info {
+            if let Some((sel_start, sel_end)) = selection {
+                let sel_byte_start = char_byte_index(value, sel_start);
+                let sel_byte_end = char_byte_index(value, sel_end);
+                let sel_start_x = x + pad_x + measure_text_width(&value[..sel_byte_start], text_size, glyph_advances);
+                let sel_w = measure_text_width(&value[sel_byte_start..sel_byte_end], text_size, glyph_advances);
+                frame.commands.push(UiCommand::TextSelection {
+                    x: sel_start_x,
+                    y: y + pad_y,
+                    w: sel_w,
+                    h: text_size,
+                });
+            }
+            let cursor_byte = char_byte_index(value, cursor_char);
+            let cursor_x = x + pad_x + measure_text_width(&value[..cursor_byte], text_size, glyph_advances);
+            frame.commands.push(UiCommand::Cursor {
+                x: cursor_x,
+                y: y + pad_y,
+                h: text_size,
+            });
+        }
+    }
+}
+
+fn world_time_label(value: u64) -> String {
+    if value == 0 { "unknown".to_string() } else { format!("{}", value / 1_000) }
+}
+
+/// Matches Java Edition's seed handling for this native generator: signed long
+/// text is used directly; other text becomes Java String.hashCode() sign-extended.
+pub fn parse_world_seed(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() { return None; }
+    if let Ok(seed) = value.parse::<i64>() { return Some(seed as u64); }
+    let hash = value.encode_utf16().fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(unit as i32));
+    Some((hash as i64) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1386,6 +1893,8 @@ mod tests {
             false,
             false,
             0,
+            None,
+            false,
         );
 
         let button_sprites: Vec<&str> = frame.commands.iter().filter_map(|command| match command {
@@ -1397,7 +1906,7 @@ mod tests {
 
         ui.move_focus(1);
         let focused_frame = ui.frame(
-            800.0, 600.0, &[], None, None, None, None, 20.0, 20.0, 20.0, 0.0, 0.0, 0.0, "", &[], None, None, false, 0.0, 0.0, 0.0, false, false, false, false, 0,
+            800.0, 600.0, &[], None, None, None, None, 20.0, 20.0, 20.0, 0.0, 0.0, 0.0, "", &[], None, None, false, 0.0, 0.0, 0.0, false, false, false, false, 0, None, false,
         );
         assert_eq!(
             focused_frame.commands.iter().filter(|command| matches!(command, UiCommand::NineSlice { sprite, .. } if sprite == "widget/button_highlighted")).count(),
@@ -1420,7 +1929,7 @@ mod tests {
         ui.screen = UiScreen::Loading;
         ui.loading_progress = 0.5;
         let frame = ui.frame(
-            800.0, 600.0, &[], None, None, None, None, 20.0, 20.0, 20.0, 0.0, 0.0, 0.0, "", &[], None, None, false, 0.0, 0.0, 0.0, false, false, false, false, 0,
+            800.0, 600.0, &[], None, None, None, None, 20.0, 20.0, 20.0, 0.0, 0.0, 0.0, "", &[], None, None, false, 0.0, 0.0, 0.0, false, false, false, false, 0, None, false,
         );
         assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::Sprite { name, .. } if name == "hud/experience_bar_background")));
         assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::SpriteProgress { name, progress, .. } if name == "hud/experience_bar_progress" && *progress == 0.5)));
@@ -1430,10 +1939,11 @@ mod tests {
     fn connect_screen_edits_address_and_submits() {
         let mut ui = UiState::default();
         ui.screen = UiScreen::Title;
-        assert_eq!(ui.activate_focused(), UiAction::StartGame);
-        assert_eq!(ui.screen, UiScreen::Loading);
+        assert_eq!(ui.activate_focused(), UiAction::OpenWorldSelect);
+        assert_eq!(ui.screen, UiScreen::Title);
+        ui.open_world_select(Vec::new());
         assert_eq!(ui.handle_escape(), UiAction::None);
-        assert_eq!(ui.screen, UiScreen::Loading);
+        assert_eq!(ui.screen, UiScreen::Title);
         ui.screen = UiScreen::Title;
         ui.selected = 0;
         ui.move_focus(3);
@@ -1443,6 +1953,32 @@ mod tests {
         ui.server_address.clear();
         ui.append_server_address("localhost:25565");
         assert_eq!(ui.activate_focused(), UiAction::ConnectServer);
+    }
+
+    #[test]
+    fn create_world_uses_java_style_seed_input() {
+        assert_eq!(parse_world_seed(""), None);
+        assert_eq!(parse_world_seed("-1"), Some(u64::MAX));
+        assert_eq!(parse_world_seed("Aa"), parse_world_seed("BB"));
+        assert_eq!(parse_world_seed("seed"), Some(3_526_257));
+    }
+
+    #[test]
+    fn world_select_and_create_flow_use_textured_controls() {
+        let mut ui = UiState::default();
+        ui.open_world_select(vec![UiWorld {
+            name: "New World".to_string(),
+            gamemode: "survival".to_string(),
+            hardcore: false,
+            last_played: 0,
+        }]);
+        assert_eq!(ui.activate_focused(), UiAction::LoadSelectedWorld);
+        ui.open_create_world();
+        ui.append_create_text(" Test");
+        assert_eq!(ui.world_name, "New World Test");
+        let frame = ui.frame(800.0, 600.0, &[], None, None, None, None, 20.0, 20.0, 20.0, 0.0, 0.0, 0.0, "", &[], None, None, false, 0.0, 0.0, 0.0, false, false, false, false, 0, None, false);
+        assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::NineSlice { sprite, .. } if sprite == "widget/text_field")));
+        assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::NineSlice { sprite, .. } if sprite == "widget/button")));
     }
 
     #[test]

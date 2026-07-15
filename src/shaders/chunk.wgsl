@@ -198,15 +198,22 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         color = vec4<f32>(mix(reflected, water_blue, 0.15), 0.6);
     }
 
+    // Underwater fog: dense blue, very short range
+    let underwater = uniforms.fog_params.w;
+    let underwater_fog_color = vec3<f32>(0.03, 0.18, 0.28);
+    let underwater_fog_start = 0.5;
+    let underwater_fog_end = 8.0;
+
     // Vanilla-style linear fog with squared curve
     let day_fog = vec3<f32>(0.65, 0.80, 0.98);
     let night_fog = vec3<f32>(0.02, 0.02, 0.1);
     let fog_color = mix(day_fog, night_fog, night);
-    let fog_start = uniforms.fog_params.x;
-    let fog_end = uniforms.fog_params.y;
+    let fog_start = mix(uniforms.fog_params.x, underwater_fog_start, underwater);
+    let fog_end = mix(uniforms.fog_params.y, underwater_fog_end, underwater);
+    let final_fog_color = mix(fog_color, underwater_fog_color, underwater);
     let fog_factor = clamp((input.distance - fog_start) / (fog_end - fog_start), 0.0, 1.0);
     let fog_curve = fog_factor * fog_factor;
-    color = vec4<f32>(mix(color.rgb, fog_color, fog_curve), color.a);
+    color = vec4<f32>(mix(color.rgb, final_fog_color, fog_curve), color.a);
 
     return color;
 }

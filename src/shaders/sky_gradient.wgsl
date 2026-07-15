@@ -5,6 +5,8 @@ struct Uniforms {
     night_factor: vec4<f32>,
     shadow_vp_matrix: mat4x4<f32>,
     inv_vp_matrix: mat4x4<f32>,
+    fog_params: vec4<f32>,
+    time: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -73,5 +75,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let dusk_color = vec3<f32>(1.0, 0.5, 0.2);
     sky_color += dusk_glow * dusk_color * (1.0 - night * 0.5);
 
-    return vec4<f32>(sky_color, 1.0);
+    // Underwater: fade sky to deep blue based on view direction
+    let underwater = uniforms.fog_params.w;
+    let underwater_sky = vec3<f32>(0.02, 0.10, 0.20);
+    // Sky fades to underwater color more near the horizon (through water)
+    let underwater_blend = smoothstep(-0.5, 0.5, view_dir.y);
+    let blended_sky = mix(sky_color, underwater_sky, underwater * (0.5 + 0.5 * underwater_blend));
+
+    return vec4<f32>(blended_sky, 1.0);
 }

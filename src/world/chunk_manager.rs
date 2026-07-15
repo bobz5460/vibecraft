@@ -4,9 +4,7 @@ use crate::world::chunk::{BlockEntity, Chunk, CHUNK_HEIGHT, CHUNK_SIZE, CHUNK_VO
 use crate::world::mesh::{build_chunk_mesh, ChunkMesh};
 use crate::world::persistence::{ChunkData, StorageError, WorldStorage};
 use crate::world::block_registry::registry;
-use crate::world::gen::generate_chunk_terrain;
-use crate::world::gen::integration::TerrainPipeline;
-use crate::world::world_gen::WorldGenerator;
+use crate::world::world_gen::VanillaWorldGenerator;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -72,7 +70,7 @@ struct LightResult {
 pub struct ChunkManager {
     pub chunks: HashMap<(i32, i32), Arc<Chunk>>,
     pub meshes: HashMap<(i32, i32), ChunkMesh>,
-    generator: WorldGenerator,
+    generator: VanillaWorldGenerator,
     task_tx: Sender<ChunkGenTask>,
     result_rx: Receiver<ChunkGenResult>,
     mesh_task_tx: Sender<MeshTask>,
@@ -126,8 +124,7 @@ impl ChunkManager {
             let rx = std::sync::Arc::clone(&task_rx);
             let tx = result_tx.clone();
             thread::spawn(move || {
-                let pipeline = TerrainPipeline::new(seed);
-                let mut generator = WorldGenerator::new(seed);
+                let generator = VanillaWorldGenerator::from_seed(seed);
                 loop {
                 let task = {
                     let lock = rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -141,10 +138,7 @@ impl ChunkManager {
                                 chunk
                             } else {
                                 let mut chunk = Chunk::new(task.cx, task.cz);
-                                generate_chunk_terrain(&mut chunk, &pipeline);
-                                generator.decorate_chunk(&mut chunk);
-                                chunk.recount_fluids();
-                                chunk.is_dirty = true;
+                                generator.generate_chunk(&mut chunk);
                                 chunk
                             }
                         }))
@@ -226,7 +220,7 @@ impl ChunkManager {
         ChunkManager {
             chunks: HashMap::new(),
             meshes: HashMap::new(),
-            generator: WorldGenerator::new(seed),
+            generator: VanillaWorldGenerator::from_seed(seed),
             task_tx,
             result_rx,
             mesh_task_tx,
@@ -615,11 +609,7 @@ impl ChunkManager {
     pub fn get_or_create_chunk(&mut self, cx: i32, cz: i32) -> &mut Chunk {
         if !self.chunks.contains_key(&(cx, cz)) {
             let mut chunk = Chunk::new(cx, cz);
-            let pipeline = TerrainPipeline::new(self.generator.seed);
-            generate_chunk_terrain(&mut chunk, &pipeline);
-            self.generator.decorate_chunk(&mut chunk);
-            chunk.recount_fluids();
-            chunk.is_dirty = true;
+            self.generator.generate_chunk(&mut chunk);
             self.chunks.insert((cx, cz), Arc::new(chunk));
             self.bump_chunk_revision((cx, cz));
         }

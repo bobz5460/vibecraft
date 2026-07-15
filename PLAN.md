@@ -232,6 +232,7 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 - Status: complete
 - Notes: The removed density prototype is retained in Git stash `shelved-continuous-terrain-2026-07-15`. The restored generator now uses deterministic surface-material tie-breaking, world-space shoreline queries, and salted per-stage RNG streams. Exact noise-router, aquifer, cave-biome, and cross-chunk feature parity remain M4 work.
 
+- [x] Port vanilla noise/density pipeline: ImprovedNoise, PerlinNoise, NormalNoise, DensityFunction framework, NoiseRouter, TerrainProvider splines, cave density functions, and cell-based trilinear interpolation chunk fill. Integrated as VanillaWorldGenerator replacing the old WorldGenerator in ChunkManager. SurfaceRules system ported but not wired into the fill loop yet. Generation makes noise-router, density-function, and cave/carving infrastructure available for end-to-end terrain use.
 - [ ] Port or faithfully reproduce target-version biome, density, surface, aquifer, cave, ore, and feature rules using reference seeds for comparison.
 - [ ] Add missing overworld biomes and biome-dependent colors, precipitation, features, and spawn rules.
 - [ ] Add naturally generated structures in dependency order: small features/geodes, villages/outposts, dungeons/mineshafts, temples, monuments, strongholds, ancient cities, trail ruins, and trial chambers.
@@ -362,6 +363,14 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 - Notes: Protocol version 1 uses a four-byte big-endian length prefix around a UTF-8 JSON envelope. It is native to Vibecraft and is not Java protocol compatible. See `NETWORK_PROTOCOL.md` and `src/network/mod.rs`.
 
 - [x] Define a small, versioned native protocol with bounded framing, handshake/version rejection, message-size/rate limits, and explicit client/server ownership. Do not implement Java protocol compatibility for the demo.
+### 2026-07-15: World select dirt background, delete world, and scrollable list
+- Owner: OpenCode
+- Scope: `src/ui/mod.rs`, `src/engine/renderer.rs`, `src/assets/gui_atlas.rs`, `src/main.rs`
+- Depends on: Existing GUI atlas, UI frame, and renderer
+- Acceptance: Title/world-select/create-world screens render a tiled dirt background (Minecraft `menu_background.png`). World list is scrollable with mouse wheel, auto-scrolls to keep selection visible. 4 bottom buttons (Play/Create/Cancel/Delete) are always visible. Delete button uses two-click confirmation, removes the world directory, and refreshes the list.
+- Status: complete
+- Notes: Added `world_scroll_offset` with `clamp_world_scroll` (auto-scrolls to keep selection visible) and `scroll_world_list` (mouse wheel). `world_row_rects` now takes a scroll offset and computes visible rows dynamically. `button_rects` for WorldSelect uses adaptive bottom spacing to fit 4 buttons. Scroll handling wired in main.rs MouseWheel event.
+
 ### 2026-07-13: Headless authoritative server foundation
 - Owner: OpenCode
 - Scope: Add a winit/wgpu-free TCP server binary using the shared fixed 20 TPS clock, chunk manager, scheduler, and native persistence. Accept bounded protocol sessions, complete handshake/keep-alive, autosave atomically, and reject unsupported client-authoritative edits. Player movement, chunk replication, inventory replication, and client conversion remain separate work.

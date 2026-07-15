@@ -3,9 +3,9 @@
   "data_version": 6,
   "kind": "level",
   "data": {
-    "name": "world",
-    "created_at": 0,
-    "last_played": 1784136387225,
+    "name": "New World",
+    "created_at": 1784146633566,
+    "last_played": 1784146633566,
     "seed": 1783972558954253730,
     "tick": 31365,
     "game_time": 16365,

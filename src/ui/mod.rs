@@ -41,6 +41,7 @@ pub enum UiAction {
     ToggleAutoJump,
     OpenConnect,
     ConnectServer,
+    DeleteWorld,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +193,14 @@ pub enum UiCommand {
         w: f32,
         h: f32,
     },
+    /// Tiles a sprite across the given area using texture repeat addressing.
+    TiledBackground {
+        sprite: String,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -222,6 +231,8 @@ pub struct UiState {
     pub connecting: bool,
     pub worlds: Vec<UiWorld>,
     pub selected_world: Option<usize>,
+    pub confirm_delete_world: bool,
+    pub world_scroll_offset: usize,
     pub world_name: String,
     pub world_seed: String,
     pub world_gamemode: CreateGameMode,
@@ -257,6 +268,8 @@ impl Default for UiState {
             connecting: false,
             worlds: Vec::new(),
             selected_world: None,
+            confirm_delete_world: false,
+            world_scroll_offset: 0,
             world_name: "New World".to_string(),
             world_seed: String::new(),
             world_gamemode: CreateGameMode::Survival,
@@ -344,6 +357,8 @@ impl UiState {
     pub fn open_world_select(&mut self, worlds: Vec<UiWorld>) {
         self.worlds = worlds;
         self.selected_world = (!self.worlds.is_empty()).then_some(0);
+        self.confirm_delete_world = false;
+        self.world_scroll_offset = 0;
         self.screen = UiScreen::WorldSelect;
         self.selected = 0;
         self.keyboard_focus = None;
@@ -411,7 +426,7 @@ impl UiState {
                 self.selected = 0;
                 self.keyboard_focus = None;
             }
-            UiScreen::Title => return UiAction::Quit,
+            UiScreen::Title => {}
             UiScreen::Loading => {}
         }
         UiAction::None
@@ -443,12 +458,14 @@ impl UiState {
             }
         }
         if self.screen == UiScreen::WorldSelect {
-            if let Some((index, _)) = world_row_rects(width, height, self.gui_scale, self.worlds.len())
+            if let Some((visual_index, _)) = world_row_rects(width, height, self.gui_scale, self.worlds.len(), self.world_scroll_offset)
                 .iter()
                 .enumerate()
                 .find(|(_, rect)| contains(**rect, x, y))
             {
-                self.selected_world = Some(index);
+                let world_index = self.world_scroll_offset + visual_index;
+                self.selected_world = Some(world_index);
+                self.confirm_delete_world = false;
                 self.keyboard_focus = None;
                 return UiAction::None;
             }
@@ -482,7 +499,7 @@ impl UiState {
             UiScreen::Accessibility => 5,
             UiScreen::Connect => 2,
             UiScreen::Title => 4,
-            UiScreen::WorldSelect => 3,
+            UiScreen::WorldSelect => 4,
             UiScreen::CreateWorld => 3,
             _ => 0,
         }
@@ -640,6 +657,14 @@ impl UiState {
                     self.open_title();
                     UiAction::None
                 }
+                3 => {
+                    if self.confirm_delete_world {
+                        UiAction::DeleteWorld
+                    } else {
+                        self.confirm_delete_world = true;
+                        UiAction::None
+                    }
+                }
                 _ => UiAction::None,
             },
             UiScreen::CreateWorld => match index {
@@ -707,6 +732,16 @@ impl UiState {
     pub fn append_server_address(&mut self, value: &str) {
         if self.screen == UiScreen::Connect {
             self.server_address.push_str(value);
+        }
+    }
+
+    pub fn append_create_text(&mut self, value: &str) {
+        if self.screen == UiScreen::CreateWorld {
+            if self.create_field == 0 {
+                self.world_name.push_str(value);
+            } else {
+                self.world_seed.push_str(value);
+            }
         }
     }
 
@@ -852,6 +887,26 @@ impl UiState {
         self.selected_world = Some((current + direction).rem_euclid(self.worlds.len() as i32) as usize);
     }
 
+    pub fn clamp_world_scroll(&mut self, visible_count: usize) {
+        if visible_count == 0 || self.worlds.is_empty() { return; }
+        if let Some(sel) = self.selected_world {
+            if sel < self.world_scroll_offset {
+                self.world_scroll_offset = sel;
+            } else if self.world_scroll_offset + visible_count <= sel {
+                self.world_scroll_offset = sel + 1 - visible_count;
+            }
+        }
+        self.world_scroll_offset = self.world_scroll_offset.min(self.worlds.len().saturating_sub(visible_count));
+    }
+
+    pub fn scroll_world_list(&mut self, direction: isize, visible_count: usize) {
+        if self.worlds.is_empty() || visible_count == 0 { return; }
+        let max_offset = self.worlds.len().saturating_sub(visible_count);
+        self.world_scroll_offset = self.world_scroll_offset
+            .saturating_add_signed(direction)
+            .min(max_offset);
+    }
+
     fn button_rects(&self, width: f32, height: f32) -> Vec<(f32, f32, f32, f32)> {
         let button_w = self.button_width(width);
         let button_h = 20.0 * self.gui_scale;
@@ -862,7 +917,10 @@ impl UiState {
             // Title screen buttons follow the classic Minecraft layout:
             // virtual Y = height/4 + 48, then 24px spacing between tops.
             UiScreen::Title => height / 4.0 + 48.0 * self.gui_scale,
-            UiScreen::WorldSelect => height - 84.0 * self.gui_scale,
+            UiScreen::WorldSelect => {
+                let total_h = count as f32 * button_h + (count - 1) as f32 * gap;
+                height - total_h - 12.0 * self.gui_scale
+            }
             UiScreen::CreateWorld => {
                 let total_h = count as f32 * button_h + (count - 1) as f32 * gap;
                 let seed_bottom = height * 0.29 + 74.0 * self.gui_scale;
@@ -1696,6 +1754,13 @@ fn draw_accessibility(frame: &mut UiFrame, width: f32, height: f32, state: &UiSt
 }
 
 fn draw_title_screen(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>) {
+    frame.commands.push(UiCommand::TiledBackground {
+        sprite: "gui/menu_background".to_string(),
+        x: 0.0,
+        y: 0.0,
+        w: width,
+        h: height,
+    });
     panel(frame, width, height, state.high_contrast);
 
     // Title logo sprite
@@ -1725,13 +1790,27 @@ fn draw_title_screen(frame: &mut UiFrame, width: f32, height: f32, state: &UiSta
     centered_text(frame, width * 0.5, height - 18.0 * state.gui_scale, text_size, copyright, [0.5, 0.5, 0.5, 1.0]);
 }
 
-fn world_row_rects(width: f32, height: f32, scale: f32, count: usize) -> Vec<(f32, f32, f32, f32)> {
+pub fn world_list_visible_count(height: f32, scale: f32) -> usize {
+    let button_h = 20.0 * scale;
+    let gap = 4.0 * scale;
+    let buttons_total = 4.0 * button_h + 3.0 * gap;
+    let buttons_top = height - buttons_total - 12.0 * scale;
+    let list_top = height * 0.18;
+    let avail = buttons_top - 8.0 * scale - list_top;
+    if avail <= 0.0 { return 0; }
+    let row_total = 36.0 * scale + 6.0 * scale;
+    (avail / row_total) as usize
+}
+
+fn world_row_rects(width: f32, height: f32, scale: f32, count: usize, scroll_offset: usize) -> Vec<(f32, f32, f32, f32)> {
     let row_w = (width - 48.0 * scale).min(460.0 * scale);
     let row_h = 36.0 * scale;
     let left = (width - row_w) * 0.5;
-    let top = height * 0.20;
-    (0..count.min(6))
-        .map(|index| (left, top + index as f32 * (row_h + 6.0 * scale), row_w, row_h))
+    let visible = world_list_visible_count(height, scale);
+    let list_top = height * 0.18;
+    let end = (scroll_offset + visible).min(count);
+    (scroll_offset..end)
+        .map(|i| (left, list_top + (i - scroll_offset) as f32 * (row_h + 6.0 * scale), row_w, row_h))
         .collect()
 }
 
@@ -1744,21 +1823,33 @@ fn create_field_rects(width: f32, height: f32, scale: f32) -> ((f32, f32, f32, f
 }
 
 fn draw_world_select(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>) {
+    // Dirt background (Minecraft-style settings/menu background)
+    frame.commands.push(UiCommand::TiledBackground {
+        sprite: "gui/menu_background".to_string(),
+        x: 0.0,
+        y: 0.0,
+        w: width,
+        h: height,
+    });
     panel(frame, width, height, state.high_contrast);
     let scale = state.gui_scale;
     centered_text(frame, width * 0.5, height * 0.10, 12.0 * scale, "Select World", [1.0, 1.0, 1.0, 1.0]);
     if state.worlds.is_empty() {
         centered_text(frame, width * 0.5, height * 0.34, 10.0 * scale, "No worlds found", [0.72, 0.72, 0.72, 1.0]);
+    } else {
+        let rows = world_row_rects(width, height, scale, state.worlds.len(), state.world_scroll_offset);
+        for (visual_index, ((x, y, w, h), world)) in rows.into_iter().zip(state.worlds.iter().skip(state.world_scroll_offset)).enumerate() {
+            let world_index = state.world_scroll_offset + visual_index;
+            let selected = state.selected_world == Some(world_index);
+            let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
+            nine_slice(frame, if selected || hovered { "widget/button_highlighted" } else { "widget/button" }, x, y, w, h, 3.0, [1.0, 1.0, 1.0, 1.0]);
+            text(frame, x + 7.0 * scale, y + 5.0 * scale, 10.0 * scale, &world.name, [1.0, 1.0, 1.0, 1.0]);
+            let mode = if world.hardcore { "Hardcore" } else { &world.gamemode };
+            text(frame, x + 7.0 * scale, y + 19.0 * scale, 8.0 * scale, format!("{}  |  Last played {}", mode, world_time_label(world.last_played)), [0.72, 0.72, 0.72, 1.0]);
+        }
     }
-    for (index, ((x, y, w, h), world)) in world_row_rects(width, height, scale, state.worlds.len()).into_iter().zip(&state.worlds).enumerate() {
-        let selected = state.selected_world == Some(index);
-        let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
-        nine_slice(frame, if selected || hovered { "widget/button_highlighted" } else { "widget/button" }, x, y, w, h, 3.0, [1.0, 1.0, 1.0, 1.0]);
-        text(frame, x + 7.0 * scale, y + 5.0 * scale, 10.0 * scale, &world.name, [1.0, 1.0, 1.0, 1.0]);
-        let mode = if world.hardcore { "Hardcore" } else { &world.gamemode };
-        text(frame, x + 7.0 * scale, y + 19.0 * scale, 8.0 * scale, format!("{}  |  Last played {}", mode, world_time_label(world.last_played)), [0.72, 0.72, 0.72, 1.0]);
-    }
-    let labels = ["Play Selected World", "Create New World", "Cancel"];
+    let delete_label = if state.confirm_delete_world { "Confirm Delete" } else { "Delete" };
+    let labels = ["Play Selected World", "Create New World", "Cancel", delete_label];
     for (index, label) in labels.iter().enumerate() {
         if let Some(&(x, y, w, h)) = state.button_rects(width, height).get(index) {
             let hovered = cursor.map_or(false, |(cx, cy)| contains((x, y, w, h), cx, cy));
@@ -1768,6 +1859,13 @@ fn draw_world_select(frame: &mut UiFrame, width: f32, height: f32, state: &UiSta
 }
 
 fn draw_create_world(frame: &mut UiFrame, width: f32, height: f32, state: &UiState, cursor: Option<(f32, f32)>) {
+    frame.commands.push(UiCommand::TiledBackground {
+        sprite: "gui/menu_background".to_string(),
+        x: 0.0,
+        y: 0.0,
+        w: width,
+        h: height,
+    });
     panel(frame, width, height, state.high_contrast);
     let scale = state.gui_scale;
     centered_text(frame, width * 0.5, height * 0.12, 12.0 * scale, "Create New World", [1.0, 1.0, 1.0, 1.0]);

@@ -1281,7 +1281,41 @@ async fn run(config: AppConfig) {
                                             if action == UiAction::CreateWorld {
                                                 pending_world_open = Some(WorldOpenRequest::Create(ui_state.create_options()));
                                             }
-                                           if action == UiAction::QuitToTitle {
+                                            if action == UiAction::DeleteWorld {
+                                                let deleted = ui_state.selected_world.and_then(|index| {
+                                                    let path = browser_paths.get(index)?;
+                                                    match std::fs::remove_dir_all(path) {
+                                                        Err(error) => {
+                                                            command_feedback = format!("Failed to delete world: {error}");
+                                                            command_feedback_timer = 5.0;
+                                                            None
+                                                        }
+                                                        Ok(()) => {
+                                                            command_feedback = "Deleted world".to_string();
+                                                            command_feedback_timer = 3.0;
+                                                            Some(())
+                                                        }
+                                                    }
+                                                });
+                                                if deleted.is_some() {
+                                                    match discover_worlds(&config.world_dir) {
+                                                        Ok(discovery) => {
+                                                            browser_paths = discovery.worlds.iter().map(|world| world.path.clone()).collect();
+                                                            ui_state.open_world_select(discovery.worlds.into_iter().map(|world| ui::UiWorld {
+                                                                name: world.name,
+                                                                gamemode: world.gamemode,
+                                                                hardcore: world.hardcore,
+                                                                last_played: world.last_played,
+                                                            }).collect());
+                                                        }
+                                                        Err(error) => {
+                                                            command_feedback = format!("World deleted but failed to refresh list: {error}");
+                                                            command_feedback_timer = 5.0;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if action == UiAction::QuitToTitle {
                                                if !network_mode {
                                                    save_world(
                                                        &storage, seed, &mut chunk_manager, &player, &inventory,
@@ -1494,6 +1528,40 @@ async fn run(config: AppConfig) {
                                   if action == UiAction::CreateWorld {
                                       pending_world_open = Some(WorldOpenRequest::Create(ui_state.create_options()));
                                   }
+                                  if action == UiAction::DeleteWorld {
+                                      let deleted = ui_state.selected_world.and_then(|index| {
+                                          let path = browser_paths.get(index)?;
+                                          match std::fs::remove_dir_all(path) {
+                                              Err(error) => {
+                                                  command_feedback = format!("Failed to delete world: {error}");
+                                                  command_feedback_timer = 5.0;
+                                                  None
+                                              }
+                                              Ok(()) => {
+                                                  command_feedback = "Deleted world".to_string();
+                                                  command_feedback_timer = 3.0;
+                                                  Some(())
+                                              }
+                                          }
+                                      });
+                                      if deleted.is_some() {
+                                          match discover_worlds(&config.world_dir) {
+                                              Ok(discovery) => {
+                                                  browser_paths = discovery.worlds.iter().map(|world| world.path.clone()).collect();
+                                                  ui_state.open_world_select(discovery.worlds.into_iter().map(|world| ui::UiWorld {
+                                                      name: world.name,
+                                                      gamemode: world.gamemode,
+                                                      hardcore: world.hardcore,
+                                                      last_played: world.last_played,
+                                                  }).collect());
+                                              }
+                                              Err(error) => {
+                                                  command_feedback = format!("World deleted but failed to refresh list: {error}");
+                                                  command_feedback_timer = 5.0;
+                                              }
+                                          }
+                                      }
+                                  }
                                 if action == UiAction::Quit {
                                     if !network_mode {
                                         save_world(
@@ -1630,6 +1698,9 @@ async fn run(config: AppConfig) {
                         };
                         if chat_state.open {
                             chat_state.scroll(amount);
+                            renderer.gui_dirty = true;
+                        } else if ui_state.screen == ui::UiScreen::WorldSelect {
+                            ui_state.scroll_world_list(-(amount as isize), ui::world_list_visible_count(renderer.size.1 as f32, ui_state.gui_scale));
                             renderer.gui_dirty = true;
                         } else if amount > 0 {
                             inventory.held_slot = (inventory.held_slot + inventory::HOTBAR_SLOTS - 1)
@@ -3219,6 +3290,10 @@ async fn run(config: AppConfig) {
                         None
                     };
                     let show_chat_cursor = chat_state.open && ui_state.frame_count % 60 < 30;
+                    if ui_state.screen == ui::UiScreen::WorldSelect {
+                        let visible = ui::world_list_visible_count(renderer.size.1.max(1) as f32, ui_state.gui_scale);
+                        ui_state.clamp_world_scroll(visible);
+                    }
                     let ui_frame = ui_state.frame(
                         renderer.size.0.max(1) as f32,
                         renderer.size.1.max(1) as f32,

@@ -4,7 +4,6 @@ pub mod chunk;
 pub mod chunk_manager;
 pub mod dropped_item;
 pub mod entity;
-pub mod gen;
 pub mod mesh;
 pub mod persistence;
 pub mod raycast;

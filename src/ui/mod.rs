@@ -589,6 +589,8 @@ impl UiState {
         carried: Option<&UiSlot>,
         health: f32,
         hunger: f32,
+        saturation: f32,
+        absorption: f32,
         armor_points: f32,
         experience: f32,
         selected_item_name: &str,
@@ -597,18 +599,25 @@ impl UiState {
         cursor: Option<(f32, f32)>,
         show_crosshair: bool,
         hurt_timer: f32,
+        health_blink_timer: f32,
+        hunger_shake_timer: f32,
+        has_regen: bool,
+        has_poison: bool,
+        has_wither: bool,
+        has_hunger_effect: bool,
+        tick: u64,
     ) -> UiFrame {
         let mut frame = UiFrame::default();
         match self.screen {
             UiScreen::Playing => {
-                draw_hud(&mut frame, width, height, self.gui_scale, hotbar, health, hunger, armor_points, experience, selected_item_name, show_crosshair, hurt_timer);
+                draw_hud(&mut frame, width, height, self.gui_scale, hotbar, health, hunger, saturation, absorption, armor_points, experience, selected_item_name, show_crosshair, hurt_timer, health_blink_timer, hunger_shake_timer, has_regen, has_poison, has_wither, has_hunger_effect, tick);
                 draw_chat(&mut frame, width, height, chat_lines, self.chat_opacity);
                 if let Some(feedback) = feedback.filter(|text| !text.is_empty()) {
                     draw_toast(&mut frame, width, feedback);
                 }
             }
             UiScreen::Inventory => {
-                draw_hud(&mut frame, width, height, self.gui_scale, hotbar, health, hunger, armor_points, experience, selected_item_name, false, hurt_timer);
+                draw_hud(&mut frame, width, height, self.gui_scale, hotbar, health, hunger, saturation, absorption, armor_points, experience, selected_item_name, false, hurt_timer, health_blink_timer, hunger_shake_timer, has_regen, has_poison, has_wither, has_hunger_effect, tick);
                 draw_inventory(&mut frame, width, height, self.gui_scale, inventory.unwrap_or(&[]), crafting.unwrap_or(&[]), craft_result, carried, cursor, self.high_contrast);
             }
             UiScreen::Pause => draw_menu(&mut frame, width, height, self, cursor, "Game Menu", &["Back to Game", "Options...", "Controls...", "Save and Quit to Title"]),
@@ -789,7 +798,7 @@ fn draw_slot_item(frame: &mut UiFrame, x: f32, y: f32, scale: f32, item: &UiSlot
     }
 }
 
-fn draw_hud(frame: &mut UiFrame, width: f32, height: f32, scale: f32, hotbar: &[UiSlot], health: f32, hunger: f32, armor: f32, experience: f32, _selected_item_name: &str, show_crosshair: bool, hurt_timer: f32) {
+fn draw_hud(frame: &mut UiFrame, width: f32, height: f32, scale: f32, hotbar: &[UiSlot], health: f32, hunger: f32, saturation: f32, absorption: f32, armor: f32, experience: f32, _selected_item_name: &str, show_crosshair: bool, hurt_timer: f32, health_blink_timer: f32, hunger_shake_timer: f32, has_regen: bool, has_poison: bool, has_wither: bool, has_hunger_effect: bool, tick: u64) {
     let bar_w = 182.0 * scale;
     let bar_h = 22.0 * scale;
     let left = (width - bar_w) * 0.5;
@@ -800,9 +809,7 @@ fn draw_hud(frame: &mut UiFrame, width: f32, height: f32, scale: f32, hotbar: &[
     let exp_bar_h = 5.0 * scale;
     let exp_left = (width - exp_bar_w) * 0.5;
     let exp_top = top - 7.0 * scale;
-    // Experience bar background
     rect(frame, exp_left, exp_top, exp_bar_w, exp_bar_h, [0.0, 0.0, 0.0, 0.6]);
-    // Filled portion
     let exp_filled = (experience / 100.0).clamp(0.0, 1.0) * exp_bar_w;
     if exp_filled > 0.0 {
         rect(frame, exp_left, exp_top, exp_filled, exp_bar_h, [0.38, 0.92, 0.08, 1.0]);
@@ -830,59 +837,123 @@ fn draw_hud(frame: &mut UiFrame, width: f32, height: f32, scale: f32, hotbar: &[
             });
         }
         if let Some(item) = hotbar.get(index).filter(|item| !item.empty) {
-            draw_slot_item(frame, slot_left + 1.0 * scale, top + 3.0 * scale, scale, item);
+            draw_slot_item(frame, slot_left, top + 3.0 * scale, scale, item);
         }
     }
 
-    // Status bars row: health left, armor middle, food right
+    // Status bars row
     let status_y = top - 13.0 * scale;
     let half_width = 91.0 * scale;
 
-    // Health bar (left side) - always render container background then fill/half overlay
+    // ── Health bar ──────────────────────────────────────────────────────
+    let health_left = width * 0.5 - half_width;
     let hurt_active = hurt_timer > 0.0;
-    let (shake_x, flash_color) = if hurt_active {
+    let (shake_x, hurt_color) = if hurt_active {
         let shake = (hurt_timer * 60.0 * 3.14).sin() * 2.0 * scale * (1.0 - hurt_timer / 0.5);
         let flash = 1.0 - hurt_timer / 0.5;
         (shake, [1.0, 1.0 - flash * 0.6, 1.0 - flash * 0.6, 1.0])
     } else {
         (0.0, [1.0, 1.0, 1.0, 1.0])
     };
-    let health_left = width * 0.5 - half_width;
-    for index in 0..10 {
+
+    // Blinking alternates every 3 ticks when blink timer is active
+    let blinking = health_blink_timer > 0.0 && (tick.wrapping_mul(3)) % 6 < 3;
+
+    // Total hearts to render (normal + absorption)
+    let total_hearts = 10 + (absorption / 2.0).ceil() as usize;
+    let abs_start = 10usize;
+    let mut absorb_remaining = absorption;
+
+    for index in 0..total_hearts {
+        let mut hy = status_y;
         let hx = health_left + index as f32 * 8.0 * scale + shake_x;
-        // Background container (always same size)
-        frame.commands.push(UiCommand::Sprite {
-            name: "hud/heart/container".to_string(),
-            x: hx,
-            y: status_y,
-            w: 9.0 * scale,
-            h: 9.0 * scale,
-            color: flash_color,
-        });
-        // Fill/half overlay
-        if health >= index as f32 * 2.0 + 2.0 {
+
+        // Low-health wobble: random Y offset (seeded by tick + index)
+        if health <= 4.0 && index < 10 {
+            let seed = tick.wrapping_add(index as u64 * 7);
+            let wobble = (seed % 3) as f32 - 1.0;
+            hy += wobble * scale * 0.5;
+        }
+
+        // Regeneration bounce: one heart bounces up 2px
+        if has_regen && index < 10 && index == (tick as usize % 10) {
+            hy -= 2.0 * scale;
+        }
+
+        if index < abs_start {
+            // ── Normal hearts (indices 0-9) ──
+            let container_name = if blinking { "hud/heart/container_blinking" } else { "hud/heart/container" };
             frame.commands.push(UiCommand::Sprite {
-                name: "hud/heart/full".to_string(),
+                name: container_name.to_string(),
                 x: hx,
-                y: status_y,
+                y: hy,
                 w: 9.0 * scale,
                 h: 9.0 * scale,
-                color: flash_color,
+                color: hurt_color,
             });
-        } else if health > index as f32 * 2.0 {
+
+            let is_full = health >= index as f32 * 2.0 + 2.0;
+            let is_half = !is_full && health > index as f32 * 2.0;
+            if is_full || is_half {
+                let (heart_name, blinking_name) = if has_wither {
+                    if is_full { ("hud/heart/withered_full", "hud/heart/withered_full_blinking") }
+                    else { ("hud/heart/withered_half", "hud/heart/withered_half_blinking") }
+                } else if has_poison {
+                    if is_full { ("hud/heart/poisoned_full", "hud/heart/poisoned_full_blinking") }
+                    else { ("hud/heart/poisoned_half", "hud/heart/poisoned_half_blinking") }
+                } else {
+                    if is_full { ("hud/heart/full", "hud/heart/full_blinking") }
+                    else { ("hud/heart/half", "hud/heart/half_blinking") }
+                };
+                let name = if blinking { blinking_name } else { heart_name };
+                frame.commands.push(UiCommand::Sprite {
+                    name: name.to_string(),
+                    x: hx,
+                    y: hy,
+                    w: 9.0 * scale,
+                    h: 9.0 * scale,
+                    color: hurt_color,
+                });
+            }
+        } else {
+            // ── Absorption hearts (yellow) ──
+            let container_name = if blinking { "hud/heart/container_blinking" } else { "hud/heart/container" };
             frame.commands.push(UiCommand::Sprite {
-                name: "hud/heart/half".to_string(),
+                name: container_name.to_string(),
                 x: hx,
-                y: status_y,
+                y: hy,
                 w: 9.0 * scale,
                 h: 9.0 * scale,
-                color: flash_color,
+                color: [1.0, 1.0, 1.0, 1.0],
             });
+
+            if absorb_remaining >= 2.0 {
+                let abs_name = if blinking { "hud/heart/absorbing_full_blinking" } else { "hud/heart/absorbing_full" };
+                frame.commands.push(UiCommand::Sprite {
+                    name: abs_name.to_string(),
+                    x: hx,
+                    y: hy,
+                    w: 9.0 * scale,
+                    h: 9.0 * scale,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                });
+                absorb_remaining -= 2.0;
+            } else if absorb_remaining > 0.0 {
+                let abs_name = if blinking { "hud/heart/absorbing_half_blinking" } else { "hud/heart/absorbing_half" };
+                frame.commands.push(UiCommand::Sprite {
+                    name: abs_name.to_string(),
+                    x: hx,
+                    y: hy,
+                    w: 9.0 * scale,
+                    h: 9.0 * scale,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                });
+                absorb_remaining = 0.0;
+            }
         }
     }
 
-    // Armor bar (between health and food) - rendered as colored rects
-    // since armor sprites may not be available in all asset packs
+    // ── Armor bar ─────────────────────────────────────────────────────
     if armor > 0.0 {
         let armor_icons = (armor / 2.0).ceil() as usize;
         let armor_width = armor_icons as f32 * 8.0 * scale;
@@ -897,33 +968,64 @@ fn draw_hud(frame: &mut UiFrame, width: f32, height: f32, scale: f32, hotbar: &[
         }
     }
 
-    // Food bar (right side)
+    // ── Food bar ───────────────────────────────────────────────────────
     let food_left = width * 0.5 + half_width - 81.0 * scale;
+    let use_hunger_textures = has_hunger_effect;
     for index in 0..10 {
         let fx = food_left + index as f32 * 8.0 * scale;
-        // Determine which food sprites to use
+        let mut fy = status_y;
+
+        // Low hunger / saturation wobble
+        let hunger_low = hunger <= 6.0;
+        let no_saturation = saturation <= 0.0;
+        if has_hunger_effect || (hunger_low && no_saturation) || hunger_shake_timer > 0.0 {
+            let seed = tick.wrapping_add(index as u64 * 13);
+            let wobble = (seed % 3) as f32 - 1.0;
+            fy += wobble * scale * 0.5;
+            if hunger_shake_timer > 0.0 {
+                let extra = ((tick as f32 * 60.0).sin() * 0.5) as f32;
+                fy += extra;
+            }
+        }
+
+        let empty_sprite = if use_hunger_textures { "hud/food_empty_hunger" } else { "hud/food_empty" };
         let (fill_sprite, show_fill) = if hunger >= index as f32 * 2.0 + 2.0 {
-            ("hud/food_full", true)
+            (if use_hunger_textures { "hud/food_full_hunger" } else { "hud/food_full" }, true)
         } else if hunger > index as f32 * 2.0 {
-            ("hud/food_half", true)
+            (if use_hunger_textures { "hud/food_half_hunger" } else { "hud/food_half" }, true)
         } else {
             ("", false)
         };
-        // Background empty sprite
+
+        // Saturation overlay: show a subtle background food when saturation covers this drumstick
+        if saturation > index as f32 * 2.0 {
+            let sat_sprite = if saturation >= index as f32 * 2.0 + 2.0 { "hud/food_full" } else { "hud/food_half" };
+            frame.commands.push(UiCommand::Sprite {
+                name: sat_sprite.to_string(),
+                x: fx,
+                y: fy - scale * 0.5,
+                w: 9.0 * scale,
+                h: 9.0 * scale,
+                color: [1.0, 1.0, 1.0, 0.25],
+            });
+        }
+
+        // Empty background
         frame.commands.push(UiCommand::Sprite {
-            name: "hud/food_empty".to_string(),
+            name: empty_sprite.to_string(),
             x: fx,
-            y: status_y,
+            y: fy,
             w: 9.0 * scale,
             h: 9.0 * scale,
             color: [1.0, 1.0, 1.0, 1.0],
         });
+
+        // Filled portion
         if show_fill {
-            // Foreground fill
             frame.commands.push(UiCommand::Sprite {
                 name: fill_sprite.to_string(),
                 x: fx,
-                y: status_y,
+                y: fy,
                 w: 9.0 * scale,
                 h: 9.0 * scale,
                 color: [1.0, 1.0, 1.0, 1.0],
@@ -1267,6 +1369,8 @@ mod tests {
             None,
             20.0,
             20.0,
+            20.0,
+            0.0,
             0.0,
             0.0,
             "",
@@ -1275,6 +1379,13 @@ mod tests {
             None,
             false,
             0.0,
+            0.0,
+            0.0,
+            false,
+            false,
+            false,
+            false,
+            0,
         );
 
         let button_sprites: Vec<&str> = frame.commands.iter().filter_map(|command| match command {
@@ -1286,7 +1397,7 @@ mod tests {
 
         ui.move_focus(1);
         let focused_frame = ui.frame(
-            800.0, 600.0, &[], None, None, None, None, 20.0, 20.0, 0.0, 0.0, "", &[], None, None, false, 0.0,
+            800.0, 600.0, &[], None, None, None, None, 20.0, 20.0, 20.0, 0.0, 0.0, 0.0, "", &[], None, None, false, 0.0, 0.0, 0.0, false, false, false, false, 0,
         );
         assert_eq!(
             focused_frame.commands.iter().filter(|command| matches!(command, UiCommand::NineSlice { sprite, .. } if sprite == "widget/button_highlighted")).count(),
@@ -1309,7 +1420,7 @@ mod tests {
         ui.screen = UiScreen::Loading;
         ui.loading_progress = 0.5;
         let frame = ui.frame(
-            800.0, 600.0, &[], None, None, None, None, 20.0, 20.0, 0.0, 0.0, "", &[], None, None, false, 0.0,
+            800.0, 600.0, &[], None, None, None, None, 20.0, 20.0, 20.0, 0.0, 0.0, 0.0, "", &[], None, None, false, 0.0, 0.0, 0.0, false, false, false, false, 0,
         );
         assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::Sprite { name, .. } if name == "hud/experience_bar_background")));
         assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::SpriteProgress { name, progress, .. } if name == "hud/experience_bar_progress" && *progress == 0.5)));
@@ -1361,12 +1472,12 @@ mod tests {
             block_tiles: None,
         };
         let mut frame = UiFrame::default();
-        draw_hud(&mut frame, 400.0, 240.0, 1.0, &[item], 20.0, 20.0, 0.0, 0.0, "", true, 0.0);
+        draw_hud(&mut frame, 400.0, 240.0, 1.0, &[item], 20.0, 20.0, 20.0, 0.0, 0.0, 0.0, "", true, 0.0, 0.0, 0.0, false, false, false, false, 0);
         let icon = frame.commands.iter().find_map(|command| match command {
             UiCommand::Item { x, y, size, .. } => Some((*x, *y, *size)),
             _ => None,
         }).unwrap();
-        assert_eq!(icon.0, (400.0 - 182.0) * 0.5 + 5.0);
+        assert_eq!(icon.0, (400.0 - 182.0) * 0.5 + 4.0);
         assert_eq!(icon.1, 240.0 - 22.0 - 4.0 + 4.0);
         assert_eq!(icon.2, ITEM_ICON_SIZE);
     }

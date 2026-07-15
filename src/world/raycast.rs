@@ -11,6 +11,33 @@ pub struct RaycastHit {
     pub block: Block,
 }
 
+fn ray_aabb_intersection(
+    origin: Vector3<f32>,
+    dir: Vector3<f32>,
+    aabb_min: Vector3<f32>,
+    aabb_max: Vector3<f32>,
+) -> Option<f32> {
+    let inv_x = if dir.x == 0.0 { f32::INFINITY } else { 1.0 / dir.x };
+    let inv_y = if dir.y == 0.0 { f32::INFINITY } else { 1.0 / dir.y };
+    let inv_z = if dir.z == 0.0 { f32::INFINITY } else { 1.0 / dir.z };
+
+    let t1 = (aabb_min.x - origin.x) * inv_x;
+    let t2 = (aabb_max.x - origin.x) * inv_x;
+    let t3 = (aabb_min.y - origin.y) * inv_y;
+    let t4 = (aabb_max.y - origin.y) * inv_y;
+    let t5 = (aabb_min.z - origin.z) * inv_z;
+    let t6 = (aabb_max.z - origin.z) * inv_z;
+
+    let t_min = t1.min(t2).max(t3.min(t4)).max(t5.min(t6));
+    let t_max = t1.max(t2).min(t3.max(t4)).min(t5.max(t6));
+
+    if t_max < 0.0 || t_min > t_max {
+        None
+    } else {
+        Some(t_min)
+    }
+}
+
 impl ChunkManager {
     pub fn raycast(
         &self,
@@ -64,13 +91,18 @@ impl ChunkManager {
         for _ in 0..(max_dist.ceil() as i32 * 3).max(1) {
             let block = self.get_block(x, y, z);
             if !block.is_air() {
-                return Some(RaycastHit {
-                    x,
-                    y,
-                    z,
-                    normal: last_normal,
-                    block,
-                });
+                let (bmin, bmax) = block.selection_box();
+                let wmin = Vector3::new(x as f32 + bmin[0], y as f32 + bmin[1], z as f32 + bmin[2]);
+                let wmax = Vector3::new(x as f32 + bmax[0], y as f32 + bmax[1], z as f32 + bmax[2]);
+                if ray_aabb_intersection(origin, dir, wmin, wmax).is_some() {
+                    return Some(RaycastHit {
+                        x,
+                        y,
+                        z,
+                        normal: last_normal,
+                        block,
+                    });
+                }
             }
 
             if t_max_x < t_max_y {

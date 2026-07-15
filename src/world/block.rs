@@ -1167,6 +1167,20 @@ impl Block {
     pub fn is_air(&self) -> bool {
         matches!(self.id, BlockId::Air)
     }
+
+    pub fn selection_box(&self) -> ([f32; 3], [f32; 3]) {
+        if self.id.is_crossed() {
+            ([0.2, 0.0, 0.2], [0.8, 0.6, 0.8])
+        } else if self.id.is_slab() {
+            if self.data & 1 == 0 {
+                ([0.0, 0.0, 0.0], [1.0, 0.5, 1.0])
+            } else {
+                ([0.0, 0.5, 0.0], [1.0, 1.0, 1.0])
+            }
+        } else {
+            ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
+        }
+    }
 }
 
 #[cfg(test)]

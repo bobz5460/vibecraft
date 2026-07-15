@@ -1008,8 +1008,8 @@ impl Renderer {
                 depth_compare: CompareFunction::LessEqual,
                 stencil: StencilState::default(),
                 bias: DepthBiasState {
-                    constant: 0,
-                    slope_scale: 2.0,
+                    constant: -2,
+                    slope_scale: 0.0,
                     clamp: 0.0,
                 },
             }),
@@ -1816,10 +1816,19 @@ impl Renderer {
         self.screenshot_path = Some(path.to_string());
     }
 
-    pub fn create_cube_outline(&mut self, x: f32, y: f32, z: f32) -> HighlightData {
+    pub fn create_cube_outline(&mut self, bx: f32, by: f32, bz: f32, min: [f32; 3], max: [f32; 3]) -> HighlightData {
+        let expand = 1.0 / 32.0;
+        let min = [min[0] - expand, min[1] - expand, min[2] - expand];
+        let max = [max[0] + expand, max[1] + expand, max[2] + expand];
         let corners = [
-            [x, y, z], [x + 1.0, y, z], [x + 1.0, y, z + 1.0], [x, y, z + 1.0],
-            [x, y + 1.0, z], [x + 1.0, y + 1.0, z], [x + 1.0, y + 1.0, z + 1.0], [x, y + 1.0, z + 1.0],
+            [bx + min[0], by + min[1], bz + min[2]],
+            [bx + max[0], by + min[1], bz + min[2]],
+            [bx + max[0], by + min[1], bz + max[2]],
+            [bx + min[0], by + min[1], bz + max[2]],
+            [bx + min[0], by + max[1], bz + min[2]],
+            [bx + max[0], by + max[1], bz + min[2]],
+            [bx + max[0], by + max[1], bz + max[2]],
+            [bx + min[0], by + max[1], bz + max[2]],
         ];
         let edges: [[usize; 2]; 12] = [
             [0, 1], [1, 2], [2, 3], [3, 0],

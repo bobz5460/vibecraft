@@ -352,6 +352,9 @@ impl UiState {
         self.screen = UiScreen::Title;
         self.selected = 0;
         self.keyboard_focus = None;
+        self.worlds.clear();
+        self.selected_world = None;
+        self.confirm_delete_world = false;
     }
 
     pub fn open_world_select(&mut self, worlds: Vec<UiWorld>) {

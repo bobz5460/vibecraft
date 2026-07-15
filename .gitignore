@@ -8,3 +8,5 @@
 
 # Generated world data.
 world/chunks/
+
+.DS_Store

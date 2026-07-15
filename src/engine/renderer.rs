@@ -40,6 +40,7 @@ enum UiBatchKind {
     Item,
     IsometricBlock,
     Text,
+    TiledBackground,
 }
 
 struct UiBatch {
@@ -338,6 +339,8 @@ pub struct Renderer {
     item_atlas: ItemAtlas,
     gui_pipeline: RenderPipeline,
     gui_bind_group: BindGroup,
+    tiled_gui_sampler: Sampler,
+    tiled_gui_bind_group: BindGroup,
     item_gui_bind_group: BindGroup,
     terrain_gui_bind_group: BindGroup,
     iso_vb: Buffer,
@@ -1435,6 +1438,34 @@ impl Renderer {
                 },
             ],
         });
+        let tiled_gui_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("tiled_gui_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let tiled_gui_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("tiled_gui_bind_group"),
+            layout: &gui_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: text_uniform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&gui_atlas.view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&tiled_gui_sampler),
+                },
+            ],
+        });
         let item_gui_bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("item_gui_bind_group"),
             layout: &gui_bgl,
@@ -1761,6 +1792,8 @@ impl Renderer {
             item_atlas,
             gui_pipeline,
             gui_bind_group,
+            tiled_gui_sampler,
+            tiled_gui_bind_group,
             item_gui_bind_group,
             terrain_gui_bind_group,
             iso_vb,
@@ -2285,6 +2318,38 @@ impl Renderer {
                     }).collect();
                     append_ui_geometry(&mut batches, UiBatchKind::IsometricBlock, iso_verts, iso_indices);
                 }
+                UiCommand::TiledBackground { sprite, x, y, w, h } => {
+                    if let Some(uv) = self.gui_atlas.get_uv(sprite) {
+                        let af = self.gui_atlas.atlas_size as f32;
+                        let src_w = (uv[2] - uv[0]) * af;
+                        let src_h = (uv[3] - uv[1]) * af;
+                        if src_w > 0.0 && src_h > 0.0 {
+                            let mut verts = Vec::new();
+                            let mut indices = Vec::new();
+                            let tiles_x = (w / src_w).ceil() as i32;
+                            let tiles_y = (h / src_h).ceil() as i32;
+                            for ty in 0..tiles_y {
+                                for tx in 0..tiles_x {
+                                    let qx = x + tx as f32 * src_w;
+                                    let qy = y + ty as f32 * src_h;
+                                    let qw = src_w.min(x + w - qx);
+                                    let qh = src_h.min(y + h - qy);
+                                    if qw <= 0.0 || qh <= 0.0 {
+                                        continue;
+                                    }
+                                    if let Some((quad, qi)) = self.gui_atlas.build_sprite(sprite, qx, qy, qw, qh, [1.0, 1.0, 1.0, 1.0]) {
+                                        let base = verts.len() as u32;
+                                        verts.extend(quad);
+                                        indices.extend(qi.into_iter().map(|i| i + base));
+                                    }
+                                }
+                            }
+                            if !verts.is_empty() {
+                                append_ui_geometry(&mut batches, UiBatchKind::TiledBackground, verts, indices);
+                            }
+                        }
+                    }
+                }
                 UiCommand::TitleLogo { sprite, center_x, y, pixel_height } => {
                     let (sprite_w, sprite_h) = self.gui_atlas.sprite_size(sprite);
                     if sprite_w > 0.0 && sprite_h > 0.0 {
@@ -2317,6 +2382,7 @@ impl Renderer {
                 UiBatchKind::Item => (&mut item_vertices, &mut item_indices),
                 UiBatchKind::IsometricBlock => (&mut iso_vertices, &mut iso_indices),
                 UiBatchKind::Text => (&mut text_vertices, &mut text_indices),
+                UiBatchKind::TiledBackground => (&mut sprite_vertices, &mut sprite_indices),
             };
             let vertex_base = vertices.len() as u32;
             let index_start = indices.len() as u32;
@@ -2361,6 +2427,20 @@ impl Renderer {
         }
         for batch in draw_batches {
             match batch.kind {
+                UiBatchKind::TiledBackground => {
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("ui_tiled_pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment { view, resolve_target: None, ops: Operations { load: LoadOp::Load, store: StoreOp::Store } })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.gui_pipeline);
+                    pass.set_bind_group(0, &self.tiled_gui_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.gui_vb.slice(..));
+                    pass.set_index_buffer(self.gui_ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(batch.index_start..batch.index_end, 0, 0..1);
+                }
                 UiBatchKind::Sprite => {
                     let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                         label: Some("ui_sprite_pass"),

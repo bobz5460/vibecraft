@@ -19,7 +19,7 @@ pub struct GuiAtlas {
     pub view: wgpu::TextureView,
     pub sampler: wgpu::Sampler,
     pub sprites: HashMap<u64, [f32; 4]>,
-    atlas_size: u32,
+    pub atlas_size: u32,
 }
 
 impl GuiAtlas {
@@ -87,6 +87,9 @@ impl GuiAtlas {
             Self::load_single_png(reader, "textures/colormap", &mut entries, "colormap/", "foliage");
             Self::load_single_png(reader, "textures/colormap", &mut entries, "colormap/", "grass");
         }
+
+        // Menu dirt background (repeating 16x16 dirt pattern)
+        Self::load_single_png(reader, "textures/gui", &mut entries, "gui/", "menu_background");
 
         // Add white reference pixel for colored quads (synthetic 1x1 white sprite)
         entries.push(("_white".to_string(), image::RgbaImage::from_pixel(1, 1, image::Rgba([255u8, 255, 255, 255]))));
@@ -259,7 +262,7 @@ impl GuiAtlas {
         (pixels, uvs)
     }
 
-    fn get_uv(&self, name: &str) -> Option<[f32; 4]> {
+    pub fn get_uv(&self, name: &str) -> Option<[f32; 4]> {
         self.sprites.get(&sprite_id(name)).copied()
     }
 

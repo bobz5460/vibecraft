@@ -39,7 +39,7 @@ pub struct WorldGenerator {
     weirdness_noise: Simplex,    // weirdness for biome variation
     river_noise: Simplex,
     biome_offsets: [(f64, f64); 8], // offsets for biome blending
-    seed: u64,
+    pub seed: u64,
     column_cache: Vec<(i32, Biome)>,
     cache_base_x: i64,
     cache_base_z: i64,
@@ -743,6 +743,31 @@ impl WorldGenerator {
 
         self.carve_caves_and_ores(chunk, base_x, base_z);
 
+        self.decorate_chunk(chunk);
+
+        chunk.recount_fluids();
+        chunk.is_dirty = true;
+    }
+
+    /// Apply decorations (trees, flowers, structures, ocean flora) to a chunk
+    /// whose terrain has already been generated. This populates the column cache
+    /// from scratch, so it works with any terrain generator.
+    pub fn decorate_chunk(&mut self, chunk: &mut Chunk) {
+        let base_x = chunk.cx as i64 * CHUNK_SIZE as i64;
+        let base_z = chunk.cz as i64 * CHUNK_SIZE as i64;
+        self.cache_base_x = base_x;
+        self.cache_base_z = base_z;
+
+        self.column_cache.clear();
+        for x in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                let wx = (base_x + x as i64) as f64;
+                let wz = (base_z + z as i64) as f64;
+                let (height, biome) = self.compute_height(wx, wz);
+                self.column_cache.push((height, biome));
+            }
+        }
+
         let center_wx = (base_x + 8i64) as f64;
         let center_wz = (base_z + 8i64) as f64;
         let (_center_h, center_biome) = self.get_height(center_wx, center_wz);
@@ -753,9 +778,6 @@ impl WorldGenerator {
         self.place_structures(chunk, &mut structure_rng, base_x, base_z, center_biome);
         let mut ocean_rng = self.chunk_rng(chunk.cx, chunk.cz, 0x3c6ef372fe94f82b);
         self.generate_ocean_flora(chunk, &mut ocean_rng, base_x, base_z);
-
-        chunk.recount_fluids();
-        chunk.is_dirty = true;
     }
 
     fn generate_terrain_column(&self, chunk: &mut Chunk, x: usize, z: usize) {

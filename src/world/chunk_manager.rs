@@ -4,6 +4,8 @@ use crate::world::chunk::{BlockEntity, Chunk, CHUNK_HEIGHT, CHUNK_SIZE, CHUNK_VO
 use crate::world::mesh::{build_chunk_mesh, ChunkMesh};
 use crate::world::persistence::{ChunkData, StorageError, WorldStorage};
 use crate::world::block_registry::registry;
+use crate::world::gen::generate_chunk_terrain;
+use crate::world::gen::integration::TerrainPipeline;
 use crate::world::world_gen::WorldGenerator;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -124,6 +126,7 @@ impl ChunkManager {
             let rx = std::sync::Arc::clone(&task_rx);
             let tx = result_tx.clone();
             thread::spawn(move || {
+                let pipeline = TerrainPipeline::new(seed);
                 let mut generator = WorldGenerator::new(seed);
                 loop {
                 let task = {
@@ -138,7 +141,10 @@ impl ChunkManager {
                                 chunk
                             } else {
                                 let mut chunk = Chunk::new(task.cx, task.cz);
-                                generator.generate_chunk(&mut chunk);
+                                generate_chunk_terrain(&mut chunk, &pipeline);
+                                generator.decorate_chunk(&mut chunk);
+                                chunk.recount_fluids();
+                                chunk.is_dirty = true;
                                 chunk
                             }
                         }))
@@ -609,7 +615,11 @@ impl ChunkManager {
     pub fn get_or_create_chunk(&mut self, cx: i32, cz: i32) -> &mut Chunk {
         if !self.chunks.contains_key(&(cx, cz)) {
             let mut chunk = Chunk::new(cx, cz);
-            self.generator.generate_chunk(&mut chunk);
+            let pipeline = TerrainPipeline::new(self.generator.seed);
+            generate_chunk_terrain(&mut chunk, &pipeline);
+            self.generator.decorate_chunk(&mut chunk);
+            chunk.recount_fluids();
+            chunk.is_dirty = true;
             self.chunks.insert((cx, cz), Arc::new(chunk));
             self.bump_chunk_revision((cx, cz));
         }

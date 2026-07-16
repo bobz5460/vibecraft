@@ -14,8 +14,10 @@ use thiserror::Error;
 use crate::world::block::BlockId;
 use crate::world::persistence::{BlockCell, ChunkData};
 use crate::world::chunk::CHUNK_VOLUME;
+use crate::world::coordinates::WorldCoordinateProfile;
+use crate::world::generation::WorldGenerationProfile;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const FRAME_HEADER_BYTES: usize = 4;
 pub const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 pub const MAX_CHUNK_PAYLOAD: usize = 768 * 1024;
@@ -136,6 +138,8 @@ pub enum ServerMessage {
         session_id: u64,
         username: String,
         world_seed: u64,
+        coordinate_profile: WorldCoordinateProfile,
+        generation_profile: WorldGenerationProfile,
         spawn: [f64; 3],
         server_tick: u64,
         view_distance: u8,
@@ -1049,6 +1053,21 @@ mod tests {
         };
         let frame = encode_server(&message).expect("valid message should encode");
         assert_eq!(decode_server(&frame), Ok(message));
+    }
+
+    #[test]
+    fn welcome_round_trips_its_world_profiles() {
+        let message = ServerMessage::Welcome {
+            session_id: 1,
+            username: "Alex".to_string(),
+            world_seed: 42,
+            coordinate_profile: crate::world::coordinates::WorldCoordinateProfile::JavaOverworld,
+            generation_profile: crate::world::generation::WorldGenerationProfile::Minecraft26NativeDecorationPreview,
+            spawn: [0.0, 75.0, 0.0],
+            server_tick: 0,
+            view_distance: 6,
+        };
+        assert_eq!(decode_server(&encode_server(&message).unwrap()), Ok(message));
     }
 
     #[test]

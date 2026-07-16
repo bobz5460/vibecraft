@@ -646,7 +646,12 @@ mod tests {
 
     #[test]
     fn movement_stops_at_a_solid_block() {
-        let mut manager = ChunkManager::new(11, 2);
+        let mut manager = ChunkManager::new(
+            11,
+            2,
+            crate::world::coordinates::WorldCoordinateProfile::LegacyLocal,
+            crate::world::generation::WorldGenerationProfile::legacy(),
+        );
         let mut chunk = Chunk::new(0, 0);
         chunk.set_block(1, 64, 0, Block::new(BlockId::Stone));
         manager.chunks.insert((0, 0), Arc::new(chunk));

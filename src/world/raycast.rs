@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn raycast_hits_expected_block_and_face() {
-        let mut manager = ChunkManager::new(7, 2);
+        let mut manager = ChunkManager::new(7, 2, crate::world::coordinates::WorldCoordinateProfile::LegacyLocal, crate::world::generation::WorldGenerationProfile::legacy());
         let mut chunk = Chunk::new(0, 0);
         chunk.set_block(2, 10, 2, Block::new(BlockId::Stone));
         manager.chunks.insert((0, 0), Arc::new(chunk));
@@ -160,7 +160,25 @@ mod tests {
 
     #[test]
     fn zero_direction_returns_no_hit() {
-        let manager = ChunkManager::new(7, 2);
+        let manager = ChunkManager::new(7, 2, crate::world::coordinates::WorldCoordinateProfile::LegacyLocal, crate::world::generation::WorldGenerationProfile::legacy());
         assert!(manager.raycast(Vector3::zeros(), Vector3::zeros(), 5.0).is_none());
+    }
+
+    #[test]
+    fn java_profile_raycast_returns_public_negative_y() {
+        let mut manager = ChunkManager::new(
+            7,
+            2,
+            crate::world::coordinates::WorldCoordinateProfile::JavaOverworld,
+            crate::world::generation::WorldGenerationProfile::legacy(),
+        );
+        let mut chunk = Chunk::new(0, 0);
+        chunk.set_block(2, 0, 2, Block::new(BlockId::Stone));
+        manager.chunks.insert((0, 0), Arc::new(chunk));
+
+        let hit = manager
+            .raycast(Vector3::new(0.5, -63.5, 2.5), Vector3::new(1.0, 0.0, 0.0), 5.0)
+            .unwrap();
+        assert_eq!(hit.y, -64);
     }
 }

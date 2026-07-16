@@ -20,6 +20,7 @@ pub enum UiScreen {
     WorldSelect,
     CreateWorld,
     Loading,
+    LoadFailed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +43,8 @@ pub enum UiAction {
     OpenConnect,
     ConnectServer,
     DeleteWorld,
+    RetryLoading,
+    BackToTitle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,6 +232,7 @@ pub struct UiState {
     pub blur_intensity: f32,
     pub frame_count: u64,
     pub connecting: bool,
+    pub loading_error: Option<String>,
     pub worlds: Vec<UiWorld>,
     pub selected_world: Option<usize>,
     pub confirm_delete_world: bool,
@@ -266,6 +270,7 @@ impl Default for UiState {
             blur_intensity: 3.0,
             frame_count: 0,
             connecting: false,
+            loading_error: None,
             worlds: Vec::new(),
             selected_world: None,
             confirm_delete_world: false,
@@ -431,6 +436,7 @@ impl UiState {
             }
             UiScreen::Title => {}
             UiScreen::Loading => {}
+            UiScreen::LoadFailed => return UiAction::BackToTitle,
         }
         UiAction::None
     }
@@ -504,6 +510,7 @@ impl UiState {
             UiScreen::Title => 4,
             UiScreen::WorldSelect => 4,
             UiScreen::CreateWorld => 3,
+            UiScreen::LoadFailed => 2,
             _ => 0,
         }
     }
@@ -682,6 +689,11 @@ impl UiState {
                     self.keyboard_focus = None;
                     UiAction::None
                 }
+                _ => UiAction::None,
+            },
+            UiScreen::LoadFailed => match index {
+                0 => UiAction::RetryLoading,
+                1 => UiAction::BackToTitle,
                 _ => UiAction::None,
             },
             _ => UiAction::None,
@@ -1007,6 +1019,7 @@ impl UiState {
             UiScreen::WorldSelect => draw_world_select(&mut frame, width, height, self, cursor),
             UiScreen::CreateWorld => draw_create_world(&mut frame, width, height, self, cursor),
             UiScreen::Loading => draw_loading(&mut frame, width, height, self.gui_scale, self.loading_progress, self.connecting),
+            UiScreen::LoadFailed => draw_loading_error(&mut frame, width, height, self, cursor),
         }
         frame
     }
@@ -1130,6 +1143,23 @@ fn draw_loading(frame: &mut UiFrame, width: f32, height: f32, scale: f32, progre
         progress,
         color: [1.0, 1.0, 1.0, 1.0],
     });
+}
+
+fn draw_loading_error(frame: &mut UiFrame, width: f32, height: f32, ui: &UiState, cursor: Option<(f32, f32)>) {
+    panel(frame, width, height, ui.high_contrast);
+    centered_text(frame, width * 0.5, height * 0.38, 12.0 * ui.gui_scale, "Could not find a safe spawn", [1.0, 1.0, 1.0, 1.0]);
+    centered_text(
+        frame,
+        width * 0.5,
+        height * 0.44,
+        7.0 * ui.gui_scale,
+        ui.loading_error.as_deref().unwrap_or("Safe spawn loading did not complete."),
+        [0.85, 0.85, 0.85, 1.0],
+    );
+    for (index, (x, y, w, h)) in ui.button_rects(width, height).iter().copied().enumerate() {
+        let hover = cursor.is_some_and(|(mx, my)| contains((x, y, w, h), mx, my));
+        minecraft_button(frame, x, y, w, h, if index == 0 { "Retry" } else { "Back" }, ui.keyboard_focus == Some(index), hover);
+    }
 }
 
 // Vanilla slots are 18px with a beveled inner area of about 16px.
@@ -2034,6 +2064,18 @@ mod tests {
         );
         assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::Sprite { name, .. } if name == "hud/experience_bar_background")));
         assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::SpriteProgress { name, progress, .. } if name == "hud/experience_bar_progress" && *progress == 0.5)));
+    }
+
+    #[test]
+    fn loading_error_captures_gameplay_and_only_offers_recovery_actions() {
+        let mut ui = UiState::default();
+        ui.screen = UiScreen::LoadFailed;
+
+        assert!(ui.captures_gameplay_input());
+        assert_eq!(ui.handle_key(KeyCode::Enter), UiAction::RetryLoading);
+        ui.move_focus(1);
+        assert_eq!(ui.handle_key(KeyCode::Enter), UiAction::BackToTitle);
+        assert_eq!(ui.handle_escape(), UiAction::BackToTitle);
     }
 
     #[test]

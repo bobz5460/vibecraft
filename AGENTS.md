@@ -71,7 +71,8 @@ This repository is a native Rust implementation of Minecraft-like Java Edition g
 ### World Coordinates And Chunks
 
 - Chunks are columns: `CHUNK_SIZE = 16`, `CHUNK_HEIGHT = 384`, and `CHUNK_VOLUME = 98,304`.
-- Valid local and world Y coordinates are `0..CHUNK_HEIGHT`; world queries outside that range currently return air/light defaults depending on the API.
+- Chunk-local Y is always `0..CHUNK_HEIGHT`. Public world Y is selected by immutable `WorldCoordinateProfile`: legacy saves use `0..383`; new Java-profile Overworlds use `-64..319`. Keep chunk storage, lighting, fluid work, and chunk wire payloads local; convert only at `ChunkManager`'s public world-coordinate boundary and mesh output.
+- `WorldGenerationProfile` is persisted separately from `WorldCoordinateProfile`. Migrated worlds retain legacy pre-corrected interpolation; new local/server worlds use the corrected Minecraft-26 base. Do not infer or change one profile from the other, and thread generation behavior through `ChunkManager` workers so old/new chunk seams remain stable.
 - `Chunk::index(x, y, z)` is `(y * 16 + z) * 16 + x`. Preserve this ordering for any parallel block/light arrays.
 - Convert negative world coordinates with `div_euclid` and `rem_euclid`, as `ChunkManager::get_block` and `set_block` do. Never use `/` and `%` for chunk lookup at negative positions.
 - `Chunk` contains blocks, sky light, block light, dirty flags, and fluid bookkeeping. It does not decide cross-chunk lighting propagation.

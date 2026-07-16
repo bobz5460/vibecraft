@@ -1,6 +1,8 @@
 use crate::inventory::item::ItemRegistry;
 use crate::world::block::{Block, BlockId};
 use crate::world::chunk::{BlockEntity, Chunk, CHUNK_HEIGHT, CHUNK_SIZE, CHUNK_VOLUME};
+use crate::world::coordinates::WorldCoordinateProfile;
+use crate::world::generation::WorldGenerationProfile;
 use crate::world::mesh::{build_chunk_mesh, ChunkMesh};
 use crate::world::persistence::{ChunkData, StorageError, WorldStorage};
 use crate::world::block_registry::registry;
@@ -42,6 +44,7 @@ struct MeshTask {
     dependencies: HashMap<(i32, i32), u64>,
     chunk: Arc<Chunk>,
     neighbors: HashMap<(i32, i32), Arc<Chunk>>,
+    coordinate_profile: WorldCoordinateProfile,
 }
 
 struct MeshResult {
@@ -71,6 +74,8 @@ pub struct ChunkManager {
     pub chunks: HashMap<(i32, i32), Arc<Chunk>>,
     pub meshes: HashMap<(i32, i32), ChunkMesh>,
     generator: VanillaWorldGenerator,
+    coordinate_profile: WorldCoordinateProfile,
+    generation_profile: WorldGenerationProfile,
     task_tx: Sender<ChunkGenTask>,
     result_rx: Receiver<ChunkGenResult>,
     mesh_task_tx: Sender<MeshTask>,
@@ -86,6 +91,7 @@ pub struct ChunkManager {
     dirty_keys: HashSet<(i32, i32)>,
     save_dirty_keys: HashSet<(i32, i32)>,
     save_failed_keys: HashSet<(i32, i32)>,
+    generation_failed_keys: HashSet<(i32, i32)>,
     storage: Option<WorldStorage>,
     light_dirty_keys: HashSet<(i32, i32)>,
     light_in_flight: Option<HashSet<(i32, i32)>>,
@@ -104,7 +110,12 @@ pub struct ChunkManagerStats {
 }
 
 impl ChunkManager {
-    pub fn new(seed: u64, render_distance: i32) -> Self {
+    pub fn new(
+        seed: u64,
+        render_distance: i32,
+        coordinate_profile: WorldCoordinateProfile,
+        generation_profile: WorldGenerationProfile,
+    ) -> Self {
         let (task_tx, task_rx) = channel::<ChunkGenTask>();
         let (result_tx, result_rx) = channel::<ChunkGenResult>();
         let (mesh_task_tx, mesh_task_rx) = channel::<MeshTask>();
@@ -124,7 +135,7 @@ impl ChunkManager {
             let rx = std::sync::Arc::clone(&task_rx);
             let tx = result_tx.clone();
             thread::spawn(move || {
-                let generator = VanillaWorldGenerator::from_seed(seed);
+                let generator = VanillaWorldGenerator::from_seed(seed, generation_profile);
                 loop {
                 let task = {
                     let lock = rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -168,7 +179,7 @@ impl ChunkManager {
                         task.neighbors.get(&(cx, cz)).map(|a| a.as_ref())
                     };
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        build_chunk_mesh(&task.chunk, &neighbor_fn)
+                        build_chunk_mesh(&task.chunk, &neighbor_fn, task.coordinate_profile)
                     }))
                     .map_err(panic_message);
                     if tx
@@ -220,7 +231,9 @@ impl ChunkManager {
         ChunkManager {
             chunks: HashMap::new(),
             meshes: HashMap::new(),
-            generator: VanillaWorldGenerator::from_seed(seed),
+            generator: VanillaWorldGenerator::from_seed(seed, generation_profile),
+            coordinate_profile,
+            generation_profile,
             task_tx,
             result_rx,
             mesh_task_tx,
@@ -236,6 +249,7 @@ impl ChunkManager {
             dirty_keys: HashSet::new(),
             save_dirty_keys: HashSet::new(),
             save_failed_keys: HashSet::new(),
+            generation_failed_keys: HashSet::new(),
             storage: None,
             light_dirty_keys: HashSet::new(),
             light_in_flight: None,
@@ -249,6 +263,18 @@ impl ChunkManager {
     /// generation and changed chunks are written before they leave memory.
     pub fn set_storage(&mut self, storage: WorldStorage) {
         self.storage = Some(storage);
+    }
+
+    pub const fn coordinate_profile(&self) -> WorldCoordinateProfile {
+        self.coordinate_profile
+    }
+
+    pub const fn generation_profile(&self) -> WorldGenerationProfile {
+        self.generation_profile
+    }
+
+    pub const fn contains_world_y(&self, y: i32) -> bool {
+        self.coordinate_profile.contains_world_y(y)
     }
 
     /// Saves every changed loaded chunk. Returns false when a write failed;
@@ -331,6 +357,40 @@ impl ChunkManager {
         })
     }
 
+    /// A chunk entering, leaving, or being replaced changes face culling and
+    /// AO for the whole 3x3 mesh neighborhood. Cardinal columns also need a
+    /// relight because skylight and block light cross their shared boundary.
+    fn invalidate_chunk_topology(&mut self, key: (i32, i32)) {
+        let mut invalidated_lighting = false;
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let neighbor = (key.0 + dx, key.1 + dz);
+                if !self.chunks.contains_key(&neighbor) {
+                    continue;
+                }
+
+                self.dirty_keys.insert(neighbor);
+                // A task made before this topology change does not include a
+                // newly available neighbor in its revision dependencies.
+                self.meshing.remove(&neighbor);
+
+                if dx == 0 || dz == 0 {
+                    if let Some(chunk) = self.chunks.get_mut(&neighbor).map(clone_arc) {
+                        chunk.light_dirty = true;
+                    }
+                    self.light_dirty_keys.insert(neighbor);
+                    invalidated_lighting = true;
+                }
+            }
+        }
+
+        // Let an in-flight light task complete, but discard its pre-topology
+        // snapshot before it can clear the newly dirtied columns.
+        if invalidated_lighting && self.light_in_flight.is_some() {
+            self.work_epoch = self.work_epoch.wrapping_add(1);
+        }
+    }
+
     fn chunk_range(&mut self, player_cx: i32, player_cz: i32) {
         if self.cached_range_center != (player_cx, player_cz) || self.cached_range.is_empty() {
             self.cached_range.clear();
@@ -349,14 +409,19 @@ impl ChunkManager {
 
     fn retain_chunks_for_centers(&mut self, centers: &[(i32, i32)]) {
         let render_distance = self.render_distance;
-        let keep = |(cx, cz): (i32, i32)| {
-            centers.iter().any(|&(center_x, center_z)| {
-                cx >= center_x - render_distance - 1
-                    && cx <= center_x + render_distance + 1
-                    && cz >= center_z - render_distance - 1
-                    && cz <= center_z + render_distance + 1
-            })
-        };
+        let mut retained = HashSet::new();
+        for &(center_x, center_z) in centers {
+            for cx in center_x - render_distance - 1..=center_x + render_distance + 1 {
+                for cz in center_z - render_distance - 1..=center_z + render_distance + 1 {
+                    retained.insert((cx, cz));
+                }
+            }
+        }
+        self.retain_chunks_for_keys(&retained);
+    }
+
+    fn retain_chunks_for_keys(&mut self, retained: &HashSet<(i32, i32)>) {
+        let keep = |key| retained.contains(&key);
         let unload: Vec<_> = self.chunks.keys().copied().filter(|&key| !keep(key)).collect();
         for key in unload {
             if self.save_dirty_keys.contains(&key) && !self.save_chunk(key) {
@@ -371,6 +436,7 @@ impl ChunkManager {
             self.chunk_revisions.remove(&key);
             self.save_dirty_keys.remove(&key);
             self.save_failed_keys.remove(&key);
+            self.invalidate_chunk_topology(key);
         }
         self.meshes.retain(|&key, _| keep(key));
     }
@@ -388,7 +454,17 @@ impl ChunkManager {
     /// by the authoritative server so one player's movement does not unload
     /// terrain needed by another player.
     pub fn update_chunks_async_for_centers(&mut self, centers: &[(i32, i32)]) {
-        if centers.is_empty() {
+        self.update_chunks_async_for_centers_and_required_chunks(centers, &[]);
+    }
+
+    /// Streams normal render-distance columns plus exact required columns. Required
+    /// columns are retained and prioritized even when they lie outside render distance.
+    pub fn update_chunks_async_for_centers_and_required_chunks(
+        &mut self,
+        centers: &[(i32, i32)],
+        required_chunks: &[(i32, i32)],
+    ) {
+        if centers.is_empty() && required_chunks.is_empty() {
             return;
         }
         self.cached_range.clear();
@@ -400,16 +476,22 @@ impl ChunkManager {
                 }
             }
         }
+        desired.extend(required_chunks.iter().copied());
         self.cached_range.extend(desired.iter().copied());
-        self.cached_range_center = centers[0];
+        self.cached_range_center = centers.first().copied().unwrap_or_default();
         self.pending.retain(|key| desired.contains(key));
         let mut range = self.cached_range.clone();
-        range.sort_by_key(|(cx, cz)| {
-            centers
-                .iter()
-                .map(|(center_x, center_z)| (cx - center_x).abs() + (cz - center_z).abs())
-                .min()
-                .unwrap_or(i32::MAX)
+        range.sort_by_key(|&(cx, cz)| {
+            (
+                !required_chunks.contains(&(cx, cz)),
+                centers
+                    .iter()
+                    .map(|(center_x, center_z)| (cx - center_x).abs() + (cz - center_z).abs())
+                    .min()
+                    .unwrap_or(i32::MAX),
+                cx,
+                cz,
+            )
         });
         for &(cx, cz) in &range {
             if self.pending.len() >= self.max_generation_tasks {
@@ -418,6 +500,7 @@ impl ChunkManager {
             if !self.chunks.contains_key(&(cx, cz))
                 && !self.pending.contains(&(cx, cz))
                 && !self.save_failed_keys.contains(&(cx, cz))
+                && !self.generation_failed_keys.contains(&(cx, cz))
             {
                 let saved_chunk = match self.storage.as_ref() {
                     Some(storage) => match storage.load_chunk_if_present(cx, cz) {
@@ -442,7 +525,15 @@ impl ChunkManager {
                 let _ = self.task_tx.send(ChunkGenTask { cx, cz, saved_chunk });
             }
         }
-        self.retain_chunks_for_centers(centers);
+        let mut retained = desired;
+        for &(center_x, center_z) in centers {
+            for cx in center_x - self.render_distance - 1..=center_x + self.render_distance + 1 {
+                for cz in center_z - self.render_distance - 1..=center_z + self.render_distance + 1 {
+                    retained.insert((cx, cz));
+                }
+            }
+        }
+        self.retain_chunks_for_keys(&retained);
     }
 
     pub fn process_loaded_chunks(&mut self) -> usize {
@@ -456,6 +547,7 @@ impl ChunkManager {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     log::error!("chunk generation worker failed for {key:?}: {error}");
+                    self.generation_failed_keys.insert(key);
                     continue;
                 }
             };
@@ -467,15 +559,7 @@ impl ChunkManager {
                 self.bump_chunk_revision(key);
                 // Do not publish a bootstrap mesh: it would contain fabricated full
                 // skylight. The relight result below schedules the first valid mesh.
-                self.light_dirty_keys.insert(key);
-                for (dx, dz) in &[(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                    let nk = (key.0 + dx, key.1 + dz);
-                    if let Some(chunk) = self.chunks.get_mut(&nk).map(|a| clone_arc(a)) {
-                        chunk.light_dirty = true;
-                        self.light_dirty_keys.insert(nk);
-                        self.bump_chunk_revision(nk);
-                    }
-                }
+                self.invalidate_chunk_topology(key);
             }
         }
         self.chunks.len()
@@ -484,6 +568,28 @@ impl ChunkManager {
     #[allow(dead_code)]
     pub fn get_chunk(&self, cx: i32, cz: i32) -> Option<&Chunk> {
         self.chunks.get(&(cx, cz)).map(|a| a.as_ref())
+    }
+
+    /// Whether generation has been requested and not yet admitted or failed.
+    /// The local loading UI samples this only from the main thread.
+    pub fn is_chunk_pending(&self, cx: i32, cz: i32) -> bool {
+        self.pending.contains(&(cx, cz))
+    }
+
+    /// Whether a chunk could not be loaded or generated and requires an explicit retry.
+    pub fn is_chunk_failed(&self, cx: i32, cz: i32) -> bool {
+        self.save_failed_keys.contains(&(cx, cz)) || self.generation_failed_keys.contains(&(cx, cz))
+    }
+
+    /// Allows a caller-owned recovery flow to retry failed chunk work.
+    pub fn retry_failed_chunks(&mut self) {
+        self.save_failed_keys.clear();
+        self.generation_failed_keys.clear();
+    }
+
+    /// Whether a mesh worker still owns a snapshot for this chunk.
+    pub fn is_chunk_meshing(&self, cx: i32, cz: i32) -> bool {
+        self.meshing.contains_key(&(cx, cz))
     }
 
     /// Returns loaded chunk coordinates for bounded replication and diagnostics.
@@ -514,6 +620,7 @@ impl ChunkManager {
         self.dirty_keys.clear();
         self.save_dirty_keys.clear();
         self.save_failed_keys.clear();
+        self.generation_failed_keys.clear();
         self.light_dirty_keys.clear();
         self.chunk_revisions.clear();
         self.cached_range.clear();
@@ -543,17 +650,7 @@ impl ChunkManager {
         self.meshes.remove(&key);
         self.chunks.insert(key, Arc::new(chunk));
         self.chunk_revisions.insert(key, revision);
-        self.dirty_keys.insert(key);
-        self.light_dirty_keys.insert(key);
-
-        // A replacement can change face culling and ambient-occlusion samples
-        // for the four neighboring columns.
-        for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-            let neighbor = (key.0 + dx, key.1 + dz);
-            if self.chunks.contains_key(&neighbor) {
-                self.dirty_keys.insert(neighbor);
-            }
-        }
+        self.invalidate_chunk_topology(key);
         Ok(true)
     }
 
@@ -571,12 +668,7 @@ impl ChunkManager {
         self.save_dirty_keys.remove(&key);
         self.save_failed_keys.remove(&key);
         if existed {
-            for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                let neighbor = (cx + dx, cz + dz);
-                if self.chunks.contains_key(&neighbor) {
-                    self.dirty_keys.insert(neighbor);
-                }
-            }
+            self.invalidate_chunk_topology(key);
         }
         existed
     }
@@ -612,12 +704,21 @@ impl ChunkManager {
             self.generator.generate_chunk(&mut chunk);
             self.chunks.insert((cx, cz), Arc::new(chunk));
             self.bump_chunk_revision((cx, cz));
+            self.invalidate_chunk_topology((cx, cz));
         }
         clone_arc(self.chunks.get_mut(&(cx, cz)).unwrap())
     }
 
+    /// Queries a block in this world's public coordinate profile.
     pub fn get_block(&self, x: i32, y: i32, z: i32) -> Block {
-        if y < 0 || y >= CHUNK_HEIGHT as i32 {
+        let Some(local_y) = self.coordinate_profile.to_local_y(y) else {
+            return Block::air();
+        };
+        self.get_block_local(x, local_y as i32, z)
+    }
+
+    fn get_block_local(&self, x: i32, y: i32, z: i32) -> Block {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return Block::air();
         }
         let cx = x.div_euclid(CHUNK_SIZE as i32);
@@ -632,7 +733,12 @@ impl ChunkManager {
     }
 
     pub fn get_block_entity(&self, x: i32, y: i32, z: i32) -> Option<&BlockEntity> {
-        if y < 0 || y >= CHUNK_HEIGHT as i32 {
+        let local_y = self.coordinate_profile.to_local_y(y)? as i32;
+        self.get_block_entity_local(x, local_y, z)
+    }
+
+    fn get_block_entity_local(&self, x: i32, y: i32, z: i32) -> Option<&BlockEntity> {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return None;
         }
         let cx = x.div_euclid(CHUNK_SIZE as i32);
@@ -646,7 +752,14 @@ impl ChunkManager {
 
     /// Persists state changes without invalidating a mesh that cannot observe them.
     pub fn set_block_entity(&mut self, x: i32, y: i32, z: i32, entity: BlockEntity) -> bool {
-        if y < 0 || y >= CHUNK_HEIGHT as i32 {
+        let Some(local_y) = self.coordinate_profile.to_local_y(y) else {
+            return false;
+        };
+        self.set_block_entity_local(x, local_y as i32, z, entity)
+    }
+
+    fn set_block_entity_local(&mut self, x: i32, y: i32, z: i32, entity: BlockEntity) -> bool {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return false;
         }
         let cx = x.div_euclid(CHUNK_SIZE as i32);
@@ -695,9 +808,9 @@ impl ChunkManager {
         completed
     }
 
-    /// Finds a standable spawn in already-loaded terrain near the requested
-    /// column. It never generates synchronously, keeping first-world spawn
-    /// selection within the normal streaming lifecycle.
+    /// Finds a dry, exposed surface spawn in already-loaded terrain near the
+    /// requested column. It never generates synchronously, keeping first-world
+    /// spawn selection within the normal streaming lifecycle.
     pub fn find_safe_spawn(&self, x: i32, z: i32, radius: i32) -> Option<[i32; 3]> {
         for distance in 0..=radius {
             for dx in -distance..=distance {
@@ -712,15 +825,26 @@ impl ChunkManager {
                     if !self.chunks.contains_key(&(cx, cz)) {
                         continue;
                     }
-                    for y in (1..CHUNK_HEIGHT as i32 - 2).rev() {
-                        let ground = self.get_block(wx, y, wz);
-                        if ground.id.is_solid()
-                            && self.get_block(wx, y + 1, wz).is_air()
-                            && self.get_block(wx, y + 2, wz).is_air()
-                        {
-                            return Some([wx, y + 1, wz]);
-                        }
+                    let Some(surface_y) = (0..CHUNK_HEIGHT as i32)
+                        .rev()
+                        .find(|&y| !self.get_block_local(wx, y, wz).is_air())
+                    else {
+                        continue;
+                    };
+                    let ground = self.get_block_local(wx, surface_y, wz);
+                    if matches!(ground.id, BlockId::Water | BlockId::Lava)
+                        || !ground.id.is_solid()
+                        || surface_y + 2 >= CHUNK_HEIGHT as i32
+                        || !self.get_block_local(wx, surface_y + 1, wz).is_air()
+                        || !self.get_block_local(wx, surface_y + 2, wz).is_air()
+                    {
+                        continue;
                     }
+                    return Some([
+                        wx,
+                        self.coordinate_profile.from_local_y((surface_y + 1) as usize)?,
+                        wz,
+                    ]);
                 }
             }
         }
@@ -730,7 +854,14 @@ impl ChunkManager {
     /// Internal light level: max(sky_light, block_light) for gameplay checks.
     /// Returns 0-15, where 0 is dark and 15 is fully lit.
     pub fn get_internal_light(&self, x: i32, y: i32, z: i32) -> u8 {
-        if y < 0 || y >= CHUNK_HEIGHT as i32 {
+        let Some(local_y) = self.coordinate_profile.to_local_y(y) else {
+            return 15;
+        };
+        self.get_internal_light_local(x, local_y as i32, z)
+    }
+
+    fn get_internal_light_local(&self, x: i32, y: i32, z: i32) -> u8 {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return 15;
         }
         let cx = x.div_euclid(CHUNK_SIZE as i32);
@@ -747,14 +878,21 @@ impl ChunkManager {
     }
 
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, block: Block) {
-        let old = self.get_block(x, y, z);
+        let Some(local_y) = self.coordinate_profile.to_local_y(y) else {
+            return;
+        };
+        self.set_block_local(x, local_y as i32, z, block);
+    }
+
+    fn set_block_local(&mut self, x: i32, y: i32, z: i32, block: Block) {
+        let old = self.get_block_local(x, y, z);
         self.set_block_internal(x, y, z, block, true);
         if old.id == BlockId::OakDoor && block.is_air() {
             let half = registry()
                 .properties_for_state(old.id, old.state)
                 .and_then(|properties| properties.into_iter().find(|(name, _)| *name == "half").map(|(_, value)| value));
             let other_y = if half == Some("lower") { y + 1 } else { y - 1 };
-            if self.get_block(x, other_y, z).id == BlockId::OakDoor {
+            if self.get_block_local(x, other_y, z).id == BlockId::OakDoor {
                 self.set_block_internal(x, other_y, z, Block::air(), true);
             }
         }
@@ -764,11 +902,18 @@ impl ChunkManager {
     /// Applies normal placement rules that need more than one block state.
     /// The caller still owns reach, inventory consumption, and game-mode rules.
     pub fn place_block(&mut self, x: i32, y: i32, z: i32, id: BlockId) -> bool {
-        if !self.get_block(x, y, z).is_air() {
+        let Some(local_y) = self.coordinate_profile.to_local_y(y) else {
+            return false;
+        };
+        self.place_block_local(x, local_y as i32, z, id)
+    }
+
+    fn place_block_local(&mut self, x: i32, y: i32, z: i32, id: BlockId) -> bool {
+        if !self.get_block_local(x, y, z).is_air() {
             return false;
         }
         if id == BlockId::OakDoor {
-            if !self.get_block(x, y + 1, z).is_air() {
+            if y + 1 >= CHUNK_HEIGHT as i32 || !self.get_block_local(x, y + 1, z).is_air() {
                 return false;
             }
             let lower = registry().state_for_properties(id, [
@@ -794,19 +939,19 @@ impl ChunkManager {
     }
 
     fn refresh_connected_state(&mut self, x: i32, y: i32, z: i32) {
-        let block = self.get_block(x, y, z);
+        let block = self.get_block_local(x, y, z);
         let directions = [("north", 0, -1), ("east", 1, 0), ("south", 0, 1), ("west", -1, 0)];
         let state = match block.id {
             BlockId::OakFence => {
                 let values: Vec<(&str, &str)> = directions.iter().map(|&(name, dx, dz)| {
-                    let neighbor = self.get_block(x + dx, y, z + dz);
+                    let neighbor = self.get_block_local(x + dx, y, z + dz);
                     (name, if neighbor.id == BlockId::OakFence || neighbor.id.is_solid() { "true" } else { "false" })
                 }).chain(std::iter::once(("waterlogged", "false"))).collect();
                 registry().state_for_properties(block.id, values).unwrap_or(block.state)
             }
             BlockId::RedstoneDust => {
                 let values: Vec<(&str, &str)> = directions.iter().map(|&(name, dx, dz)| {
-                    let neighbor = self.get_block(x + dx, y, z + dz);
+                    let neighbor = self.get_block_local(x + dx, y, z + dz);
                     (name, if neighbor.id == BlockId::RedstoneDust { "side" } else { "none" })
                 }).chain(std::iter::once(("power", "0"))).collect();
                 registry().state_for_properties(block.id, values).unwrap_or(block.state)
@@ -1103,6 +1248,7 @@ impl ChunkManager {
                     dependencies,
                     chunk,
                     neighbors,
+                    coordinate_profile: self.coordinate_profile,
                 })
                 .is_ok()
             {
@@ -1180,7 +1326,7 @@ impl ChunkManager {
             if let Some(chunk) = self.chunks.get(key) {
                 let neighbor_fn =
                     |ncx: i32, ncz: i32| -> Option<&Chunk> { self.chunks.get(&(ncx, ncz)).map(|a| a.as_ref()) };
-                let mesh = build_chunk_mesh(chunk.as_ref(), &neighbor_fn);
+                let mesh = build_chunk_mesh(chunk.as_ref(), &neighbor_fn, self.coordinate_profile);
                 self.meshes.insert(*key, mesh);
                 self.meshing.remove(key);
                 if let Some(chunk) = self.chunks.get_mut(key).map(|a| clone_arc(a)) {
@@ -1414,6 +1560,13 @@ impl ChunkManager {
     }
 
     pub fn absorb_water_sponge(&mut self, x: i32, y: i32, z: i32) -> bool {
+        let Some(local_y) = self.coordinate_profile.to_local_y(y) else {
+            return false;
+        };
+        self.absorb_water_sponge_local(x, local_y as i32, z)
+    }
+
+    fn absorb_water_sponge_local(&mut self, x: i32, y: i32, z: i32) -> bool {
         let mut absorbed = false;
         let radius = 2;
         for dx in -radius..=radius {
@@ -1422,8 +1575,8 @@ impl ChunkManager {
                     let bx = x + dx;
                     let by = y + dy;
                     let bz = z + dz;
-                    if self.get_block(bx, by, bz).id == BlockId::Water {
-                        self.set_block(bx, by, bz, Block::air());
+                    if self.get_block_local(bx, by, bz).id == BlockId::Water {
+                        self.set_block_local(bx, by, bz, Block::air());
                         absorbed = true;
                     }
                 }
@@ -1438,7 +1591,7 @@ impl ChunkManager {
 
     fn apply_fluid_updates(&mut self, fluid_id: BlockId, updates: &[(i32, i32, i32, u8)]) {
         for &(x, y, z, data) in updates {
-            let existing = self.get_block(x, y, z);
+            let existing = self.get_block_local(x, y, z);
             if existing.is_air() {
                 self.set_block_internal(
                     x,
@@ -1527,7 +1680,7 @@ impl ChunkManager {
                         {
                             chunk.blocks[Chunk::index(nx as usize, y, nz as usize)]
                         } else {
-                            self.get_block(wx + dx, wy, wz + dz)
+                            self.get_block_local(wx + dx, wy, wz + dz)
                         };
                         if neighbor.is_air() || (neighbor.id == BlockId::Water) {
                             if neighbor.id == BlockId::Water {
@@ -1545,7 +1698,7 @@ impl ChunkManager {
 
         let mut rebuild_keys: HashSet<(i32, i32)> = HashSet::new();
         for (x, y, z) in &interactions {
-            self.set_block(*x, *y, *z, Block::new(BlockId::Stone));
+            self.set_block_local(*x, *y, *z, Block::new(BlockId::Stone));
             rebuild_keys.insert(chunk_key(*x, *z));
         }
 
@@ -1623,8 +1776,8 @@ impl ChunkManager {
                                 && chunk.blocks[Chunk::index(nx as usize, y + 1, nz as usize)].id
                                     == BlockId::Lava)
                     } else {
-                        self.get_block(wx + dx, wy, wz + dz).id == BlockId::Lava
-                            || self.get_block(wx + dx, wy + 1, wz + dz).id == BlockId::Lava
+                        self.get_block_local(wx + dx, wy, wz + dz).id == BlockId::Lava
+                            || self.get_block_local(wx + dx, wy + 1, wz + dz).id == BlockId::Lava
                     }
                 }) || below_block.id == BlockId::Lava
                     || above_block.id == BlockId::Lava;
@@ -1656,7 +1809,7 @@ impl ChunkManager {
                         {
                             chunk.blocks[Chunk::index(nx as usize, y, nz as usize)]
                         } else {
-                            self.get_block(wx + dx, wy, wz + dz)
+                            self.get_block_local(wx + dx, wy, wz + dz)
                         };
                         if neighbor.is_air() {
                             updates.push((wx + dx, wy, wz + dz, level + 1));
@@ -1670,7 +1823,7 @@ impl ChunkManager {
 
         let mut rebuild_keys: HashSet<(i32, i32)> = HashSet::new();
         for (x, y, z, block_id) in &lava_interactions {
-            self.set_block(*x, *y, *z, Block::new(*block_id));
+            self.set_block_local(*x, *y, *z, Block::new(*block_id));
             rebuild_keys.insert(chunk_key(*x, *z));
         }
 
@@ -1871,6 +2024,7 @@ fn light_signature(block: Block) -> (u8, u8, u8) {
 mod tests {
     use super::*;
     use crate::inventory::ItemStack;
+    use crate::world::generation::WorldGenerationProfile;
     use crate::world::persistence::WorldStorage;
     use std::fs;
 
@@ -1888,7 +2042,7 @@ mod tests {
 
     #[test]
     fn placement_builds_door_pair_and_connects_fences() {
-        let mut manager = ChunkManager::new(7, 1);
+        let mut manager = ChunkManager::new(7, 1, WorldCoordinateProfile::LegacyLocal, WorldGenerationProfile::legacy());
         manager.chunks.insert((0, 0), Arc::new(Chunk::new(0, 0)));
         assert!(manager.place_block(2, 40, 2, BlockId::OakDoor));
         assert_eq!(manager.get_block(2, 40, 2).id, BlockId::OakDoor);
@@ -1910,7 +2064,7 @@ mod tests {
         let mut source = Chunk::new(0, 0);
         source.set_block(2, 40, 2, Block::new(BlockId::DiamondBlock));
         let snapshot = ChunkData::from_chunk(&source);
-        let mut manager = ChunkManager::new(7, 1);
+        let mut manager = ChunkManager::new(7, 1, WorldCoordinateProfile::LegacyLocal, WorldGenerationProfile::legacy());
 
         assert!(manager.apply_chunk_data(snapshot.clone(), 5).unwrap());
         assert_eq!(manager.get_block(2, 40, 2).id, BlockId::DiamondBlock);
@@ -1925,7 +2079,7 @@ mod tests {
     #[test]
     fn derived_lighting_does_not_change_authoritative_revision() {
         let source = Chunk::new(0, 0);
-        let mut manager = ChunkManager::new(7, 1);
+        let mut manager = ChunkManager::new(7, 1, WorldCoordinateProfile::LegacyLocal, WorldGenerationProfile::legacy());
         assert!(manager.apply_chunk_data(ChunkData::from_chunk(&source), 7).unwrap());
 
         for _ in 0..200 {
@@ -1944,7 +2098,7 @@ mod tests {
         let mut source = Chunk::new(0, 0);
         source.set_block(2, 40, 2, Block::new(BlockId::DiamondBlock));
         let snapshot = ChunkData::from_chunk(&source);
-        let mut manager = ChunkManager::new(7, 1);
+        let mut manager = ChunkManager::new(7, 1, WorldCoordinateProfile::LegacyLocal, WorldGenerationProfile::legacy());
 
         assert!(manager.apply_chunk_data(snapshot.clone(), 5).unwrap());
         assert_eq!(manager.get_block(2, 40, 2).id, BlockId::DiamondBlock);
@@ -1960,7 +2114,7 @@ mod tests {
         let mut source = Chunk::new(0, 0);
         source.set_block(2, 40, 2, Block::new(BlockId::DiamondBlock));
         let snapshot = ChunkData::from_chunk(&source);
-        let mut manager = ChunkManager::new(7, 1);
+        let mut manager = ChunkManager::new(7, 1, WorldCoordinateProfile::LegacyLocal, WorldGenerationProfile::legacy());
 
         assert!(manager.apply_chunk_data(snapshot.clone(), 9).unwrap());
         assert!(manager.unload_authoritative_chunk(0, 0));
@@ -1971,7 +2125,7 @@ mod tests {
 
     #[test]
     fn block_entity_api_uses_world_coordinates_and_block_lifecycle() {
-        let mut manager = ChunkManager::new(7, 1);
+        let mut manager = ChunkManager::new(7, 1, WorldCoordinateProfile::LegacyLocal, WorldGenerationProfile::legacy());
         manager.chunks.insert((-1, -1), Arc::new(Chunk::new(-1, -1)));
         manager.set_block(-1, 30, -1, Block::new(BlockId::Chest));
 
@@ -1989,6 +2143,82 @@ mod tests {
     }
 
     #[test]
+    fn java_profile_converts_public_y_without_reinterpreting_chunk_storage() {
+        let mut manager = ChunkManager::new(7, 1, WorldCoordinateProfile::JavaOverworld, WorldGenerationProfile::Minecraft26Base);
+        manager.chunks.insert((0, 0), Arc::new(Chunk::new(0, 0)));
+
+        manager.set_block(2, -64, 3, Block::new(BlockId::Stone));
+        manager.set_block(2, 319, 3, Block::new(BlockId::DiamondBlock));
+
+        assert_eq!(manager.get_block(2, -64, 3).id, BlockId::Stone);
+        assert_eq!(manager.get_block(2, 319, 3).id, BlockId::DiamondBlock);
+        assert_eq!(manager.get_chunk(0, 0).unwrap().get_block(2, 0, 3).id, BlockId::Stone);
+        assert_eq!(manager.get_chunk(0, 0).unwrap().get_block(2, 383, 3).id, BlockId::DiamondBlock);
+        assert!(manager.get_block(2, -65, 3).is_air());
+        assert!(manager.get_block(2, 320, 3).is_air());
+    }
+
+    #[test]
+    fn java_profile_safe_spawn_can_stand_above_local_bottom() {
+        let mut manager = ChunkManager::new(7, 1, WorldCoordinateProfile::JavaOverworld, WorldGenerationProfile::Minecraft26Base);
+        manager.chunks.insert((0, 0), Arc::new(Chunk::new(0, 0)));
+        manager.set_block(0, -64, 0, Block::new(BlockId::Bedrock));
+
+        assert_eq!(manager.find_safe_spawn(0, 0, 0), Some([0, -63, 0]));
+    }
+
+    #[test]
+    fn safe_spawn_selects_only_the_top_dry_surface() {
+        let mut manager = ChunkManager::new(
+            7,
+            1,
+            WorldCoordinateProfile::JavaOverworld,
+            WorldGenerationProfile::Minecraft26Base,
+        );
+        manager.chunks.insert((0, 0), Arc::new(Chunk::new(0, 0)));
+        manager.set_block(0, 100, 0, Block::new(BlockId::Stone));
+        manager.set_block(0, 40, 0, Block::new(BlockId::Stone));
+
+        assert_eq!(manager.find_safe_spawn(0, 0, 0), Some([0, 101, 0]));
+
+        manager.set_block(0, 101, 0, Block::new(BlockId::Water));
+        assert_eq!(manager.find_safe_spawn(0, 0, 0), None);
+
+        manager.set_block(0, 101, 0, Block::new(BlockId::Lava));
+        assert_eq!(manager.find_safe_spawn(0, 0, 0), None);
+    }
+
+    #[test]
+    fn topology_changes_invalidate_all_loaded_mesh_neighbors() {
+        let mut manager = ChunkManager::new(
+            7,
+            1,
+            WorldCoordinateProfile::JavaOverworld,
+            WorldGenerationProfile::Minecraft26Base,
+        );
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let key = (dx, dz);
+                let mut chunk = Chunk::new(dx, dz);
+                chunk.light_dirty = false;
+                manager.chunks.insert(key, Arc::new(chunk));
+                manager.meshing.insert(key, 1);
+            }
+        }
+
+        manager.invalidate_chunk_topology((0, 0));
+
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let key = (dx, dz);
+                assert!(manager.dirty_keys.contains(&key));
+                assert!(!manager.meshing.contains_key(&key));
+                assert_eq!(manager.get_chunk(dx, dz).unwrap().light_dirty, dx == 0 || dz == 0);
+            }
+        }
+    }
+
+    #[test]
     fn changed_chunk_is_saved_before_streaming_unload() {
         let path = std::env::temp_dir().join(format!(
             "vibecraft-chunk-save-{}",
@@ -1998,7 +2228,7 @@ mod tests {
                 .as_nanos()
         ));
         let storage = WorldStorage::new(&path);
-        let mut manager = ChunkManager::new(7, 1);
+        let mut manager = ChunkManager::new(7, 1, WorldCoordinateProfile::LegacyLocal, WorldGenerationProfile::legacy());
         manager.set_storage(storage.clone());
         manager.chunks.insert((0, 0), Arc::new(Chunk::new(0, 0)));
         manager.set_block(1, 30, 2, Block::new(BlockId::DiamondBlock));

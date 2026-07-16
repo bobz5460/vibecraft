@@ -619,10 +619,10 @@ impl Clone for HalfNegative {
 impl DensityFunction for HalfNegative {
     fn compute(&self, ctx: &dyn FunctionContext) -> f64 {
         let a = self.0.compute(ctx);
-        if a < 0.0 { a } else { 0.0 }
+        if a > 0.0 { a } else { a * 0.5 }
     }
-    fn min_value(&self) -> f64 { self.0.min_value().min(0.0) }
-    fn max_value(&self) -> f64 { 0.0_f64.max(self.0.max_value().min(0.0)) }
+    fn min_value(&self) -> f64 { half_negative_value(self.0.min_value()) }
+    fn max_value(&self) -> f64 { half_negative_value(self.0.max_value()) }
     fn map_children(&self, visitor: &dyn Visitor) -> DenseFn { DenseFn(Box::new(HalfNegative(visitor.apply(self.0.clone())))) }
     fn clone_dyn(&self) -> DenseFn { DenseFn(Box::new(self.clone())) }
 }
@@ -634,20 +634,20 @@ impl Clone for QuarterNegative {
 impl DensityFunction for QuarterNegative {
     fn compute(&self, ctx: &dyn FunctionContext) -> f64 {
         let a = self.0.compute(ctx);
-        if a < 0.0 { a * a } else { 0.0 }
+        if a > 0.0 { a } else { a * 0.25 }
     }
-    fn min_value(&self) -> f64 {
-        let mi = self.0.min_value();
-        let ma = self.0.max_value();
-        if ma <= 0.0 { (mi * mi).min(ma * ma) } else { 0.0 }
-    }
-    fn max_value(&self) -> f64 {
-        let mi = self.0.min_value();
-        let ma = self.0.max_value();
-        if mi < 0.0 { let a = mi.abs().max(ma.abs()); a * a } else { 0.0 }
-    }
+    fn min_value(&self) -> f64 { quarter_negative_value(self.0.min_value()) }
+    fn max_value(&self) -> f64 { quarter_negative_value(self.0.max_value()) }
     fn map_children(&self, visitor: &dyn Visitor) -> DenseFn { DenseFn(Box::new(QuarterNegative(visitor.apply(self.0.clone())))) }
     fn clone_dyn(&self) -> DenseFn { DenseFn(Box::new(self.clone())) }
+}
+
+fn half_negative_value(value: f64) -> f64 {
+    if value > 0.0 { value } else { value * 0.5 }
+}
+
+fn quarter_negative_value(value: f64) -> f64 {
+    if value > 0.0 { value } else { value * 0.25 }
 }
 
 pub struct Invert(pub DenseFn);
@@ -1245,8 +1245,8 @@ mod tests {
         let pos = constant(5.0);
         let neg_val = constant(-5.0);
         let ctx = SinglePointContext { block_x: 0, block_y: 0, block_z: 0 };
-        assert!((half_negative(pos).compute(&ctx) - 0.0).abs() < 1e-12);
-        assert!((half_negative(neg_val).compute(&ctx) + 5.0).abs() < 1e-12);
+        assert!((half_negative(pos).compute(&ctx) - 5.0).abs() < 1e-12);
+        assert!((half_negative(neg_val).compute(&ctx) + 2.5).abs() < 1e-12);
     }
 
     #[test]
@@ -1254,8 +1254,8 @@ mod tests {
         let neg_val = constant(-4.0);
         let pos = constant(5.0);
         let ctx = SinglePointContext { block_x: 0, block_y: 0, block_z: 0 };
-        assert!((quarter_negative(neg_val).compute(&ctx) - 16.0).abs() < 1e-12);
-        assert!((quarter_negative(pos).compute(&ctx) - 0.0).abs() < 1e-12);
+        assert!((quarter_negative(neg_val).compute(&ctx) + 1.0).abs() < 1e-12);
+        assert!((quarter_negative(pos).compute(&ctx) - 5.0).abs() < 1e-12);
     }
 
     #[test]

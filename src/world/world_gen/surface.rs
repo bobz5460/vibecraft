@@ -15,6 +15,11 @@ use crate::world::world_gen::noise_router::NoiseRouter;
 use crate::world::world_gen::Biome;
 use std::sync::Arc;
 
+/// Ordinary fallback materials may reach this far below the preliminary
+/// surface. The current preliminary surface comes from the chunk heightmap;
+/// a later data-driven cave rule can use `DeepCaveException` instead.
+const ORDINARY_SURFACE_MAX_DEPTH_BELOW_PRELIMINARY: i32 = 8;
+
 // ============================================================================
 // CaveSurface
 // ============================================================================
@@ -23,6 +28,15 @@ use std::sync::Arc;
 pub enum CaveSurface {
     Floor,
     Ceiling,
+}
+
+/// Controls whether a surface replacement is constrained to the preliminary
+/// terrain surface. Deep cave-specific rules are intentionally a separate
+/// scope so they are not permanently hidden by the ordinary fallback gate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SurfaceRuleScope {
+    Ordinary,
+    DeepCaveException,
 }
 
 // ============================================================================
@@ -133,7 +147,7 @@ pub struct SurfaceContext {
     pub(crate) world_min_y: i32,
     pub(crate) world_height: i32,
     // Height getter (wx, wy, wz) -> biome
-    pub(crate) get_height: Box<dyn Fn(i32, i32, i32) -> Biome + Send + Sync>,
+    pub(crate) get_height: Box<dyn FnMut(i32, i32, i32) -> Biome + Send>,
     // Preliminary surface level getter (x, z) -> y
     pub(crate) get_preliminary_surface: Box<dyn Fn(i32, i32) -> i32 + Send + Sync>,
 }
@@ -142,7 +156,7 @@ impl SurfaceContext {
     pub fn new(
         system: Arc<SurfaceSystemRef>,
         sea_level: i32,
-        get_height: Box<dyn Fn(i32, i32, i32) -> Biome + Send + Sync>,
+        get_height: Box<dyn FnMut(i32, i32, i32) -> Biome + Send>,
         get_preliminary_surface: Box<dyn Fn(i32, i32) -> i32 + Send + Sync>,
     ) -> Self {
         Self::new_with_height(system, sea_level, 0, CHUNK_HEIGHT as i32, get_height, get_preliminary_surface)
@@ -153,7 +167,7 @@ impl SurfaceContext {
         sea_level: i32,
         world_min_y: i32,
         world_height: i32,
-        get_height: Box<dyn Fn(i32, i32, i32) -> Biome + Send + Sync>,
+        get_height: Box<dyn FnMut(i32, i32, i32) -> Biome + Send>,
         get_preliminary_surface: Box<dyn Fn(i32, i32) -> i32 + Send + Sync>,
     ) -> Self {
         SurfaceContext {
@@ -220,6 +234,16 @@ impl SurfaceContext {
             self.min_surface_level = prelim + self.surface_depth - 8;
         }
         self.min_surface_level
+    }
+
+    fn permits_surface_rule(&mut self, scope: SurfaceRuleScope) -> bool {
+        match scope {
+            SurfaceRuleScope::Ordinary => {
+                let preliminary_surface = (self.get_preliminary_surface)(self.block_x, self.block_z);
+                self.block_y >= preliminary_surface - ORDINARY_SURFACE_MAX_DEPTH_BELOW_PRELIMINARY
+            }
+            SurfaceRuleScope::DeepCaveException => true,
+        }
     }
 }
 
@@ -816,7 +840,7 @@ impl SurfaceSystem {
         rule_source: &dyn RuleSourceEx,
         sea_level: i32,
         world_min_y: i32,
-        biome_provider: impl Fn(i32, i32, i32) -> Biome + Send + Sync + 'static,
+        biome_provider: impl FnMut(i32, i32, i32) -> Biome + Send + 'static,
     ) {
         let heightmap = build_heightmap(chunk);
 
@@ -899,7 +923,18 @@ impl SurfaceSystem {
                         let stone_below_depth = stone_below_depth[y as usize];
                         ctx.update_y(stone_above_depth, stone_below_depth, water_height, world_y);
 
-                        if blk.id == system.default_block {
+                        // The simplified rules have unconditional fallback
+                        // states (for example grass, dirt, sandstone, and
+                        // terracotta). The depth context handles the exposed
+                        // face; this preliminary-heightmap gate prevents those
+                        // ordinary materials from reaching deep cave openings.
+                        // Deep-cave-specific rules must be evaluated with
+                        // `DeepCaveException` before this ordinary fallback.
+                        let surface_rule_depth = 1 + ctx.surface_depth.max(0);
+                        if blk.id == system.default_block
+                            && stone_above_depth <= surface_rule_depth
+                            && ctx.permits_surface_rule(SurfaceRuleScope::Ordinary)
+                        {
                             if let Some(new_state) = rule.try_apply(&mut ctx, block_x, world_y, block_z) {
                                 chunk.set_block(x, y as usize, z, Block::new(new_state));
                             }
@@ -1338,6 +1373,57 @@ pub fn default_overworld_rules(system: Arc<SurfaceSystemRef>) -> Box<dyn Surface
         ])),
     )));
 
+    // Cave biomes — apply under the terrain surface (hole/cave conditions)
+    // These run before the default grass/dirt/stone rule so they win for cave biomes.
+
+    // Dripstone Caves: stone surface in cave openings
+    rules.push(Box::new(TestRuleEx::new(
+        Box::new(BiomeConditionEx::new(vec![Biome::DripstoneCaves])),
+        Box::new(SequenceRuleEx::new(vec![
+            Box::new(TestRuleEx::new(
+                Box::new(StoneDepthConditionEx::new(0, false, 0, CaveSurface::Floor)),
+                Box::new(StateRuleEx::new(BlockId::Stone)),
+            )),
+            Box::new(StateRuleEx::new(BlockId::Stone)),
+        ])),
+    )));
+
+    // Lush Caves: moss block on cave floors
+    rules.push(Box::new(TestRuleEx::new(
+        Box::new(BiomeConditionEx::new(vec![Biome::LushCaves])),
+        Box::new(SequenceRuleEx::new(vec![
+            Box::new(TestRuleEx::new(
+                Box::new(StoneDepthConditionEx::new(0, false, 0, CaveSurface::Floor)),
+                Box::new(StateRuleEx::new(BlockId::MossBlock)),
+            )),
+            Box::new(StateRuleEx::new(BlockId::Stone)),
+        ])),
+    )));
+
+    // Deep Dark: stone surface (Sculk when block exists)
+    rules.push(Box::new(TestRuleEx::new(
+        Box::new(BiomeConditionEx::new(vec![Biome::DeepDark])),
+        Box::new(SequenceRuleEx::new(vec![
+            Box::new(TestRuleEx::new(
+                Box::new(StoneDepthConditionEx::new(0, false, 0, CaveSurface::Floor)),
+                Box::new(StateRuleEx::new(BlockId::Stone)),
+            )),
+            Box::new(StateRuleEx::new(BlockId::Stone)),
+        ])),
+    )));
+
+    // Sulfur Caves: stone surface
+    rules.push(Box::new(TestRuleEx::new(
+        Box::new(BiomeConditionEx::new(vec![Biome::SulfurCaves])),
+        Box::new(SequenceRuleEx::new(vec![
+            Box::new(TestRuleEx::new(
+                Box::new(StoneDepthConditionEx::new(0, false, 0, CaveSurface::Floor)),
+                Box::new(StateRuleEx::new(BlockId::Stone)),
+            )),
+            Box::new(StateRuleEx::new(BlockId::Stone)),
+        ])),
+    )));
+
     // Default: grass > dirt > stone
     rules.push(Box::new(SequenceRuleEx::new(vec![
         Box::new(TestRuleEx::new(
@@ -1382,7 +1468,7 @@ pub fn generate_surface_with_biome_provider(
     surface_rule: &dyn RuleSourceEx,
     sea_level: i32,
     world_seed: u64,
-    biome_provider: impl Fn(i32, i32, i32) -> Biome + Send + Sync + 'static,
+    biome_provider: impl FnMut(i32, i32, i32) -> Biome + Send + 'static,
 ) {
     let system_ref = SurfaceSystem::create_ref_from_seed(BlockId::Stone, sea_level, world_seed);
     SurfaceSystem::build_surface_with_biome_provider(
@@ -1431,6 +1517,7 @@ pub fn surface_blocks_for_biome(biome: Biome) -> (BlockId, BlockId, BlockId) {
 mod tests {
     use super::*;
     use crate::world::world_gen::density_fn::{constant, SinglePointContext};
+    use std::sync::Mutex;
 
     #[test]
     fn test_generate_bands_length() {
@@ -1505,6 +1592,141 @@ mod tests {
 
         let (surface, _, _) = surface_blocks_for_biome(Biome::Desert);
         assert_eq!(surface, BlockId::Sand);
+    }
+
+    fn build_continuous_stone_surface(
+        chunk_x: i32,
+        chunk_z: i32,
+        biome: Biome,
+        cave_y: Option<usize>,
+    ) -> (Chunk, Arc<SurfaceSystemRef>) {
+        let mut chunk = Chunk::new(chunk_x, chunk_z);
+        for x in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for y in 1..=64 {
+                    chunk.set_block(x, y, z, Block::new(BlockId::Stone));
+                }
+            }
+        }
+        if let Some(y) = cave_y {
+            chunk.set_block(0, y, 0, Block::new(BlockId::Air));
+        }
+
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, 0x5EED);
+        let source = StaticRuleSource::new(default_overworld_rules(system.clone()));
+        SurfaceSystem::build_surface_with_biome_provider(
+            system.clone(),
+            &mut chunk,
+            &source,
+            63,
+            0,
+            move |_, _, _| biome,
+        );
+        (chunk, system)
+    }
+
+    #[test]
+    fn simplified_biome_fallbacks_do_not_replace_deep_continuous_stone() {
+        for (biome, expected_surface) in [
+            (Biome::Desert, BlockId::Sand),
+            (Biome::Beach, BlockId::Sand),
+        ] {
+            let (chunk, _) = build_continuous_stone_surface(0, 0, biome, None);
+            assert_eq!(chunk.get_block(0, 64, 0).id, expected_surface, "{biome:?} surface");
+            assert_eq!(chunk.get_block(0, 1, 0).id, BlockId::Stone, "{biome:?} deep stone");
+        }
+
+        let (chunk, system) = build_continuous_stone_surface(0, 0, Biome::Badlands, None);
+        assert_eq!(chunk.get_block(0, 64, 0).id, system.get_band(0, 64, 0));
+        assert_eq!(chunk.get_block(0, 1, 0).id, BlockId::Stone);
+    }
+
+    #[test]
+    fn ordinary_surface_materials_do_not_reach_deep_plains_caves() {
+        let (chunk, _) = build_continuous_stone_surface(0, 0, Biome::Plains, Some(40));
+        assert_eq!(chunk.get_block(0, 39, 0).id, BlockId::Stone);
+    }
+
+    #[test]
+    fn ordinary_surface_materials_reach_shallow_plains_caves() {
+        let (chunk, _) = build_continuous_stone_surface(0, 0, Biome::Plains, Some(60));
+        assert_eq!(chunk.get_block(0, 59, 0).id, BlockId::GrassBlock);
+    }
+
+    #[test]
+    fn deep_cave_surface_scope_bypasses_the_ordinary_surface_gate() {
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, 0x5EED);
+        let mut ctx = SurfaceContext::new(
+            system,
+            63,
+            Box::new(|_, _, _| Biome::Plains),
+            Box::new(|_, _| 64),
+        );
+        ctx.update_xz(0, 0);
+        ctx.update_y(1, 1, i32::MIN, 40);
+
+        assert!(!ctx.permits_surface_rule(SurfaceRuleScope::Ordinary));
+        assert!(ctx.permits_surface_rule(SurfaceRuleScope::DeepCaveException));
+    }
+
+    #[test]
+    fn plains_top_surface_retains_grass_and_dirt_layers() {
+        let (chunk, _) = build_continuous_stone_surface(0, 0, Biome::Plains, None);
+        assert_eq!(chunk.get_block(0, 64, 0).id, BlockId::GrassBlock);
+        assert_eq!(chunk.get_block(0, 63, 0).id, BlockId::Dirt);
+    }
+
+    #[test]
+    fn surface_biome_provider_uses_y_within_one_column() {
+        let mut chunk = Chunk::new(0, 0);
+        for x in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for y in 1..=64 {
+                    chunk.set_block(x, y, z, Block::new(BlockId::Stone));
+                }
+            }
+        }
+
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, 0x5EED);
+        let source = StaticRuleSource::new(default_overworld_rules(system.clone()));
+        let queried_y = Arc::new(Mutex::new(Vec::new()));
+        let provider_queries = queried_y.clone();
+        let mut _calls = 0;
+        SurfaceSystem::build_surface_with_biome_provider(
+            system,
+            &mut chunk,
+            &source,
+            63,
+            0,
+            move |x, y, z| {
+                _calls += 1;
+                if (x, z) == (0, 0) {
+                    provider_queries
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(y);
+                }
+                if y == 64 { Biome::Desert } else { Biome::Plains }
+            },
+        );
+
+        assert_eq!(chunk.get_block(0, 64, 0).id, BlockId::Sand);
+        assert_eq!(chunk.get_block(0, 63, 0).id, BlockId::Dirt);
+        let queried_y = queried_y
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(queried_y.contains(&64));
+        assert!(queried_y.contains(&63));
+    }
+
+    #[test]
+    fn preliminary_surface_gate_is_stable_at_negative_chunk_coordinates() {
+        let (first, _) = build_continuous_stone_surface(-3, -2, Biome::Plains, Some(40));
+        let (second, _) = build_continuous_stone_surface(-3, -2, Biome::Plains, Some(40));
+
+        assert_eq!(first.blocks, second.blocks);
+        assert_eq!(first.get_block(0, 39, 0).id, BlockId::Stone);
+        assert_eq!(first.get_block(0, 64, 0).id, BlockId::GrassBlock);
     }
 
     #[test]

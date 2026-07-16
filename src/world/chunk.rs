@@ -105,22 +105,24 @@ impl Chunk {
             if old_is_water || old_is_lava {
                 self.fluid_positions.retain(|&p| p != pos);
             }
+            if old_is_water {
+                self.water_count = self.water_count.saturating_sub(1);
+                self.has_water = self.water_count > 0;
+            }
+            if old_is_lava {
+                self.lava_count = self.lava_count.saturating_sub(1);
+                self.has_lava = self.lava_count > 0;
+            }
             if new_is_water {
                 self.water_count += 1;
                 self.has_water = true;
                 self.fluid_positions.push(pos);
-            } else if old_is_water {
-                self.water_count = self.water_count.saturating_sub(1);
-                self.has_water = self.water_count > 0;
             }
 
             if new_is_lava {
                 self.lava_count += 1;
                 self.has_lava = true;
                 self.fluid_positions.push(pos);
-            } else if old_is_lava {
-                self.lava_count = self.lava_count.saturating_sub(1);
-                self.has_lava = self.lava_count > 0;
             }
         }
     }
@@ -250,5 +252,24 @@ mod tests {
         ));
         chunk.set_block(1, 2, 3, Block::air());
         assert!(chunk.get_block_entity(1, 2, 3).is_none());
+    }
+
+    #[test]
+    fn changing_a_fluid_level_keeps_single_position_and_count() {
+        let mut chunk = Chunk::new(0, 0);
+        chunk.set_block(1, 2, 3, Block::new(BlockId::Water));
+        chunk.set_block(
+            1,
+            2,
+            3,
+            Block {
+                id: BlockId::Water,
+                state: 0,
+                data: 5,
+            },
+        );
+
+        assert_eq!(chunk.water_count, 1);
+        assert_eq!(chunk.fluid_positions, vec![(1, 2, 3)]);
     }
 }

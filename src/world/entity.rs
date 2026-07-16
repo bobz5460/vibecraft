@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn arrow_hits_entity_before_block_and_applies_damage() {
-        let mut chunks = ChunkManager::new(7, 1);
+        let mut chunks = ChunkManager::new(7, 1, crate::world::coordinates::WorldCoordinateProfile::LegacyLocal, crate::world::generation::WorldGenerationProfile::legacy());
         let mut chunk = Chunk::new(0, 0);
         chunk.set_block(4, 4, 0, Block::new(BlockId::Stone));
         chunks.chunks.insert((0, 0), Arc::new(chunk));
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn arrow_reports_block_hit_and_entities_stop_at_solid_blocks() {
-        let mut chunks = ChunkManager::new(7, 1);
+        let mut chunks = ChunkManager::new(7, 1, crate::world::coordinates::WorldCoordinateProfile::LegacyLocal, crate::world::generation::WorldGenerationProfile::legacy());
         let mut chunk = Chunk::new(0, 0);
         chunk.set_block(1, 0, 0, Block::new(BlockId::Stone));
         chunk.set_block(2, 4, 0, Block::new(BlockId::Stone));

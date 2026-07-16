@@ -186,6 +186,7 @@ fn mix_stafford13(mut value: u64) -> u64 {
 }
 
 /// The Xoroshiro positional factory used by `PerlinNoise` and `RandomState`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PositionalRandomFactory {
     seed_lo: u64,
     seed_hi: u64,

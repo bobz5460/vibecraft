@@ -1,7 +1,9 @@
-pub mod caves;
 pub mod aquifer;
 pub mod biome_source;
+pub mod carver;
+pub mod caves;
 pub mod density_fn;
+pub mod decoration;
 pub mod generator;
 pub mod noise;
 pub mod noise_router;

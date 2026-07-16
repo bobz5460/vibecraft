@@ -1,5 +1,6 @@
 use crate::world::block::{Block, BlockFace, BlockId, FACES};
 use crate::world::chunk::{Chunk, CHUNK_HEIGHT, CHUNK_SIZE};
+use crate::world::coordinates::WorldCoordinateProfile;
 use crate::world::block_registry::{registry, CollisionShape};
 use crate::assets::BlockMeshAssets;
 use std::collections::HashMap;
@@ -210,11 +211,20 @@ fn emit_resolved_models<'a>(
     opaque_indices: &mut Vec<u32>,
     transparent: &mut Vec<MeshVertex>,
     transparent_indices: &mut Vec<u32>,
+    coordinate_profile: WorldCoordinateProfile,
 ) -> bool {
     let Some(assets) = model_assets() else { return false; };
     if !assets.has_model(block.id) { return false; }
     let (x, y, z) = local;
-    let models = assets.resolve(block.id, block.state, (chunk.cx * CHUNK_SIZE as i32 + x, y, chunk.cz * CHUNK_SIZE as i32 + z));
+    let models = assets.resolve(
+        block.id,
+        block.state,
+        (
+            chunk.cx * CHUNK_SIZE as i32 + x,
+            coordinate_profile.from_local_y(y as usize).unwrap_or(y),
+            chunk.cz * CHUNK_SIZE as i32 + z,
+        ),
+    );
     if models.is_empty() { return false; }
     let blended = uses_translucent_blend(block);
     let (verts, indices) = if blended { (transparent, transparent_indices) } else { (opaque, opaque_indices) };
@@ -344,6 +354,43 @@ mod model_tests {
     #[test]
     fn model_rotation_preserves_unit_axes() {
         assert_eq!(rotate_vector([0.0, 0.0, -1.0], "y", 90).map(|value| value.round()), [-1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn java_profile_offsets_finished_mesh_vertices_without_affecting_local_storage() {
+        let mut chunk = Chunk::new(0, 0);
+        chunk.set_block(0, 0, 0, Block::new(BlockId::Stone));
+        let mesh = build_chunk_mesh(
+            &chunk,
+            &|_, _| None,
+            WorldCoordinateProfile::JavaOverworld,
+        );
+        let min_y = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.pos[1])
+            .min_by(f32::total_cmp)
+            .unwrap();
+        assert_eq!(min_y, -64.0);
+        assert_eq!(chunk.get_block(0, 0, 0).id, BlockId::Stone);
+    }
+
+    #[test]
+    fn matching_water_at_a_chunk_border_does_not_emit_a_seam_face() {
+        let mut chunk = Chunk::new(0, 0);
+        let mut east = Chunk::new(1, 0);
+        chunk.set_block(15, 64, 8, Block::new(BlockId::Water));
+        east.set_block(0, 64, 8, Block::new(BlockId::Water));
+
+        let mesh = build_chunk_mesh(
+            &chunk,
+            &|cx, cz| ((cx, cz) == (1, 0)).then_some(&east),
+            WorldCoordinateProfile::LegacyLocal,
+        );
+
+        assert!(!mesh.transparent_vertices.iter().any(|vertex| {
+            vertex.normal == [1.0, 0.0, 0.0] && vertex.pos[0] == 16.0
+        }));
     }
 }
 
@@ -661,6 +708,7 @@ fn face_light_signature<'a>(
 pub fn build_chunk_mesh<'a>(
     chunk: &'a Chunk,
     get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
+    coordinate_profile: WorldCoordinateProfile,
 ) -> ChunkMesh {
     // Avoid retaining megabytes of mostly-unused capacity for every loaded chunk.
     let mut vertices = Vec::with_capacity(1024);
@@ -964,6 +1012,7 @@ pub fn build_chunk_mesh<'a>(
                     &mut indices,
                     &mut transparent_vertices,
                     &mut transparent_indices,
+                    coordinate_profile,
                 ) {
                     continue;
                 } else if block.id.is_crossed() {
@@ -1537,6 +1586,13 @@ pub fn build_chunk_mesh<'a>(
                 }
             }
         }
+    }
+
+    // Lighting and AO above intentionally used local Y. Apply the profile only
+    // after all storage-local geometry work is complete.
+    let y_offset = coordinate_profile.min_y() as f32;
+    for vertex in vertices.iter_mut().chain(transparent_vertices.iter_mut()) {
+        vertex.pos[1] += y_offset;
     }
 
     ChunkMesh {

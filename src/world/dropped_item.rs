@@ -1,7 +1,6 @@
 use crate::inventory::item::ItemRegistry;
 use crate::inventory::ItemStack;
 use crate::world::block::BlockId;
-use crate::world::chunk::CHUNK_HEIGHT;
 use crate::world::chunk_manager::ChunkManager;
 use crate::world::mesh::{build_item_cube_mesh, ChunkMesh};
 
@@ -25,6 +24,7 @@ pub struct DroppedItem {
     pub lifetime: f32,
     pub pickup_delay: f32,
     ground_y: Option<f32>,
+    ground_revision: Option<u64>,
     last_bx: i32,
     last_bz: i32,
 }
@@ -43,6 +43,7 @@ impl DroppedItem {
             lifetime: DESPAWN_TIME,
             pickup_delay: 0.5,
             ground_y: None,
+            ground_revision: None,
             last_bx: 0,
             last_bz: 0,
         };
@@ -88,23 +89,33 @@ impl DroppedItem {
         let bz = self.z.floor() as i32;
         if bx != self.last_bx || bz != self.last_bz {
             self.ground_y = None;
+            self.ground_revision = None;
             self.last_bx = bx;
             self.last_bz = bz;
         }
+        let revision = cm.chunk_revision(
+            bx.div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+            bz.div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+        );
+        if self.ground_y.is_some() && self.ground_revision != revision {
+            self.ground_y = None;
+        }
         if self.ground_y.is_none() {
             self.ground_y = {
-                let mut gy = self.y.floor() as i32;
+                let min_y = cm.coordinate_profile().min_y();
+                let mut gy = (self.y.floor() as i32).max(min_y);
                 loop {
-                    if gy <= -64 {
-                        break None;
-                    }
                     let block = cm.get_block(bx, gy, bz);
                     if !block.is_air() && block.id != BlockId::Water && block.id != BlockId::Lava {
                         break Some((gy + 1) as f32);
                     }
+                    if gy == min_y {
+                        break None;
+                    }
                     gy -= 1;
                 }
             };
+            self.ground_revision = revision;
         }
         if let Some(ground) = self.ground_y {
             if self.y < ground {
@@ -119,8 +130,11 @@ impl DroppedItem {
         }
     }
 
-    pub fn is_alive(&self) -> bool {
-        self.lifetime > 0.0 && self.y > -64.0 && self.y < CHUNK_HEIGHT as f32 + 16.0
+    pub fn is_alive(&self, cm: &ChunkManager) -> bool {
+        let profile = cm.coordinate_profile();
+        self.lifetime > 0.0
+            && self.y > profile.min_y() as f32
+            && self.y < profile.max_y_exclusive() as f32 + 16.0
     }
 }
 
@@ -135,6 +149,7 @@ pub struct XpOrb {
     pub value: u32,
     pub lifetime: f32,
     ground_y: Option<f32>,
+    ground_revision: Option<u64>,
     last_bx: i32,
     last_bz: i32,
 }
@@ -153,6 +168,7 @@ impl XpOrb {
             value,
             lifetime: 60.0,
             ground_y: None,
+            ground_revision: None,
             last_bx: bx,
             last_bz: bz,
         }
@@ -182,23 +198,33 @@ impl XpOrb {
         let bz = self.z.floor() as i32;
         if bx != self.last_bx || bz != self.last_bz {
             self.ground_y = None;
+            self.ground_revision = None;
             self.last_bx = bx;
             self.last_bz = bz;
         }
+        let revision = cm.chunk_revision(
+            bx.div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+            bz.div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+        );
+        if self.ground_y.is_some() && self.ground_revision != revision {
+            self.ground_y = None;
+        }
         if self.ground_y.is_none() {
             self.ground_y = {
-                let mut gy = self.y.floor() as i32;
+                let min_y = cm.coordinate_profile().min_y();
+                let mut gy = (self.y.floor() as i32).max(min_y);
                 loop {
-                    if gy <= -64 {
-                        break None;
-                    }
                     let block = cm.get_block(bx, gy, bz);
                     if !block.is_air() && block.id != BlockId::Water && block.id != BlockId::Lava {
                         break Some((gy + 1) as f32);
                     }
+                    if gy == min_y {
+                        break None;
+                    }
                     gy -= 1;
                 }
             };
+            self.ground_revision = revision;
         }
         if let Some(ground) = self.ground_y {
             if self.y < ground {
@@ -210,8 +236,11 @@ impl XpOrb {
         }
     }
 
-    pub fn is_alive(&self) -> bool {
-        self.lifetime > 0.0 && self.y > -64.0 && self.y < 400.0
+    pub fn is_alive(&self, cm: &ChunkManager) -> bool {
+        let profile = cm.coordinate_profile();
+        self.lifetime > 0.0
+            && self.y > profile.min_y() as f32
+            && self.y < profile.max_y_exclusive() as f32 + 16.0
     }
 }
 
@@ -269,6 +298,10 @@ pub fn map_drop(block_id: BlockId) -> BlockId {
 mod tests {
     use super::*;
     use crate::inventory::item::ItemRegistry;
+    use crate::world::block::Block;
+    use crate::world::chunk::Chunk;
+    use crate::world::coordinates::WorldCoordinateProfile;
+    use std::sync::Arc;
 
     #[test]
     fn stack_merge_preserves_every_item() {
@@ -287,5 +320,55 @@ mod tests {
         let stack = ItemStack::new(registry.item_id_from_block(BlockId::Stone), 1);
         let dropped = DroppedItem::from_stack(0.0, 64.0, 0.0, stack, &registry).unwrap();
         assert_eq!(dropped.block_id, BlockId::Stone);
+    }
+
+    #[test]
+    fn drops_and_xp_orbs_land_on_the_inclusive_world_bottom() {
+        for profile in [
+            WorldCoordinateProfile::LegacyLocal,
+            WorldCoordinateProfile::JavaOverworld,
+        ] {
+            let mut manager = ChunkManager::new(7, 1, profile, crate::world::generation::WorldGenerationProfile::legacy());
+            manager.chunks.insert((0, 0), Arc::new(Chunk::new(0, 0)));
+            manager.set_block(0, profile.min_y(), 0, Block::new(BlockId::Bedrock));
+
+            let mut item = DroppedItem::new(0.5, profile.min_y() as f32 + 0.2, 0.5, BlockId::Stone);
+            item.vy = -20.0;
+            item.update(0.1, &manager);
+            assert_eq!(item.y, profile.min_y() as f32 + 1.0);
+
+            let mut orb = XpOrb::new(0.5, profile.min_y() as f32 + 0.2, 0.5, 1);
+            orb.vy = -20.0;
+            orb.update(0.1, &manager, 100.0, 100.0, 100.0);
+            assert_eq!(orb.y, profile.min_y() as f32 + 1.0);
+        }
+    }
+
+    #[test]
+    fn floor_caches_revalidate_after_a_block_edit_in_the_same_column() {
+        let profile = WorldCoordinateProfile::JavaOverworld;
+        let mut manager = ChunkManager::new(7, 1, profile, crate::world::generation::WorldGenerationProfile::legacy());
+        manager.chunks.insert((0, 0), Arc::new(Chunk::new(0, 0)));
+        manager.set_block(0, -62, 0, Block::new(BlockId::Bedrock));
+        manager.set_block(0, -60, 0, Block::new(BlockId::Stone));
+
+        let mut item = DroppedItem::new(0.5, -59.2, 0.5, BlockId::Stone);
+        item.vy = -1.0;
+        item.update(0.01, &manager);
+        assert_eq!(item.y, -59.0);
+
+        let mut orb = XpOrb::new(0.5, -59.2, 0.5, 1);
+        orb.vy = -1.0;
+        orb.update(0.01, &manager, 100.0, 100.0, 100.0);
+        assert_eq!(orb.y, -59.0);
+
+        manager.set_block(0, -60, 0, Block::air());
+        item.vy = -20.0;
+        item.update(0.1, &manager);
+        assert_eq!(item.y, -61.0);
+
+        orb.vy = -20.0;
+        orb.update(0.1, &manager, 100.0, 100.0, 100.0);
+        assert_eq!(orb.y, -61.0);
     }
 }

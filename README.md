@@ -53,7 +53,28 @@ cargo run --release -- \
 The game creates the selected world directory and stores native JSON level,
 player, and chunk data there. It autosaves during play, saves on window close,
 and supports `/save` and `/quit`. Existing saves are validated and migrated by
-native data version; they are not Minecraft Java save files.
+native data version; they are not Minecraft Java save files. Migrated worlds
+retain their legacy generation interpolation profile, while newly created
+local and server worlds use the corrected `minecraft26_native_decoration_preview`
+profile. Existing `minecraft26_base` worlds remain undecorated.
+The preview has bounded oak/spruce trees and rare desert wells, but is not
+Java feature-index compatible and does not claim Java world-output parity.
+
+## Native Decoration Preview
+
+`minecraft26_native_decoration_preview` plans candidates from fixed owner
+halos, uses isolated undecorated snapshots for bounded support checks, and
+projects only cells owned by the generated target chunk. It does not access or
+mutate neighboring runtime chunks, so target output is independent of chunk
+load or generation order.
+
+The supported tree subset is oak in plains/forest variants and spruce in
+taiga/grove variants. Trees use vertical default-data logs and default leaf
+state only; horizontal log axes and leaf distance/persistence state are not
+implemented. The rare desert well is intentionally incomplete: it uses only
+sandstone and water, without sandstone slabs, suspicious sand, loot, or any
+block-entity behavior. None of these features uses Java configured/placed
+feature indexes or claims Java parity.
 
 ## Configuration
 

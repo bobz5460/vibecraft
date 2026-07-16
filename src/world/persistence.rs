@@ -9,6 +9,8 @@ use crate::inventory::{Inventory, ItemStack, TOTAL_SLOTS};
 use crate::player::{EffectManager, Player, StatusEffect};
 use crate::world::block::{Block, BlockId};
 use crate::world::chunk::{BlockEntity, Chunk, CHEST_SLOTS, CHUNK_SIZE, CHUNK_VOLUME};
+use crate::world::coordinates::WorldCoordinateProfile;
+use crate::world::generation::WorldGenerationProfile;
 use crate::inventory::progression::FurnaceState;
 use crate::inventory::SlotContainer;
 use crate::world::simulation::ScheduledTick;
@@ -25,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Native on-disk envelope format. This is unrelated to Minecraft's save format.
 pub const FORMAT_VERSION: u32 = 1;
 /// Version of the native game data encoded inside each envelope.
-pub const DATA_VERSION: u32 = 6;
+pub const DATA_VERSION: u32 = 9;
 
 const LEVEL_FILE: &str = "level.json";
 const PLAYER_FILE: &str = "player.json";
@@ -42,6 +44,10 @@ pub struct LevelData {
     /// UTC milliseconds since the Unix epoch. Updated after a world is entered.
     #[serde(default)]
     pub last_played: u64,
+    /// Defines how public Y coordinates map onto fixed local chunk storage.
+    pub coordinate_profile: WorldCoordinateProfile,
+    /// Selects immutable generator behavior independently from coordinates.
+    pub generation_profile: WorldGenerationProfile,
     pub seed: u64,
     pub tick: u64,
     pub game_time: u64,
@@ -840,10 +846,18 @@ impl Validate for LevelData {
         if self.scheduled_ticks.len() > 65_536 {
             return Err(corrupt(path, "level contains too many scheduled ticks"));
         }
+        if !self.coordinate_profile.contains_world_y(self.spawn[1]) {
+            return Err(corrupt(path, "world spawn is outside the world's build height"));
+        }
+        let min_live_y = self.coordinate_profile.min_y() as f32;
+        let max_live_y = self.coordinate_profile.max_y_exclusive() as f32 + 16.0;
         for item in &self.dropped_items {
             let values = [item.x, item.y, item.z, item.vx, item.vy, item.vz, item.lifetime];
             if values.iter().any(|value| !value.is_finite()) || item.lifetime < 0.0 {
                 return Err(corrupt(path, "dropped item contains an invalid value"));
+            }
+            if item.y <= min_live_y || item.y >= max_live_y {
+                return Err(corrupt(path, "dropped item is outside this world's live height"));
             }
             if BlockId::from_repr(item.block_id).is_none() {
                 return Err(corrupt(
@@ -861,6 +875,9 @@ impl Validate for LevelData {
             let values = [orb.x, orb.y, orb.z, orb.vx, orb.vy, orb.vz, orb.lifetime];
             if values.iter().any(|value| !value.is_finite()) || orb.lifetime < 0.0 {
                 return Err(corrupt(path, "XP orb contains an invalid value"));
+            }
+            if orb.y <= min_live_y || orb.y >= max_live_y {
+                return Err(corrupt(path, "XP orb is outside this world's live height"));
             }
         }
         let mut usernames = std::collections::HashSet::new();
@@ -984,6 +1001,41 @@ fn migrate_data(
                 object.entry("last_played".to_string()).or_insert(Value::from(0));
             }
             (5, FileKind::Player | FileKind::Chunk) => {}
+            (6, FileKind::Level) => {
+                data.as_object_mut()
+                    .ok_or_else(|| corrupt(path, "level data must be a JSON object"))?
+                    .insert(
+                        "coordinate_profile".to_string(),
+                        Value::String("legacy_local".to_string()),
+                    );
+            }
+            (6, FileKind::Player | FileKind::Chunk) => {}
+            (7, FileKind::Level) => {
+                data.as_object_mut()
+                    .ok_or_else(|| corrupt(path, "level data must be a JSON object"))?
+                    .insert(
+                        "generation_profile".to_string(),
+                        Value::String("legacy_pre_corrected_interpolation".to_string()),
+                    );
+            }
+            (7, FileKind::Player | FileKind::Chunk) => {}
+            // Version 9 introduces a new-world-only decoration profile. Version
+            // 8 could only persist the legacy or undecorated base profiles.
+            (8, FileKind::Level) => {
+                let object = data
+                    .as_object_mut()
+                    .ok_or_else(|| corrupt(path, "level data must be a JSON object"))?;
+                if !matches!(
+                    object.get("generation_profile").and_then(Value::as_str),
+                    Some("legacy_pre_corrected_interpolation" | "minecraft26_base")
+                ) {
+                    object.insert(
+                        "generation_profile".to_string(),
+                        Value::String("minecraft26_base".to_string()),
+                    );
+                }
+            }
+            (8, FileKind::Player | FileKind::Chunk) => {}
             _ => {
                 return Err(StorageError::Version {
                     path: path.to_path_buf(),
@@ -1246,6 +1298,8 @@ mod tests {
             name: "Fixture World".to_string(),
             created_at: 100,
             last_played: 200,
+            coordinate_profile: WorldCoordinateProfile::LegacyLocal,
+            generation_profile: WorldGenerationProfile::LegacyPreCorrectedInterpolation,
             seed,
             tick: 42,
             game_time: 84,
@@ -1392,6 +1446,125 @@ mod tests {
         assert!(migrated.scheduled_ticks.is_empty());
         assert!(migrated.dropped_items.is_empty());
         assert!(migrated.xp_orbs.is_empty());
+        assert_eq!(migrated.coordinate_profile, WorldCoordinateProfile::LegacyLocal);
+        assert_eq!(
+            migrated.generation_profile,
+            WorldGenerationProfile::LegacyPreCorrectedInterpolation
+        );
+    }
+
+    #[test]
+    fn version_six_level_defaults_to_legacy_coordinates_without_shifting_data() {
+        let world = TempWorld::new();
+        let storage = WorldStorage::new(&world.path);
+        let mut data = serde_json::to_value(level(12)).unwrap();
+        let object = data.as_object_mut().unwrap();
+        object.insert(
+            "coordinate_profile".to_string(),
+            Value::String("java_overworld".to_string()),
+        );
+        object.insert(
+            "generation_profile".to_string(),
+            Value::String("minecraft26_native_decoration_preview".to_string()),
+        );
+        let old_level = serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "data_version": 6,
+            "kind": "level",
+            "data": data,
+        });
+        fs::write(storage.level_path(), serde_json::to_vec(&old_level).unwrap()).unwrap();
+
+        let migrated = storage.load_level().unwrap();
+        assert_eq!(migrated.coordinate_profile, WorldCoordinateProfile::LegacyLocal);
+        assert_eq!(
+            migrated.generation_profile,
+            WorldGenerationProfile::LegacyPreCorrectedInterpolation
+        );
+        assert_eq!(migrated.spawn, [1, 72, -3]);
+        assert_eq!(migrated.dropped_items[0].y, 72.0);
+    }
+
+    #[test]
+    fn version_seven_level_defaults_to_legacy_generation_without_shifting_data() {
+        let world = TempWorld::new();
+        let storage = WorldStorage::new(&world.path);
+        let mut data = serde_json::to_value(level(12)).unwrap();
+        let object = data.as_object_mut().unwrap();
+        object.insert(
+            "coordinate_profile".to_string(),
+            Value::String("java_overworld".to_string()),
+        );
+        object.insert(
+            "generation_profile".to_string(),
+            Value::String("minecraft26_native_decoration_preview".to_string()),
+        );
+        let old_level = serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "data_version": 7,
+            "kind": "level",
+            "data": data,
+        });
+        fs::write(storage.level_path(), serde_json::to_vec(&old_level).unwrap()).unwrap();
+
+        let migrated = storage.load_level().unwrap();
+        assert_eq!(
+            migrated.generation_profile,
+            WorldGenerationProfile::LegacyPreCorrectedInterpolation
+        );
+        assert_eq!(migrated.coordinate_profile, WorldCoordinateProfile::JavaOverworld);
+        assert_eq!(migrated.spawn, [1, 72, -3]);
+        assert_eq!(migrated.dropped_items[0].y, 72.0);
+    }
+
+    #[test]
+    fn version_eight_level_normalizes_a_forged_decoration_profile_to_base() {
+        let world = TempWorld::new();
+        let storage = WorldStorage::new(&world.path);
+        let mut data = serde_json::to_value(level(12)).unwrap();
+        data.as_object_mut()
+            .unwrap()
+            .insert(
+                "generation_profile".to_string(),
+                Value::String("minecraft26_native_decoration_preview".to_string()),
+            );
+        let old_level = serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "data_version": 8,
+            "kind": "level",
+            "data": data,
+        });
+        fs::write(storage.level_path(), serde_json::to_vec(&old_level).unwrap()).unwrap();
+
+        let migrated = storage.load_level().unwrap();
+        assert_eq!(migrated.generation_profile, WorldGenerationProfile::Minecraft26Base);
+        storage.save_level(&migrated).unwrap();
+        let rewritten: Value = serde_json::from_slice(&fs::read(storage.level_path()).unwrap()).unwrap();
+        assert_eq!(rewritten["data_version"], DATA_VERSION);
+        assert_eq!(
+            rewritten["data"]["generation_profile"],
+            "minecraft26_base",
+        );
+    }
+
+    #[test]
+    fn current_version_level_requires_explicit_world_profiles() {
+        let world = TempWorld::new();
+        let storage = WorldStorage::new(&world.path);
+
+        for field in ["coordinate_profile", "generation_profile"] {
+            let mut data = serde_json::to_value(level(12)).unwrap();
+            data.as_object_mut().unwrap().remove(field);
+            let current_level = serde_json::json!({
+                "format_version": FORMAT_VERSION,
+                "data_version": DATA_VERSION,
+                "kind": "level",
+                "data": data,
+            });
+            fs::write(storage.level_path(), serde_json::to_vec(&current_level).unwrap()).unwrap();
+
+            assert!(matches!(storage.load_level(), Err(StorageError::Json { .. })));
+        }
     }
 
     #[test]
@@ -1469,5 +1642,41 @@ mod tests {
         assert_eq!(loaded_player.effects.get_amplifier(StatusEffect::NightVision), Some(1));
         assert_eq!(loaded_inventory.slots[3], ItemStack::new(12, 42));
         assert_eq!(loaded_inventory.held_slot, 3);
+    }
+
+    #[test]
+    fn player_coordinates_are_not_limited_by_block_coordinate_profiles() {
+        let world = TempWorld::new();
+        let storage = WorldStorage::new(&world.path);
+        let player = Player::new(0.0, 512.0, 0.0);
+        let inventory = Inventory::new();
+        let data = PlayerData::from_runtime(&player, &inventory);
+
+        storage.save_player(&data).unwrap();
+        let (restored, _) = storage.load_player().unwrap().into_runtime().unwrap();
+        assert_eq!(restored.y, 512.0);
+
+        let mut level = level(1);
+        level.coordinate_profile = WorldCoordinateProfile::JavaOverworld;
+        level.players.push(NamedPlayerData {
+            username: "Alex".to_string(),
+            player: data,
+        });
+        storage.save_level(&level).unwrap();
+        assert_eq!(storage.load_level().unwrap().players[0].player.y, 512.0);
+    }
+
+    #[test]
+    fn dropped_entities_must_fit_their_profile_live_height() {
+        let world = TempWorld::new();
+        let storage = WorldStorage::new(&world.path);
+        let mut legacy_level = level(1);
+        legacy_level.dropped_items[0].y = -1.0;
+        assert!(matches!(storage.save_level(&legacy_level), Err(StorageError::Corrupt { .. })));
+
+        let mut java_level = level(1);
+        java_level.coordinate_profile = WorldCoordinateProfile::JavaOverworld;
+        java_level.xp_orbs[0].y = 336.0;
+        assert!(matches!(storage.save_level(&java_level), Err(StorageError::Corrupt { .. })));
     }
 }

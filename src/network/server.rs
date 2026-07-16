@@ -18,6 +18,8 @@ use crate::player::{Player, GRAVITY, JUMP_SPEED, SPRINT_MULT, SNEAK_SPEED, WALK_
 use crate::world::block::{Block, BlockId};
 use crate::world::chunk::CHUNK_SIZE;
 use crate::world::chunk_manager::ChunkManager;
+use crate::world::coordinates::WorldCoordinateProfile;
+use crate::world::generation::WorldGenerationProfile;
 use crate::world::persistence::{LevelData, NamedPlayerData, PlayerData, StorageError, WorldStorage};
 use crate::world::simulation::{FixedStepClock, ScheduledTickKind, TickScheduler};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -232,6 +234,8 @@ impl HeadlessServer {
             name: "Server World".to_string(),
             created_at: 0,
             last_played: 0,
+            coordinate_profile: WorldCoordinateProfile::new_world(),
+            generation_profile: WorldGenerationProfile::new_world(),
             seed: requested_seed,
             tick: 0,
             game_time: 9_000,
@@ -255,7 +259,12 @@ impl HeadlessServer {
             );
         }
 
-        let mut world = ChunkManager::new(level.seed, config.render_distance);
+        let mut world = ChunkManager::new(
+            level.seed,
+            config.render_distance,
+            level.coordinate_profile,
+            level.generation_profile,
+        );
         world.set_storage(storage.clone());
         let spawn_chunk = (
             level.spawn[0].div_euclid(CHUNK_SIZE as i32),
@@ -700,6 +709,8 @@ impl HeadlessServer {
             session_id: id,
             username: username.clone(),
             world_seed: self.level.seed,
+            coordinate_profile: self.level.coordinate_profile,
+            generation_profile: self.level.generation_profile,
             spawn: spawn.map(f64::from),
             server_tick: self.level.tick,
             view_distance: self.config.render_distance as u8,
@@ -849,6 +860,9 @@ impl HeadlessServer {
         if !matches!(gamemode, "survival" | "creative") {
             return self.reject(id, Some(request_id), RejectCode::NotAllowed, "the current game mode cannot edit blocks");
         }
+        if !self.world.contains_world_y(position[1]) {
+            return self.reject(id, Some(request_id), RejectCode::OutOfRange, "target is outside the world's build height");
+        }
         let target_chunk = (position[0].div_euclid(CHUNK_SIZE as i32), position[2].div_euclid(CHUNK_SIZE as i32));
         let Some(revision) = self.world.chunk_revision(target_chunk.0, target_chunk.1) else {
             return self.reject(id, Some(request_id), RejectCode::OutOfRange, "target chunk is not loaded");
@@ -885,6 +899,9 @@ impl HeadlessServer {
             BlockEditAction::Place { state } => {
                 let Some(block_id) = BlockId::from_repr(state.block_id) else { return self.reject(id, Some(request_id), RejectCode::NotAllowed, "unknown block ID"); };
                 let place = offset_position(position, face);
+                if !self.world.contains_world_y(place[1]) {
+                    return self.reject(id, Some(request_id), RejectCode::OutOfRange, "placement is outside the world's build height");
+                }
                 if !self.world.get_block(place[0], place[1], place[2]).is_air() {
                     return self.reject(id, Some(request_id), RejectCode::NotAllowed, "placement position is occupied");
                 }
@@ -1435,6 +1452,8 @@ mod tests {
                 session_id: 1,
                 username: "Alex".to_string(),
                 world_seed: 42,
+                coordinate_profile: WorldCoordinateProfile::JavaOverworld,
+                generation_profile: WorldGenerationProfile::Minecraft26Base,
                 spawn: [0.0, 75.0, 0.0],
                 server_tick: 0,
                 view_distance: DEFAULT_RENDER_DISTANCE as u8,

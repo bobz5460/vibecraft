@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::world::block::BlockId;
 use crate::world::world_gen::density_fn::{FunctionContext, SinglePointContext};
-use crate::world::world_gen::noise::NoiseSeed;
+use crate::world::world_gen::noise::{NoiseSeed, PositionalRandomFactory};
 use crate::world::world_gen::noise_router::NoiseRouter;
 
 const X_SPACING: i32 = 16;
@@ -117,7 +117,7 @@ struct AquiferLocation {
 /// Per-chunk implementation of Minecraft 26.2's noise-based aquifer.
 pub struct NoiseBasedAquifer {
     router: Arc<NoiseRouter>,
-    positional_random_factory: crate::world::world_gen::noise::PositionalRandomFactory,
+    positional_random_factory: PositionalRandomFactory,
     global_fluid_picker: GlobalFluidPicker,
     aquifer_cache: Vec<Option<FluidStatus>>,
     aquifer_location_cache: Vec<Option<AquiferLocation>>,
@@ -135,14 +135,14 @@ impl NoiseBasedAquifer {
     /// Construct an aquifer for one 16x16 chunk column.
     ///
     /// `min_block_y` and `y_block_size` must describe the same vertical range
-    /// used by the density interpolation loop. The positional random factory
-    /// is created exactly as Java's `RandomState` path: root `NoiseSeed`, then
-    /// `fork_positional`, then `.at(grid_x, grid_y, grid_z)` for each center.
-    pub fn new(
+    /// used by the density interpolation loop. `positional_random_factory`
+    /// must be RandomState's named `minecraft:aquifer` factory, not the root
+    /// levelgen factory.
+    pub fn with_positional_random_factory(
         chunk_x: i32,
         chunk_z: i32,
         router: Arc<NoiseRouter>,
-        seed: u64,
+        positional_random_factory: PositionalRandomFactory,
         min_block_y: i32,
         y_block_size: i32,
         global_fluid_picker: GlobalFluidPicker,
@@ -176,9 +176,6 @@ impl NoiseBasedAquifer {
         let skip_sampling_above_grid_y = grid_y(adjust_surface_level(max_surface) + 12) + 1;
         let skip_sampling_above_y = from_grid_y(skip_sampling_above_grid_y, 11) - 1;
 
-        let mut root_seed = NoiseSeed::new(seed);
-        let positional_random_factory = root_seed.fork_positional();
-
         Self {
             router,
             positional_random_factory,
@@ -203,11 +200,14 @@ impl NoiseBasedAquifer {
         router: Arc<NoiseRouter>,
         seed: u64,
     ) -> Self {
-        Self::new(
+        let mut root_seed = NoiseSeed::new(seed);
+        let levelgen_random = root_seed.fork_positional();
+        let mut aquifer_random = levelgen_random.from_hash_of("minecraft:aquifer");
+        Self::with_positional_random_factory(
             chunk_x,
             chunk_z,
             router,
-            seed,
+            aquifer_random.fork_positional(),
             -64,
             384,
             GlobalFluidPicker::overworld(),
@@ -250,6 +250,15 @@ impl NoiseBasedAquifer {
         let x_anchor = grid_x(x + SAMPLE_OFFSET_X);
         let y_anchor = grid_y(y + SAMPLE_OFFSET_Y);
         let z_anchor = grid_z(z + SAMPLE_OFFSET_Z);
+
+        // When the block position falls outside the aquifer's sampled grid
+        // range (including the +-1 Y offset used for center sampling, which
+        // can occur for blocks at the world bottom or from carver edges),
+        // fall back to the global fluid picker rather than panicking.
+        if !self.contains_block_with_offsets(x, y, z) {
+            self.should_schedule_fluid_update = false;
+            return Some(global_fluid.at(y));
+        }
 
         let mut nearest = [(i64::MAX, 0usize); 4];
         for x_offset in 0..=1 {
@@ -384,6 +393,22 @@ impl NoiseBasedAquifer {
         debug_assert!(y >= 0 && y < self.grid_size_y);
         debug_assert!(z >= 0 && z < self.grid_size_z);
         (y * self.grid_size_z * self.grid_size_x + z * self.grid_size_x + x) as usize
+    }
+
+    /// Check whether a block coordinate falls within the aquifer's sampled
+    /// grid range, including the +-1 offset in Y that `compute_substance`
+    /// applies when sampling nearest aquifer centers.
+    fn contains_block_with_offsets(&self, block_x: i32, block_y: i32, block_z: i32) -> bool {
+        let gx = grid_x(block_x + SAMPLE_OFFSET_X);
+        let gy = grid_y(block_y + SAMPLE_OFFSET_Y);
+        let gz = grid_z(block_z + SAMPLE_OFFSET_Z);
+        let x = gx - self.min_grid_x;
+        let y = gy - self.min_grid_y;
+        let z = gz - self.min_grid_z;
+        // X/Z iterate 0..=1, Y iterates -1..=1
+        x >= 0 && x + 1 < self.grid_size_x
+            && y - 1 >= 0 && y + 1 < self.grid_size_y
+            && z >= 0 && z + 1 < self.grid_size_z
     }
 
     fn get_aquifer_location(
@@ -753,5 +778,19 @@ mod tests {
         let mut aquifer = test_aquifer();
         assert_eq!(aquifer.compute_substance(0, 20, 0, 1.0), None);
         assert!(!aquifer.should_schedule_fluid_update());
+    }
+
+    #[test]
+    fn overworld_uses_random_state_aquifer_fork() {
+        let router = Arc::new(NoiseRouterData::create_overworld_router(42, false, false));
+        let aquifer = NoiseBasedAquifer::overworld(0, 0, router, 42);
+
+        let mut root = NoiseSeed::new(42);
+        let levelgen = root.fork_positional();
+        let mut expected_seed = levelgen.from_hash_of("minecraft:aquifer");
+        assert_eq!(
+            aquifer.positional_random_factory,
+            expected_seed.fork_positional()
+        );
     }
 }

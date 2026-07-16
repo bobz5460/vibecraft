@@ -1027,9 +1027,9 @@ impl DensityFunction for BlendedNoiseDensity {
             pow /= 2.0;
         }
 
-        let factor = (main_value / 10.0 + 1.0) / 2.0;
-        let is_max = factor >= 1.0;
-        let is_min = factor <= 0.0;
+        let raw_factor = (main_value / 10.0 + 1.0) / 2.0;
+        let is_max = raw_factor >= 1.0;
+        let is_min = raw_factor <= 0.0;
 
         let mut blend_min = 0.0;
         let mut blend_max = 0.0;
@@ -1057,15 +1057,16 @@ impl DensityFunction for BlendedNoiseDensity {
             pow /= 2.0;
         }
 
-        (blend_min / 512.0) + (blend_max / 512.0 - blend_min / 512.0) * factor
+        let factor = raw_factor.clamp(0.0, 1.0);
+        ((blend_min / 512.0) + (blend_max / 512.0 - blend_min / 512.0) * factor) / 128.0
     }
 
     fn min_value(&self) -> f64 {
-        -self.max_value
+        -self.max_value / 128.0
     }
 
     fn max_value(&self) -> f64 {
-        self.max_value
+        self.max_value / 128.0
     }
 
     fn map_children(&self, _visitor: &dyn Visitor) -> DenseFn {
@@ -1467,8 +1468,8 @@ mod tests {
 
         let mut continents_random = positional.from_hash_of("minecraft:continentalness");
         let continents = shifted_noise_2d(
-            shift_x,
-            shift_z,
+            shift_x.clone(),
+            shift_z.clone(),
             0.25,
             NoiseHandle::new(NormalNoise::create(
                 &mut continents_random,
@@ -1476,6 +1477,73 @@ mod tests {
             )),
         );
         assert_eq!(router.continents.compute(&ctx), continents.compute(&ctx));
+
+        let mut erosion_random = positional.from_hash_of("minecraft:erosion");
+        let erosion = shifted_noise_2d(
+            shift_x.clone(),
+            shift_z.clone(),
+            0.25,
+            NoiseHandle::new(NormalNoise::create(
+                &mut erosion_random,
+                &create_noise_parameters(&NoiseKey::Erosion),
+            )),
+        );
+        assert_eq!(router.erosion.compute(&ctx), erosion.compute(&ctx));
+
+        let mut temperature_random = positional.from_hash_of("minecraft:temperature");
+        let temperature = shifted_noise_2d(
+            shift_x.clone(),
+            shift_z.clone(),
+            0.25,
+            NoiseHandle::new(NormalNoise::create(
+                &mut temperature_random,
+                &create_noise_parameters(&NoiseKey::Temperature),
+            )),
+        );
+        assert_eq!(router.temperature.compute(&ctx), temperature.compute(&ctx));
+
+        let mut vegetation_random = positional.from_hash_of("minecraft:vegetation");
+        let vegetation = shifted_noise_2d(
+            shift_x,
+            shift_z,
+            0.25,
+            NoiseHandle::new(NormalNoise::create(
+                &mut vegetation_random,
+                &create_noise_parameters(&NoiseKey::Vegetation),
+            )),
+        );
+        assert_eq!(router.vegetation.compute(&ctx), vegetation.compute(&ctx));
+    }
+
+    #[test]
+    fn peaks_and_valleys_and_base_noise_keep_their_required_axes() {
+        for (weirdness, expected) in [
+            (-1.0, 0.0),
+            (-2.0 / 3.0, 1.0),
+            (-1.0 / 3.0, 0.0),
+            (0.0, -1.0),
+            (1.0 / 3.0, 0.0),
+            (2.0 / 3.0, 1.0),
+            (1.0, 0.0),
+        ] {
+            assert!((NoiseRouterData::peaks_and_valleys(weirdness) - expected).abs() < 1e-12);
+        }
+
+        let mut seed = NoiseSeed::new(42);
+        let positional = seed.fork_positional();
+        let mut terrain_random = positional.from_hash_of("minecraft:terrain");
+        let base_noise = BlendedNoiseDensity::new(
+            &mut terrain_random,
+            0.25,
+            0.125,
+            80.0,
+            160.0,
+            8.0,
+        );
+        let low = SinglePointContext { block_x: 123, block_y: -37, block_z: -456 };
+        let high = SinglePointContext { block_x: 123, block_y: 91, block_z: -456 };
+
+        assert_ne!(base_noise.compute(&low), base_noise.compute(&high));
     }
 
     #[test]

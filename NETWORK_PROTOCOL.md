@@ -1,6 +1,6 @@
 # Native Multiplayer Protocol
 
-The demo protocol is version `1` and is native to Vibecraft. It is not the
+The demo protocol is version `4` and is native to Vibecraft. It is not the
 Java Edition protocol and does not promise Java client/server compatibility.
 
 ## Framing
@@ -9,7 +9,7 @@ Each message is a UTF-8 JSON envelope prefixed by a four-byte unsigned big-
 endian payload length:
 
 ```text
-u32 payload_length | {"version":1,"message":...}
+u32 payload_length | {"version":4,"message":...}
 ```
 
 The default payload limit is 1 MiB. Chunk payloads are limited to 768 KiB,
@@ -21,8 +21,9 @@ limit violation are rejected before the message reaches simulation code.
 ## Handshake And Session
 
 1. The client sends `Hello { protocol_version, username }`.
-2. The server validates the version and username, then sends `Welcome` and the
-   initial authoritative state.
+2. The server validates the version and username, then sends `Welcome` with
+    the world's coordinate and generation profiles before any initial
+    authoritative state.
 3. The client may send movement input, block-edit requests, inventory-action
    requests, chat, keep-alives, or a disconnect request.
 4. A client input sequence must increase monotonically. A session that has not
@@ -41,6 +42,19 @@ legacy data byte. Chunk payloads use the bounded `VCC1` run-length codec rather
 than JSON per-cell arrays; block-entity metadata remains JSON inside that
 bounded payload. A `ChunkData` revision is the server's mutation revision for
 the chunk and is required on block-edit requests.
+
+Chunk payload cells always use internal local Y `0..383`. `Welcome` carries the
+immutable world profile that maps those cells to public coordinates: legacy
+worlds use `0..383`, while new Java-profile Overworlds use `-64..319`. Player,
+block-request, and block-update positions use the public coordinate system.
+
+`Welcome` also carries the immutable generation profile. The server alone
+generates chunks in the native protocol, so clients do not use this value to
+generate terrain; it identifies whether newly streamed server chunks preserve
+legacy pre-corrected interpolation, use the corrected Minecraft-26 base, or
+use the future-world-only native decoration preview. The preview is not Java
+feature-index compatible; version 4 is required because it adds this profile
+value to the wire contract.
 
 `ChunkData` adds an authoritative chunk snapshot; `ChunkUnload` removes a
 snapshot that is outside the player's current view. Clients must discard the

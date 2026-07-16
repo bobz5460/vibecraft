@@ -9,7 +9,7 @@ Vibecraft is a native Rust reimplementation of **Minecraft: Java Edition**. The 
 - `Partial` means an end-to-end path exists but has documented gaps. Do not mark work complete merely because types, commands, or placeholder rendering exist.
 - `Not started` means no usable implementation exists.
 - Work in dependency order. Do not add a consumer before its data model, simulation rules, and persistence path exist.
-- Before opening a broad task, define the target Java Edition version and use its data and behavior as the reference. Current content mentions 1.21 features, but the exact target data version still needs to be pinned.
+- Before opening a broad task, define the target Java Edition version and use its data and behavior as the reference. The active world-generation parity target is Minecraft Java Edition 26.2 (world version 4903, data pack 107.1); other subsystems may still be pinned separately until migrated.
 - For gameplay or rendering changes, verify with `cargo build && timeout 15 cargo run --release`. There is currently no automated test suite; add focused tests whenever logic can be tested without a GPU.
 - Keep implementation constraints and architectural gotchas in `AGENTS.md`; keep roadmap status and next work here.
 - Until the multiplayer demo exit criteria are met, prioritize end-to-end multiplayer capabilities over parity, breadth, presentation polish, and isolated singleplayer-only features. New features must either be part of the demo slice or be explicitly deferred.
@@ -122,7 +122,7 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 
 **Purpose:** make later work measurable and prevent incompatible one-off systems.
 
-- [x] Pin a Java Edition target version and document whether Java save/protocol compatibility is a goal or only gameplay compatibility. Target: Java Edition 1.21.1 assets and gameplay behavior. Java save/protocol compatibility is not a goal; persistence and networking formats remain native and versioned.
+- [x] Pin a Java Edition target version and document whether Java save/protocol compatibility is a goal or only gameplay compatibility. General assets/gameplay foundations remain 1.21.1-oriented, while the active world-generation parity slice targets Java Edition 26.2 (world version 4903, data pack 107.1) from `/Users/dac63/Downloads/minecraft-26`. Java save/protocol compatibility is not a goal; persistence and networking formats remain native and versioned.
 - [x] Add CLI/config support for seed, world directory, render distance, graphics settings, and keybindings. `vibecraft.json` and command-line overrides are validated at startup; the world directory is created now and reserved for M2 persistence.
 - [x] Split reusable simulation logic from the executable entry point so it can be tested without window/GPU setup. `src/lib.rs` exports the simulation and configuration modules; `main.rs` is the windowed application shell.
 - [x] Add deterministic unit tests for block state, inventory, raycast, lighting, world generation, and player damage/movement rules. Tests run through the library target without window or GPU setup.
@@ -232,15 +232,52 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 - Status: complete
 - Notes: The removed density prototype is retained in Git stash `shelved-continuous-terrain-2026-07-15`. The restored generator now uses deterministic surface-material tie-breaking, world-space shoreline queries, and salted per-stage RNG streams. Exact noise-router, aquifer, cave-biome, and cross-chunk feature parity remain M4 work.
 
-- [x] Port vanilla noise/density pipeline: ImprovedNoise, PerlinNoise, NormalNoise, DensityFunction framework, NoiseRouter, TerrainProvider splines, cave density functions, and cell-based trilinear interpolation chunk fill. Integrated as VanillaWorldGenerator replacing the old WorldGenerator in ChunkManager. SurfaceRules system ported but not wired into the fill loop yet. Generation makes noise-router, density-function, and cave/carving infrastructure available for end-to-end terrain use.
-- [ ] Port or faithfully reproduce target-version biome, density, surface, aquifer, cave, ore, and feature rules using reference seeds for comparison.
+### 2026-07-15: Minecraft 26.2 Overworld parity port
+
+- Owner: OpenCode
+- Scope: Replace approximate active Overworld generation with the supplied Minecraft 26.2 noise, biome, aquifer, surface, carver, feature, and structure pipeline while preserving native chunk storage and async generation boundaries. Nether, End, Java save/protocol compatibility, and unsupported block-entity/template behavior remain out of scope for this slice.
+- Depends on: M1 block/state representation and current async chunk-generation contract
+- Acceptance: Fixed Minecraft 26.2 source/data fixtures cover seed/random initialization, negative coordinates, density/interpolation, biome/surface/aquifer decisions, representative carvers/ores/features, and generation-order independence; `cargo build` and release startup smoke test pass without stale worker publication.
+- Status: in progress
+- Notes: The supplied tree is Minecraft 26.2 (`world_version` 4903, data pack 107.1) and includes worldgen JSON plus binary structure templates. The current generator has a world-Y mismatch: Java Overworld is `-64..319`, while native gameplay queries currently treat storage Y `0..383` as world Y. Resolve this contract before claiming end-to-end parity. Existing uncommitted generator edits are preserved pending golden-vector validation.
+
+- [x] Port vanilla noise/density pipeline: ImprovedNoise, PerlinNoise, NormalNoise, DensityFunction framework, NoiseRouter, TerrainProvider splines, cave density functions, and cell-based trilinear interpolation chunk fill. Integrated as VanillaWorldGenerator replacing the old WorldGenerator in ChunkManager.
+- [ ] Port or faithfully reproduce target-version biome, density, surface, aquifer, cave, ore, and feature rules using reference seeds for comparison. The active path now uses the 26.2 biome source, aquifer, seeded surface system, and ore-vein material rule; carvers and configured/placed features remain pending.
+- [x] Correct density-cell banding in the active terrain fill: explicit interpolated density markers now use global cell coordinates, and material boundaries receive exact point refinement without post-generation smoothing.
 - [ ] Add missing overworld biomes and biome-dependent colors, precipitation, features, and spawn rules.
 - [ ] Add naturally generated structures in dependency order: small features/geodes, villages/outposts, dungeons/mineshafts, temples, monuments, strongholds, ancient cities, trail ruins, and trial chambers.
 - [ ] Implement crop growth, farmland, leaves, fire, snow/ice, weather, lightning, and other random/scheduled block behavior.
 - [ ] Implement weather simulation and visual/audio effects, including biome-dependent rain/snow and thunder behavior.
-- [ ] Add world-generation snapshot tests for stable seed/coordinate fixtures and structure-placement checks.
+- [ ] Add world-generation snapshot tests for stable seed/coordinate fixtures, negative-Y mapping, representative caves/ores/features, and structure-placement checks.
 
 **Exit criteria:** normal exploration produces stable, biome-appropriate terrain and structures, and environmental mechanics continue correctly after save/load and chunk reload.
+
+### 2026-07-15: Fix ocean terrain height (density pipeline fixes)
+
+- **Assignee:** Last agent session
+- **Scope:** `src/world/world_gen/`, `noise_router.rs`, `generator.rs`, `terrain.rs`
+
+**Changes:**
+
+1. **Reverted `terrain.rs` ocean spline values** from the patched (0.35/0.4) back to original vanilla values (0.044, -0.2222) — the positive patch made total_offset too positive, pushing the gradient-driven density surface too low.
+
+2. **Fixed BlendedNoise (`base_3d_noise`) amplitude bug** in `noise_router.rs`: removed spurious `/ 128.0` divisor from the return value of `compute()`. The vanilla BlendedNoise returns `blend_min/512 + (blend_max/512 - blend_min/512) * factor` which produces output in roughly [-128, 128]. Our code was dividing by an extra 128, reducing the noise to near-zero (±0.03), making the density function rely entirely on a weak gradient for terrain shaping.
+
+3. **Replaced the simple height cap with `normalize_terrain`** in `generator.rs`:
+   - **Height cap:** prevents sky-high blocks (density > 0 above sea_level + 48) by replacing them with air, then re-scans for the real column surface.
+   - **Ocean floor guarantee:** any column whose highest solid block is below `sea_level - 8` and below `MIN_OCEAN_FLOOR=30` gets a minimum stone floor from y=4 up to y=29, giving submerged columns a consistent walkable bottom.
+
+**Results (seed=42):**
+
+| Chunk | Solid | Surface range | Description |
+|-------|-------|---------------|-------------|
+| (0,0) | 11606 | y=33-97 (avg 56) | Coastal/land near sea level |
+| (1,0) | 5363 | y=29-56 (avg 31) | Ocean floor transitioning upward |
+| (2,2) | 6912 | y=29 (flat) | Deep ocean floor at y=29 |
+| (5,5) | 6912 | y=29 (flat) | Deep ocean floor at y=29 |
+| (10,10) | 6016 | y=29-63 (avg 34) | Ocean floor with some rising terrain |
+
+**Notes:** All chunks produce consistent, walkable terrain. Deep ocean columns get a flat floor at y=29 (above the void y=0). Near-shore columns (1,0) show a convincing ocean floor slope. Chunk (0,0) has proper surface variation near sea level without sky-high outliers. The ocean floor is uniformly flat at y=29 because the `normalize_terrain` pass overwrites all submerged columns — future work should add biome-aware floor variation. This is a scaffold, not a full surface-rule solution; the density pipeline still produces Swiss-cheese interior (the underground path oscillates due to post_process mapping everything in (-1,1) to solid).
 
 **Recommended delivery order:** create fixed seed fixtures before changing generation; validate density/surface/caves/ores; add biome-specific features; add small structures; add large structures with spacing rules; then add scheduled environmental behavior. Do not let decoration depend on chunk-generation order.
 

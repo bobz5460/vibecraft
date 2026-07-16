@@ -16,14 +16,12 @@
 
 /// Equivalent to `Mth.floor(double)` — returns the largest int ≤ x.
 fn floor(x: f64) -> i32 {
-    let i = x as i32;
-    if x < i as f64 { i - 1 } else { i }
+    x.floor() as i32
 }
 
 /// Equivalent to `Mth.lfloor(double)` — returns the largest i64 ≤ x.
 fn lfloor(x: f64) -> i64 {
-    let i = x as i64;
-    if x < i as f64 { i - 1 } else { i }
+    x.floor() as i64
 }
 
 /// Equivalent to `Mth.smoothstep(double)` — Ken Perlin's 6t⁵ − 15t⁴ + 10t³.
@@ -74,20 +72,36 @@ fn lerp3(
 }
 
 // ============================================================================
-// NoiseSeed — SplitMix64 PRNG with Java's Random semantics
+// NoiseSeed — Xoroshiro128++ with Minecraft's seed semantics
 // ============================================================================
 
-/// Deterministic PRNG using SplitMix64, exposing methods that match
-/// `java.util.Random`'s `nextDouble()` and `nextInt(int)` contract.
+/// Deterministic PRNG corresponding to Minecraft's `XoroshiroRandomSource`.
+///
+/// The single-seed constructor performs the same Stafford13 expansion as
+/// `RandomSupport.upgradeSeedTo128bit(seed)`. The internal two-state constructor
+/// is used by positional factories, whose states are already fully specified.
 pub struct NoiseSeed {
-    state: u64,
-    /// Saved initial seed, used for `fork_positional()` semantics.
+    state_lo: u64,
+    state_hi: u64,
+    /// Saved initial seed retained for callers of the old accessor.
     initial_seed: u64,
 }
 
 impl NoiseSeed {
     pub fn new(seed: u64) -> Self {
-        NoiseSeed { state: seed, initial_seed: seed }
+        let low = seed ^ 0x6a09e667f3bcc909;
+        let high = low.wrapping_add(0x9e3779b97f4a7c15);
+        let (state_lo, state_hi) = (mix_stafford13(low), mix_stafford13(high));
+        NoiseSeed::from_state(state_lo, state_hi, seed)
+    }
+
+    fn from_state(state_lo: u64, state_hi: u64, initial_seed: u64) -> Self {
+        let (state_lo, state_hi) = if state_lo == 0 && state_hi == 0 {
+            (0x9e3779b97f4a7c15, 0x6a09e667f3bcc909)
+        } else {
+            (state_lo, state_hi)
+        };
+        NoiseSeed { state_lo, state_hi, initial_seed }
     }
 
     /// Return the initial seed (for positional forking).
@@ -95,58 +109,196 @@ impl NoiseSeed {
         self.initial_seed
     }
 
-    /// Advance SplitMix64 and return the top `bits` bits.
+    /// Advance Xoroshiro128++ and return the top `bits` bits.
     fn next(&mut self, bits: i32) -> i32 {
-        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-        z ^= z >> 31;
-        (z >> (64 - bits)) as i32
+        (self.next_long() >> (64 - bits)) as i32
     }
 
-    /// Equivalent to `java.util.Random.nextDouble()`.
+    fn next_bits(&mut self, bits: i32) -> u64 {
+        self.next_long() >> (64 - bits)
+    }
+
+    /// Equivalent to `Xoroshiro128PlusPlus.nextLong()`.
+    pub fn next_long(&mut self) -> u64 {
+        let s0 = self.state_lo;
+        let mut s1 = self.state_hi;
+        let result = s0.wrapping_add(s1).rotate_left(17).wrapping_add(s0);
+
+        s1 ^= s0;
+        self.state_lo = s0.rotate_left(49) ^ s1 ^ (s1 << 21);
+        self.state_hi = s1.rotate_left(28);
+        result
+    }
+
+    /// Equivalent to `RandomSource.nextDouble()` for Xoroshiro.
     /// Returns a double in [0.0, 1.0).
     pub fn next_double(&mut self) -> f64 {
-        let hi = self.next(26) as i64;
-        let lo = self.next(27) as i64;
-        ((hi << 27) | lo) as f64 / (1i64 << 53) as f64
+        self.next_bits(53) as f64 * 1.1102230246251565e-16
     }
 
-    /// Equivalent to `java.util.Random.nextInt(int n)`.
+    pub fn next_float(&mut self) -> f32 {
+        self.next_bits(24) as f32 * 5.9604645e-8
+    }
+
+    pub fn next_boolean(&mut self) -> bool {
+        self.next_long() & 1 != 0
+    }
+
+    /// Equivalent to `XoroshiroRandomSource.nextInt(int n)`.
     /// Returns a uniformly distributed int in [0, n).
     pub fn next_int(&mut self, n: i32) -> i32 {
         assert!(n > 0, "n must be positive");
-        // Fast path for power-of-two n
-        if (n & -n) == n {
-            return ((n as i64 * self.next(31) as i64) >> 31) as i32;
-        }
-        // Rejection sampling to remove bias
+        let bound = n as u64;
         loop {
-            let bits = self.next(31);
-            let val = bits % n;
-            if bits - val + (n - 1) >= 0 {
-                return val;
+            let random_bits = self.next_long() as u32 as u64;
+            let multiplied = random_bits * bound;
+            let fractional = multiplied & u32::MAX as u64;
+            if fractional < bound {
+                let threshold = ((u32::MAX as u64 + 1) - bound) % bound;
+                if fractional < threshold {
+                    continue;
+                }
             }
+            return (multiplied >> 32) as i32;
         }
     }
 
-    /// Create a new `NoiseSeed` deterministically from a name string,
-    /// corresponding to `PositionalRandomFactory.fromHashOf(String)`.
+    /// Create a new `NoiseSeed` from the root positional factory for `base_seed`.
+    /// This corresponds to `XoroshiroRandomSource(base_seed).forkPositional()
+    /// .fromHashOf(name)`.
     pub fn from_hash_of(base_seed: u64, name: &str) -> Self {
-        let hash = hash_name(name);
-        NoiseSeed::new(base_seed.wrapping_mul(0x9e3779b97f4a7c15) ^ hash)
+        NoiseSeed::new(base_seed).fork_positional().from_hash_of(name)
+    }
+
+    /// Split this source into the positional factory used by Java levelgen.
+    pub fn fork_positional(&mut self) -> PositionalRandomFactory {
+        PositionalRandomFactory {
+            seed_lo: self.next_long(),
+            seed_hi: self.next_long(),
+        }
     }
 }
 
-/// FNV-1a 64-bit hash for string names.
-fn hash_name(name: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in name.as_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+fn mix_stafford13(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
+/// The Xoroshiro positional factory used by `PerlinNoise` and `RandomState`.
+pub struct PositionalRandomFactory {
+    seed_lo: u64,
+    seed_hi: u64,
+}
+
+impl PositionalRandomFactory {
+    pub fn from_hash_of(&self, name: &str) -> NoiseSeed {
+        let digest = md5_digest(name.as_bytes());
+        let hash_lo = u64::from_be_bytes([
+            digest[0], digest[1], digest[2], digest[3],
+            digest[4], digest[5], digest[6], digest[7],
+        ]);
+        let hash_hi = u64::from_be_bytes([
+            digest[8], digest[9], digest[10], digest[11],
+            digest[12], digest[13], digest[14], digest[15],
+        ]);
+        NoiseSeed::from_state(hash_lo ^ self.seed_lo, hash_hi ^ self.seed_hi, 0)
     }
-    h
+
+    /// Equivalent to `XoroshiroPositionalRandomFactory.at(x, y, z)`.
+    pub fn at(&self, x: i32, y: i32, z: i32) -> NoiseSeed {
+        // Match Mth.getSeed: the X term is evaluated as a Java int before
+        // being promoted by the long Z term in the XOR expression.
+        let x_term = x.wrapping_mul(3_129_871) as i64;
+        let mut positional = x_term
+            ^ (z as i64).wrapping_mul(116_129_781)
+            ^ y as i64;
+        positional = positional
+            .wrapping_mul(positional)
+            .wrapping_mul(42_317_861)
+            .wrapping_add(positional.wrapping_mul(11));
+        NoiseSeed::from_state((positional >> 16) as u64 ^ self.seed_lo, self.seed_hi, 0)
+    }
+
+    pub fn from_seed(&self, seed: u64) -> NoiseSeed {
+        NoiseSeed::from_state(seed ^ self.seed_lo, seed ^ self.seed_hi, seed)
+    }
+}
+
+fn md5_digest(input: &[u8]) -> [u8; 16] {
+    const SHIFT: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const TABLE: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+        0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+        0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+        0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+        0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+        0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+        0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    ];
+
+    let mut message = input.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&((input.len() as u64) * 8).to_le_bytes());
+
+    let mut a0 = 0x67452301_u32;
+    let mut b0 = 0xefcdab89_u32;
+    let mut c0 = 0x98badcfe_u32;
+    let mut d0 = 0x10325476_u32;
+
+    for chunk in message.chunks_exact(64) {
+        let mut words = [0_u32; 16];
+        for (word, bytes) in words.iter_mut().zip(chunk.chunks_exact(4)) {
+            *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (f, g) = if i < 16 {
+                ((b & c) | ((!b) & d), i)
+            } else if i < 32 {
+                ((d & b) | ((!d) & c), (5 * i + 1) % 16)
+            } else if i < 48 {
+                (b ^ c ^ d, (3 * i + 5) % 16)
+            } else {
+                (c ^ (b | !d), (7 * i) % 16)
+            };
+            let next = a
+                .wrapping_add(f)
+                .wrapping_add(TABLE[i])
+                .wrapping_add(words[g])
+                .rotate_left(SHIFT[i])
+                .wrapping_add(b);
+            (a, b, c, d) = (d, next, b, c);
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+
+    let mut digest = [0_u8; 16];
+    digest[0..4].copy_from_slice(&a0.to_le_bytes());
+    digest[4..8].copy_from_slice(&b0.to_le_bytes());
+    digest[8..12].copy_from_slice(&c0.to_le_bytes());
+    digest[12..16].copy_from_slice(&d0.to_le_bytes());
+    digest
 }
 
 // ============================================================================
@@ -694,10 +846,10 @@ impl PerlinNoise {
         (-low_freq_octaves, amplitudes)
     }
 
-    /// New initialization path: each octave gets an RNG seeded from its name.
-    /// Uses `random.initial_seed()` as the base (matching `forkPositional()` semantics).
+    /// New initialization path: one positional factory supplies all octaves.
+    /// Each octave is then seeded with the factory's MD5 name hash.
     fn init_new(random: &mut NoiseSeed, first_octave: i32, amplitudes: &[f64]) -> Vec<Option<ImprovedNoise>> {
-        let base_seed = random.initial_seed();
+        let positional = random.fork_positional();
         let octaves = amplitudes.len();
         let mut levels = Vec::with_capacity(octaves);
 
@@ -705,7 +857,7 @@ impl PerlinNoise {
             if amplitudes[i] != 0.0 {
                 let octave = first_octave + i as i32;
                 let name = format!("octave_{}", octave);
-                let mut seed = NoiseSeed::from_hash_of(base_seed, &name);
+                let mut seed = positional.from_hash_of(&name);
                 levels.push(Some(ImprovedNoise::new(&mut seed)));
             } else {
                 levels.push(None);
@@ -1279,6 +1431,53 @@ mod tests {
             assert_eq!(a.next_double(), b.next_double());
             assert_eq!(a.next_int(100), b.next_int(100));
         }
+    }
+
+    #[test]
+    fn test_xoroshiro_reference_vector() {
+        // RandomSupport.upgradeSeedTo128bit(0) and Xoroshiro128PlusPlus.
+        let mut seed = NoiseSeed::new(0);
+        assert_eq!(seed.state_lo, 0x3564b439cd1e1f16);
+        assert_eq!(seed.state_hi, 0x63cfc62a2b097592);
+        assert_eq!(seed.next_long(), 0x2a2ca488f66f517e);
+        assert_eq!(seed.next_long(), 0xccbc22d72e97c372);
+        assert_eq!(seed.next_long(), 0x404e64b826f4b9f4);
+    }
+
+    #[test]
+    fn test_positional_factory_reference_vector() {
+        // XoroshiroRandomSource(42).forkPositional().fromHashOf("octave_-2").
+        let mut root = NoiseSeed::new(42);
+        let factory = root.fork_positional();
+        assert_eq!(factory.seed_lo, 0xbed4a3d469c5d91f);
+        assert_eq!(factory.seed_hi, 0x65e301cb50e8f4ab);
+
+        let octave = factory.from_hash_of("octave_-2");
+        assert_eq!(octave.state_lo, 0x0a76eeaeed22be64);
+        assert_eq!(octave.state_hi, 0x67dcf8adde61416f);
+        assert_eq!(NoiseSeed::from_hash_of(42, "octave_-2").state_lo, octave.state_lo);
+    }
+
+    #[test]
+    fn test_positional_coordinate_reference_vector() {
+        // Mth.getSeed(12345, 80, -54321), then the Xoroshiro positional xor.
+        let mut root = NoiseSeed::new(42);
+        let factory = root.fork_positional();
+        let positional = factory.at(12345, 80, -54321);
+        // Mth.getSeed evaluates the X term with Java int overflow before the
+        // long XOR. This is the resulting positional seed for this fixture.
+        assert_eq!(positional.state_lo, 0xbed4fb029b1fe01b);
+        assert_eq!(positional.state_hi, 0x65e301cb50e8f4ab);
+    }
+
+    #[test]
+    fn test_normal_noise_reference_vector() {
+        // NormalNoise.create(42, -2, [1, 0, 1]) from minecraft-26.2.
+        let mut seed = NoiseSeed::new(42);
+        let noise = NormalNoise::create_simple(&mut seed, -2, &[1.0, 0.0, 1.0]);
+        assert!((noise.max_value() - 25.0 / 7.0).abs() < 1e-15);
+        assert!((noise.get_value(1.5, 2.5, 3.5) - 0.04237057610103179).abs() < 1e-14);
+        assert_eq!(seed.next_long(), 0x74d89c01aa1097cb);
     }
 
     #[test]

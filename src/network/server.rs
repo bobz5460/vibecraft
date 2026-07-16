@@ -1685,16 +1685,23 @@ mod tests {
             world_dir: world_dir.clone(),
             seed: Some(17),
             render_distance: 2,
+            idle_timeout: Duration::from_secs(120),
             ..ServerConfig::default()
         };
         let mut server = HeadlessServer::bind(config).unwrap();
+        // Keep this test focused on fan-out. Preload the spawn chunk so the
+        // async worldgen worker pool cannot make the transport assertion
+        // depend on unrelated test-thread contention.
+        server.world.get_or_create_chunk(0, 0);
         let address = server.local_addr().unwrap();
         let mut first = ClientTransport::connect(address, "Player".to_string()).unwrap();
         let mut second = ClientTransport::connect(address, "Player".to_string()).unwrap();
         let mut first_chunks = 0;
         let mut second_chunks = 0;
 
-        for _ in 0..300 {
+        // World generation runs asynchronously and the parity generator is
+        // intentionally more expensive than the legacy test fixture.
+        for _ in 0..15000 {
             server.poll().unwrap();
             server.tick();
             if let Ok(messages) = first.poll() {

@@ -1,4 +1,6 @@
 pub mod caves;
+pub mod aquifer;
+pub mod biome_source;
 pub mod density_fn;
 pub mod generator;
 pub mod noise;
@@ -7,6 +9,7 @@ pub mod surface;
 pub mod terrain;
 
 pub use generator::VanillaWorldGenerator;
+pub use biome_source::{OverworldBiomeSource, UnsupportedBiome};
 
 use crate::world::block::{Block, BlockId};
 use crate::world::chunk::{Chunk, CHUNK_HEIGHT, CHUNK_SIZE};
@@ -342,6 +345,12 @@ impl WorldGenerator {
             Biome::WindsweptForest => BiomeParams::new(70.0, 22.0, 0.02, BlockId::GrassBlock, BlockId::Dirt, BlockId::Stone),
             Biome::WindsweptSavanna => BiomeParams::new(69.0, 20.0, 0.019, BlockId::GrassBlock, BlockId::Dirt, BlockId::Stone),
             Biome::WindsweptGravellyHills => BiomeParams::new(73.0, 28.0, 0.024, BlockId::Gravel, BlockId::Stone, BlockId::Stone),
+            Biome::BirchForest | Biome::PaleGarden => BiomeParams::new(68.0, 12.0, 0.015, BlockId::GrassBlock, BlockId::Dirt, BlockId::Stone),
+            Biome::SavannaPlateau => BiomeParams::new(69.0, 12.0, 0.015, BlockId::GrassBlock, BlockId::Dirt, BlockId::Stone),
+            Biome::SnowyTaiga | Biome::IceSpikes => BiomeParams::new(70.0, 8.0, 0.012, BlockId::SnowBlock, BlockId::Dirt, BlockId::Stone),
+            Biome::MangroveSwamp | Biome::StonyShore | Biome::SnowyBeach | Biome::FrozenRiver => BiomeParams::new(63.0, 3.0, 0.01, BlockId::GrassBlock, BlockId::Dirt, BlockId::Stone),
+            Biome::SparseJungle => BiomeParams::new(69.0, 16.0, 0.017, BlockId::GrassBlock, BlockId::Dirt, BlockId::Stone),
+            Biome::DripstoneCaves | Biome::LushCaves | Biome::SulfurCaves | Biome::DeepDark => BiomeParams::new(50.0, 4.0, 0.01, BlockId::Stone, BlockId::Stone, BlockId::Stone),
         }
     }
 
@@ -2613,13 +2622,20 @@ mod tests {
 pub enum Biome {
     Plains,
     Forest,
+    BirchForest,
+    PaleGarden,
     Desert,
     Savanna,
+    SavannaPlateau,
     Taiga,
+    SnowyTaiga,
     SnowyTundra,
+    IceSpikes,
     Mountains,
     Swamp,
+    MangroveSwamp,
     Jungle,
+    SparseJungle,
     DarkForest,
     Ocean,
     DeepOcean,
@@ -2627,6 +2643,8 @@ pub enum Biome {
     LukewarmOcean,
     ColdOcean,
     FrozenOcean,
+    StonyShore,
+    SnowyBeach,
     DeepWarmOcean,
     DeepLukewarmOcean,
     DeepColdOcean,
@@ -2638,6 +2656,7 @@ pub enum Biome {
     WoodedBadlands,
     ErodedBadlands,
     River,
+    FrozenRiver,
     FlowerForest,
     SunflowerPlains,
     CherryGrove,
@@ -2653,4 +2672,8 @@ pub enum Biome {
     WindsweptForest,
     WindsweptSavanna,
     WindsweptGravellyHills,
+    DripstoneCaves,
+    LushCaves,
+    SulfurCaves,
+    DeepDark,
 }

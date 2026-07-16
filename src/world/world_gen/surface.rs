@@ -10,7 +10,7 @@
 use crate::world::block::{Block, BlockId};
 use crate::world::chunk::{Chunk, CHUNK_HEIGHT, CHUNK_SIZE};
 use crate::world::world_gen::density_fn::{DensityFunction, FunctionContext, NoiseHandle};
-use crate::world::world_gen::noise::{NormalNoise, NoiseSeed};
+use crate::world::world_gen::noise::{NoiseKey, NormalNoise, NoiseSeed, PositionalRandomFactory};
 use crate::world::world_gen::noise_router::NoiseRouter;
 use crate::world::world_gen::Biome;
 use std::sync::Arc;
@@ -68,6 +68,25 @@ pub trait RuleSourceEx: Send + Sync {
     fn create(&self) -> Box<dyn SurfaceRuleEx>;
 }
 
+/// Adapts an already-built rule tree to the source interface used by the
+/// surface pipeline. This keeps rule construction separate from chunk-local
+/// biome callbacks.
+pub struct StaticRuleSource {
+    rule: Box<dyn SurfaceRuleEx>,
+}
+
+impl StaticRuleSource {
+    pub fn new(rule: Box<dyn SurfaceRuleEx>) -> Self {
+        Self { rule }
+    }
+}
+
+impl RuleSourceEx for StaticRuleSource {
+    fn create(&self) -> Box<dyn SurfaceRuleEx> {
+        self.rule.clone()
+    }
+}
+
 // ============================================================================
 // Clone for trait-object boxes
 // ============================================================================
@@ -111,6 +130,8 @@ pub struct SurfaceContext {
 
     // Sea level
     pub(crate) sea_level: i32,
+    pub(crate) world_min_y: i32,
+    pub(crate) world_height: i32,
     // Height getter (wx, wy, wz) -> biome
     pub(crate) get_height: Box<dyn Fn(i32, i32, i32) -> Biome + Send + Sync>,
     // Preliminary surface level getter (x, z) -> y
@@ -121,6 +142,17 @@ impl SurfaceContext {
     pub fn new(
         system: Arc<SurfaceSystemRef>,
         sea_level: i32,
+        get_height: Box<dyn Fn(i32, i32, i32) -> Biome + Send + Sync>,
+        get_preliminary_surface: Box<dyn Fn(i32, i32) -> i32 + Send + Sync>,
+    ) -> Self {
+        Self::new_with_height(system, sea_level, 0, CHUNK_HEIGHT as i32, get_height, get_preliminary_surface)
+    }
+
+    pub fn new_with_height(
+        system: Arc<SurfaceSystemRef>,
+        sea_level: i32,
+        world_min_y: i32,
+        world_height: i32,
         get_height: Box<dyn Fn(i32, i32, i32) -> Biome + Send + Sync>,
         get_preliminary_surface: Box<dyn Fn(i32, i32) -> i32 + Send + Sync>,
     ) -> Self {
@@ -141,6 +173,8 @@ impl SurfaceContext {
             biome: None,
             last_update_y: 0,
             sea_level,
+            world_min_y,
+            world_height,
             get_height,
             get_preliminary_surface,
         }
@@ -278,7 +312,7 @@ impl YConditionEx {
 impl ConditionEx for YConditionEx {
     fn test(&self, ctx: &mut SurfaceContext) -> bool {
         let y = ctx.block_y + if self.add_stone_depth { ctx.stone_depth_above } else { 0 };
-        let anchor_y = self.anchor.resolve(0, 384);
+        let anchor_y = self.anchor.resolve(ctx.world_min_y, ctx.world_height);
         y >= anchor_y + ctx.surface_depth * self.surface_depth_multiplier
     }
 
@@ -675,7 +709,11 @@ pub struct SurfaceSystemRef {
 impl SurfaceSystemRef {
     pub fn get_surface_depth(&self, block_x: i32, block_z: i32) -> i32 {
         let noise_value = self.surface_noise.sample(block_x as f64, 0.0, block_z as f64);
-        let mut rng = NoiseSeed::new(positional_hash(self.noise_random_seed, block_x, 0, block_z));
+        // SurfaceSystem uses the same world-seed positional factory for both
+        // noise initialization and its per-column random offset.
+        let mut world_random = NoiseSeed::new(self.noise_random_seed);
+        let positional = world_random.fork_positional();
+        let mut rng = positional.at(block_x, 0, block_z);
         let random_offset = rng.next_double() * 0.25;
         (noise_value * 2.75 + 3.0 + random_offset) as i32
     }
@@ -700,6 +738,26 @@ impl SurfaceSystemRef {
 pub struct SurfaceSystem;
 
 impl SurfaceSystem {
+    pub fn create_ref_from_seed(default_block: BlockId, sea_level: i32, seed: u64) -> Arc<SurfaceSystemRef> {
+        let mut world_random = NoiseSeed::new(seed);
+        let positional = world_random.fork_positional();
+
+        Self::create_ref(
+            default_block,
+            sea_level,
+            seed,
+            seeded_surface_noise(&positional, NoiseKey::Surface),
+            seeded_surface_noise(&positional, NoiseKey::SurfaceSecondary),
+            seeded_surface_noise(&positional, NoiseKey::ClayBandsOffset),
+            seeded_surface_noise(&positional, NoiseKey::BadlandsPillar),
+            seeded_surface_noise(&positional, NoiseKey::BadlandsPillarRoof),
+            seeded_surface_noise(&positional, NoiseKey::BadlandsSurface),
+            seeded_surface_noise(&positional, NoiseKey::IcebergPillar),
+            seeded_surface_noise(&positional, NoiseKey::IcebergPillarRoof),
+            seeded_surface_noise(&positional, NoiseKey::IcebergSurface),
+        )
+    }
+
     pub fn create_ref(
         default_block: BlockId,
         sea_level: i32,
@@ -714,7 +772,9 @@ impl SurfaceSystem {
         iceberg_pillar_roof_noise: NoiseHandle,
         iceberg_surface_noise: NoiseHandle,
     ) -> Arc<SurfaceSystemRef> {
-        let mut rng = NoiseSeed::from_hash_of(seed, "clay_bands");
+        let mut world_random = NoiseSeed::new(seed);
+        let positional = world_random.fork_positional();
+        let mut rng = positional.from_hash_of("minecraft:clay_bands");
         let clay_bands = generate_bands(&mut rng);
 
         Arc::new(SurfaceSystemRef {
@@ -740,20 +800,28 @@ impl SurfaceSystem {
         rule_source: &dyn RuleSourceEx,
         sea_level: i32,
     ) {
+        Self::build_surface_with_biome_provider(
+            system,
+            chunk,
+            rule_source,
+            sea_level,
+            0,
+            |_, _, _| Biome::Plains,
+        );
+    }
+
+    pub fn build_surface_with_biome_provider(
+        system: Arc<SurfaceSystemRef>,
+        chunk: &mut Chunk,
+        rule_source: &dyn RuleSourceEx,
+        sea_level: i32,
+        world_min_y: i32,
+        biome_provider: impl Fn(i32, i32, i32) -> Biome + Send + Sync + 'static,
+    ) {
         let heightmap = build_heightmap(chunk);
 
         let base_x = chunk.cx as i64 * CHUNK_SIZE as i64;
         let base_z = chunk.cz as i64 * CHUNK_SIZE as i64;
-
-        let get_biome: Box<dyn Fn(i32, i32, i32) -> Biome + Send + Sync> = {
-            let hm = heightmap.clone();
-            Box::new(move |_wx: i32, _wy: i32, _wz: i32| {
-                // Simplified: returns Plains as default
-                // In production, this would query the biome system.
-                let _ = &hm;
-                Biome::Plains
-            })
-        };
 
         let get_preliminary_surface: Box<dyn Fn(i32, i32) -> i32 + Send + Sync> = {
             let hm = heightmap.clone();
@@ -761,17 +829,19 @@ impl SurfaceSystem {
                 let lx = (wx as i64 - base_x) as usize;
                 let lz = (wz as i64 - base_z) as usize;
                 if lx < CHUNK_SIZE && lz < CHUNK_SIZE {
-                    hm[lx * CHUNK_SIZE + lz]
+                    hm[lx * CHUNK_SIZE + lz] + world_min_y
                 } else {
-                    63
+                    sea_level
                 }
             })
         };
 
-        let mut ctx = SurfaceContext::new(
+        let mut ctx = SurfaceContext::new_with_height(
             system.clone(),
             sea_level,
-            get_biome,
+            world_min_y,
+            CHUNK_HEIGHT as i32,
+            Box::new(biome_provider),
             get_preliminary_surface,
         );
 
@@ -794,43 +864,43 @@ impl SurfaceSystem {
 
                 let mut stone_above_depth = 0;
                 let mut water_height = i32::MIN;
-                let mut next_ceiling_stone_y = i32::MAX;
-
                 let end_y = 0;
+
+                // The Java implementation tracks the nearest opening below
+                // each stone block. Precompute that depth bottom-up once per
+                // column instead of rescanning the entire lower column for
+                // every block (which turns a 384-high column into O(n^2)).
+                let mut stone_below_depth = vec![0i32; (starting_height + 1) as usize];
+                let mut nearest_opening = None;
+                for local_y in end_y..=starting_height {
+                    let block = chunk.get_block(x, local_y as usize, z);
+                    if block.is_air() || block.id == BlockId::Water || block.id == BlockId::Lava {
+                        nearest_opening = Some(local_y);
+                    } else {
+                        stone_below_depth[local_y as usize] = nearest_opening
+                            .map(|opening| local_y - opening)
+                            .unwrap_or(1);
+                    }
+                }
 
                 for y in (end_y..=starting_height).rev() {
                     let blk = chunk.get_block(x, y as usize, z);
+                    let world_y = y + world_min_y;
 
                     if blk.is_air() {
                         stone_above_depth = 0;
                         water_height = i32::MIN;
                     } else if blk.id == BlockId::Water || blk.id == BlockId::Lava {
                         if water_height == i32::MIN {
-                            water_height = y + 1;
+                            water_height = world_y + 1;
                         }
                     } else {
-                        if next_ceiling_stone_y >= y {
-                            next_ceiling_stone_y = i32::MIN;
-                            for lookahead in (end_y..y).rev() {
-                                let nxt = chunk.get_block(x, lookahead as usize, z);
-                                if nxt.is_air() || nxt.id == BlockId::Water || nxt.id == BlockId::Lava {
-                                    next_ceiling_stone_y = lookahead + 1;
-                                    break;
-                                }
-                            }
-                        }
-
                         stone_above_depth += 1;
-                        let stone_below_depth = if next_ceiling_stone_y == i32::MIN {
-                            1
-                        } else {
-                            y - next_ceiling_stone_y + 1
-                        };
-
-                        ctx.update_y(stone_above_depth, stone_below_depth, water_height, y);
+                        let stone_below_depth = stone_below_depth[y as usize];
+                        ctx.update_y(stone_above_depth, stone_below_depth, water_height, world_y);
 
                         if blk.id == system.default_block {
-                            if let Some(new_state) = rule.try_apply(&mut ctx, block_x, y, block_z) {
+                            if let Some(new_state) = rule.try_apply(&mut ctx, block_x, world_y, block_z) {
                                 chunk.set_block(x, y as usize, z, Block::new(new_state));
                             }
                         }
@@ -863,10 +933,10 @@ fn generate_bands(random: &mut NoiseSeed) -> Vec<BlockId> {
             break;
         }
         bands[start] = BlockId::WhiteTerracotta;
-        if start > 0 && random.next_double() < 0.5 {
+        if start > 0 && random.next_boolean() {
             bands[start - 1] = BlockId::LightGrayTerracotta;
         }
-        if start + 1 < bands.len() && random.next_double() < 0.5 {
+        if start + 1 < bands.len() && random.next_boolean() {
             bands[start + 1] = BlockId::LightGrayTerracotta;
         }
         start += 4 + random.next_int(16) as usize;
@@ -919,6 +989,12 @@ fn positional_hash(base_seed: u64, x: i32, y: i32, z: i32) -> u64 {
     h ^= z as u64;
     h = h.wrapping_mul(0x9e3779b97f4a7c15);
     h
+}
+
+fn seeded_surface_noise(positional: &PositionalRandomFactory, key: NoiseKey) -> NoiseHandle {
+    let mut random = positional.from_hash_of(&format!("minecraft:{}", key.name()));
+    let parameters = crate::world::world_gen::noise_router::create_noise_parameters(&key);
+    NoiseHandle::new(NormalNoise::create(&mut random, &parameters))
 }
 
 fn clamped_map(value: f64, from_start: f64, from_end: f64, to_start: f64, to_end: f64) -> f64 {
@@ -991,7 +1067,7 @@ impl OreVeinifier {
         vein_toggle: &dyn DensityFunction,
         vein_ridged: &dyn DensityFunction,
         vein_gap: &dyn DensityFunction,
-        ore_veins_random_seed: u64,
+        ore_veins_random: &PositionalRandomFactory,
         pos: &dyn FunctionContext,
     ) -> Option<BlockId> {
         let ore_veininess_noise = vein_toggle.compute(pos);
@@ -1019,14 +1095,9 @@ impl OreVeinifier {
             return None;
         }
 
-        let mut rng = NoiseSeed::new(positional_hash(
-            ore_veins_random_seed,
-            pos.block_x(),
-            pos.block_y(),
-            pos.block_z(),
-        ));
+        let mut rng = ore_veins_random.at(pos.block_x(), pos.block_y(), pos.block_z());
 
-        if rng.next_double() > 0.7 {
+        if rng.next_float() > 0.7 {
             return None;
         }
 
@@ -1036,8 +1107,8 @@ impl OreVeinifier {
 
         let richness = clamped_map(veininess_ridged, 0.4, 0.6, 0.1, 0.3);
 
-        if rng.next_double() < richness && vein_gap.compute(pos) > -0.3 {
-            if rng.next_double() < 0.02 {
+        if rng.next_float() as f64 <= richness && vein_gap.compute(pos) > -0.3 {
+            if rng.next_float() < 0.02 {
                 Some(vein_type.raw_ore_block())
             } else {
                 Some(vein_type.ore())
@@ -1293,79 +1364,35 @@ pub fn generate_surface(
     surface_rule: &dyn RuleSourceEx,
     sea_level: i32,
 ) {
-    let zero_seed = 0u64;
-
-    let surface_noise = NoiseHandle::new(NormalNoise::create(
-        &mut NoiseSeed::new(zero_seed),
-        &crate::world::world_gen::noise_router::create_noise_parameters(
-            &crate::world::world_gen::noise::NoiseKey::Surface,
-        ),
-    ));
-    let surface_secondary_noise = NoiseHandle::new(NormalNoise::create(
-        &mut NoiseSeed::new(zero_seed),
-        &crate::world::world_gen::noise_router::create_noise_parameters(
-            &crate::world::world_gen::noise::NoiseKey::SurfaceSecondary,
-        ),
-    ));
-    let clay_bands_offset_noise = NoiseHandle::new(NormalNoise::create(
-        &mut NoiseSeed::new(zero_seed),
-        &crate::world::world_gen::noise_router::create_noise_parameters(
-            &crate::world::world_gen::noise::NoiseKey::ClayBandsOffset,
-        ),
-    ));
-    let badlands_pillar_noise = NoiseHandle::new(NormalNoise::create(
-        &mut NoiseSeed::new(zero_seed),
-        &crate::world::world_gen::noise_router::create_noise_parameters(
-            &crate::world::world_gen::noise::NoiseKey::BadlandsPillar,
-        ),
-    ));
-    let badlands_pillar_roof_noise = NoiseHandle::new(NormalNoise::create(
-        &mut NoiseSeed::new(zero_seed),
-        &crate::world::world_gen::noise_router::create_noise_parameters(
-            &crate::world::world_gen::noise::NoiseKey::BadlandsPillarRoof,
-        ),
-    ));
-    let badlands_surface_noise = NoiseHandle::new(NormalNoise::create(
-        &mut NoiseSeed::new(zero_seed),
-        &crate::world::world_gen::noise_router::create_noise_parameters(
-            &crate::world::world_gen::noise::NoiseKey::BadlandsSurface,
-        ),
-    ));
-    let iceberg_pillar_noise = NoiseHandle::new(NormalNoise::create(
-        &mut NoiseSeed::new(zero_seed),
-        &crate::world::world_gen::noise_router::create_noise_parameters(
-            &crate::world::world_gen::noise::NoiseKey::IcebergPillar,
-        ),
-    ));
-    let iceberg_pillar_roof_noise = NoiseHandle::new(NormalNoise::create(
-        &mut NoiseSeed::new(zero_seed),
-        &crate::world::world_gen::noise_router::create_noise_parameters(
-            &crate::world::world_gen::noise::NoiseKey::IcebergPillarRoof,
-        ),
-    ));
-    let iceberg_surface_noise = NoiseHandle::new(NormalNoise::create(
-        &mut NoiseSeed::new(zero_seed),
-        &crate::world::world_gen::noise_router::create_noise_parameters(
-            &crate::world::world_gen::noise::NoiseKey::IcebergSurface,
-        ),
-    ));
-
-    let system_ref = SurfaceSystem::create_ref(
-        BlockId::Stone,
+    // This wrapper has no seed parameter for compatibility with existing
+    // callers. Seed-aware callers should use generate_surface_with_biome_provider.
+    generate_surface_with_biome_provider(
+        chunk,
+        _router,
+        surface_rule,
         sea_level,
-        zero_seed,
-        surface_noise,
-        surface_secondary_noise,
-        clay_bands_offset_noise,
-        badlands_pillar_noise,
-        badlands_pillar_roof_noise,
-        badlands_surface_noise,
-        iceberg_pillar_noise,
-        iceberg_pillar_roof_noise,
-        iceberg_surface_noise,
+        0,
+        |_, _, _| Biome::Plains,
     );
+}
 
-    SurfaceSystem::build_surface(system_ref, chunk, surface_rule, sea_level);
+pub fn generate_surface_with_biome_provider(
+    chunk: &mut Chunk,
+    _router: &NoiseRouter,
+    surface_rule: &dyn RuleSourceEx,
+    sea_level: i32,
+    world_seed: u64,
+    biome_provider: impl Fn(i32, i32, i32) -> Biome + Send + Sync + 'static,
+) {
+    let system_ref = SurfaceSystem::create_ref_from_seed(BlockId::Stone, sea_level, world_seed);
+    SurfaceSystem::build_surface_with_biome_provider(
+        system_ref,
+        chunk,
+        surface_rule,
+        sea_level,
+        0,
+        biome_provider,
+    );
 }
 
 /// Simple biome-to-surface-block mapping without the full rule system.
@@ -1426,8 +1453,47 @@ mod tests {
             block_z: 0,
         };
 
-        let result = OreVeinifier::apply(&constant_neg, &constant_pos, &constant_gap, 42, &pos);
+        let base_random = NoiseSeed::new(42).fork_positional();
+        let ore_random = base_random.from_hash_of("minecraft:ore").fork_positional();
+        let result = OreVeinifier::apply(
+            &constant_neg,
+            &constant_pos,
+            &constant_gap,
+            &ore_random,
+            &pos,
+        );
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_ore_veinifier_uses_positional_random_factory() {
+        let toggle = constant(0.5);
+        let ridged = constant(-0.5);
+        let gap = constant(0.0);
+        let base_random = NoiseSeed::new(42).fork_positional();
+        let ore_random = base_random.from_hash_of("minecraft:ore").fork_positional();
+
+        let mut produced = false;
+        for x in -8..=8 {
+            for y in -60..=50 {
+                for z in -8..=8 {
+                    let pos = SinglePointContext {
+                        block_x: x,
+                        block_y: y,
+                        block_z: z,
+                    };
+                    produced |= OreVeinifier::apply(
+                        &toggle,
+                        &ridged,
+                        &gap,
+                        &ore_random,
+                        &pos,
+                    )
+                    .is_some();
+                }
+            }
+        }
+        assert!(produced);
     }
 
     #[test]
@@ -1451,6 +1517,44 @@ mod tests {
 
         let result = clamped_map(2.0, 0.0, 1.0, 0.0, 10.0);
         assert!((result - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn seeded_surface_noise_uses_world_positional_factory() {
+        let seed = 0x5eed_u64;
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, seed);
+
+        let mut world_random = NoiseSeed::new(seed);
+        let positional = world_random.fork_positional();
+        let mut random = positional.from_hash_of("minecraft:surface");
+        let parameters = crate::world::world_gen::noise_router::create_noise_parameters(&NoiseKey::Surface);
+        let expected = NormalNoise::create(&mut random, &parameters).get_value(12.5, 0.0, -8.25);
+
+        assert_eq!(system.surface_noise.sample(12.5, 0.0, -8.25), expected);
+        assert_ne!(
+            system.surface_noise.sample(12.5, 0.0, -8.25),
+            SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, seed.wrapping_add(1))
+                .surface_noise
+                .sample(12.5, 0.0, -8.25)
+        );
+    }
+
+    #[test]
+    fn surface_depth_uses_deterministic_positional_coordinate_random() {
+        let seed = 0x1234_5678_u64;
+        let block_x = 12345;
+        let block_z = -54321;
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, seed);
+
+        let mut world_random = NoiseSeed::new(seed);
+        let positional = world_random.fork_positional();
+        let mut coordinate_random = positional.at(block_x, 0, block_z);
+        let expected = (system.surface_noise.sample(block_x as f64, 0.0, block_z as f64) * 2.75
+            + 3.0
+            + coordinate_random.next_double() * 0.25) as i32;
+
+        assert_eq!(system.get_surface_depth(block_x, block_z), expected);
+        assert_eq!(system.get_surface_depth(block_x, block_z), expected);
     }
 
     #[test]

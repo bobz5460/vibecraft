@@ -8,6 +8,7 @@
 
 use crate::world::world_gen::density_fn::*;
 use crate::world::world_gen::noise::*;
+use crate::world::world_gen::terrain::{overworld_factor, overworld_jaggedness, overworld_offset};
 
 // ---------------------------------------------------------------------------
 // Bridge: implement NoiseSampler for NormalNoise so it can be used with
@@ -54,7 +55,7 @@ const BLENDING_FACTOR_VALUE: f64 = 10.0;
 
 // Vein Y bounds from OreVeinifier.VeinType
 const VEIN_MIN_Y: i32 = -60;
-const VEIN_MAX_Y: i32 = 56;
+const VEIN_MAX_Y: i32 = 50;
 
 // Noodle Y bounds
 const NOODLE_MIN_Y: i32 = -60;
@@ -505,65 +506,47 @@ impl NoiseRouterData {
     // Terrain spline providers (approximations of TerrainProvider)
     // ------------------------------------------------------------------
 
-    /// Approximates `TerrainProvider.overworldOffset(continents, erosion, ridges, amplified)`.
-    ///
-    /// Returns a DenseFn that combines the three inputs into a terrain
-    /// height offset value using approximated spline-like behavior.
+    /// Uses the actual TerrainProvider cubic spline for overworld offset.
     fn terrain_offset(
-        _continents: DenseFn,
-        _erosion: DenseFn,
-        _ridges: DenseFn,
+        continents: DenseFn,
+        erosion: DenseFn,
+        ridges: DenseFn,
         amplified: bool,
     ) -> DenseFn {
-        // Approximated: continents dominates the offset, erosion modulates,
-        // and ridges adds mountain variation.
-        let extra = if amplified { constant(0.3) } else { constant(0.0) };
-        add(add(_continents, mul(_erosion, constant(-0.4))), add(mul(_ridges, constant(0.2)), extra))
+        let c = SplineCoordinate(continents);
+        let e = SplineCoordinate(erosion);
+        let r = SplineCoordinate(ridges);
+        DenseFn(Box::new(overworld_offset(c, e, r, amplified)))
     }
 
-    /// Approximates `TerrainProvider.overworldFactor(continents, erosion, weirdness, ridges, amplified)`.
+    /// Uses the actual TerrainProvider cubic spline for overworld factor.
     fn terrain_factor(
-        _continents: DenseFn,
-        _erosion: DenseFn,
-        _weirdness: DenseFn,
-        _ridges: DenseFn,
+        continents: DenseFn,
+        erosion: DenseFn,
+        weirdness: DenseFn,
+        ridges: DenseFn,
         amplified: bool,
     ) -> DenseFn {
-        // Approximated: factor combines continentalness (land gets more
-        // height variation) and weirdness (mountain regions get more), with
-        // amplified boosting everything.
-        let base = add(
-            add(mul(_continents, constant(2.0)), mul(_erosion, constant(0.8))),
-            add(mul(_weirdness, constant(1.5)), mul(_ridges, constant(0.5))),
-        );
-        let clamped = clamp(base, 0.0, 8.0);
-        if amplified {
-            mul(clamped, constant(2.0))
-        } else {
-            mul(clamped, constant(1.0))
-        }
+        let c = SplineCoordinate(continents);
+        let e = SplineCoordinate(erosion);
+        let w = SplineCoordinate(weirdness);
+        let r = SplineCoordinate(ridges);
+        DenseFn(Box::new(overworld_factor(c, e, w, r, amplified)))
     }
 
-    /// Approximates `TerrainProvider.overworldJaggedness(continents, erosion, weirdness, ridges, amplified)`.
+    /// Uses the actual TerrainProvider cubic spline for overworld jaggedness.
     fn terrain_jaggedness(
-        _continents: DenseFn,
-        _erosion: DenseFn,
-        _weirdness: DenseFn,
-        _ridges: DenseFn,
+        continents: DenseFn,
+        erosion: DenseFn,
+        weirdness: DenseFn,
+        ridges: DenseFn,
         amplified: bool,
     ) -> DenseFn {
-        // Approximated: jaggedness is highest in areas with high weirdness
-        // (mountain ridges) and low erosion (not worn down).
-        let base = add(
-            mul(_weirdness, constant(0.6)),
-            mul(_ridges, constant(0.3)),
-        );
-        let clamped = clamp(base, 0.0, 1.0);
-        if amplified {
-            mul(clamped, constant(1.5))
-        } else {
-            clamped
-        }
+        let c = SplineCoordinate(continents);
+        let e = SplineCoordinate(erosion);
+        let w = SplineCoordinate(weirdness);
+        let r = SplineCoordinate(ridges);
+        DenseFn(Box::new(overworld_jaggedness(c, e, w, r, amplified)))
     }
 
     // ------------------------------------------------------------------
@@ -573,14 +556,18 @@ impl NoiseRouterData {
 
     fn register_terrain_noises(
         functions: &mut DensityFnMap,
-        noises: &NoiseMap,
         jagged_noise: DenseFn,
         continents_function: DenseFn,
         erosion_function: DenseFn,
+        ridge_function: DenseFn,
         amplified: bool,
     ) -> DenseFn {
-        let ridge_fn = Self::peaks_and_valleys_fn(noise(noises.ridge.clone(), 1.0, 0.0));
-        let weirdness_fn = Self::peaks_and_valleys_fn(noise(noises.ridge.clone(), 1.0, 0.0));
+        // Java keeps both the raw ridge value ("weirdness") and its
+        // peaks-and-valleys transform ("ridges_folded"). The terrain
+        // offset spline uses the folded value; factor and jaggedness use
+        // both independently.
+        let weirdness_fn = ridge_function;
+        let ridge_fn = Self::peaks_and_valleys_fn(weirdness_fn.clone());
 
         let offset_spline = Self::terrain_offset(
             continents_function.clone(),
@@ -639,22 +626,25 @@ impl NoiseRouterData {
     pub fn create_overworld_router(seed: u64, large_biomes: bool, amplified: bool) -> NoiseRouter {
         let mut functions = DensityFnMap::new();
         let noises = NoiseMap::from_seed(seed, large_biomes);
-        let mut seed_gen = NoiseSeed::new(seed);
+        let mut root_random = NoiseSeed::new(seed);
+        let positional = root_random.fork_positional();
 
         // --- Y function ---
         // below_bottom = -128, above_top = 640 (DimensionType.MIN_Y=-64, MAX_Y=320, *2)
         functions.y = y_clamped_gradient(-128, 640, -128.0, 640.0);
 
         // --- Shift X/Z ---
+        let mut shift_random = positional.from_hash_of("minecraft:offset");
         let shift_noise = NoiseHandle::new(NormalNoise::create(
-            &mut NoiseSeed::from_hash_of(seed, "offset"),
+            &mut shift_random,
             &create_noise_parameters(&NoiseKey::Shift),
         ));
         let shift_x = flat_cache(cache2d(shift_a(shift_noise.clone())));
         let shift_z = flat_cache(cache2d(shift_b(shift_noise)));
 
         // --- Base 3D noise (BlendedNoise) ---
-        functions.base_3d_noise = create_blended_noise(&mut seed_gen, 0.25, 0.125, 80.0, 160.0, 8.0);
+        let mut terrain_random = positional.from_hash_of("minecraft:terrain");
+        functions.base_3d_noise = create_blended_noise(&mut terrain_random, 0.25, 0.125, 80.0, 160.0, 8.0);
 
         // --- Continentalness, erosion, ridge ---
         let continents_key = if large_biomes {
@@ -677,13 +667,17 @@ impl NoiseRouterData {
         } else {
             NoiseKey::Vegetation
         };
+        let mut continents_random = positional.from_hash_of(&format!("minecraft:{}", continents_key.name()));
+        let mut erosion_random = positional.from_hash_of(&format!("minecraft:{}", erosion_key.name()));
+        let mut ridge_random = positional.from_hash_of("minecraft:ridge");
+        let mut jagged_random = positional.from_hash_of("minecraft:jagged");
 
         let continents = flat_cache(shifted_noise_2d(
             shift_x.clone(),
             shift_z.clone(),
             0.25,
             NoiseHandle::new(NormalNoise::create(
-                &mut NoiseSeed::from_hash_of(seed, continents_key.name()),
+                &mut continents_random,
                 &create_noise_parameters(&continents_key),
             )),
         ));
@@ -693,7 +687,7 @@ impl NoiseRouterData {
             shift_z.clone(),
             0.25,
             NoiseHandle::new(NormalNoise::create(
-                &mut NoiseSeed::from_hash_of(seed, erosion_key.name()),
+                &mut erosion_random,
                 &create_noise_parameters(&erosion_key),
             )),
         ));
@@ -703,7 +697,7 @@ impl NoiseRouterData {
             shift_z.clone(),
             0.25,
             NoiseHandle::new(NormalNoise::create(
-                &mut NoiseSeed::from_hash_of(seed, "ridge"),
+                &mut ridge_random,
                 &create_noise_parameters(&NoiseKey::Ridge),
             )),
         ));
@@ -711,22 +705,22 @@ impl NoiseRouterData {
         functions.ridges_folded = Self::peaks_and_valleys_fn(ridge.clone());
 
         // --- Jagged noise ---
-        let jagged_noise = half_negative(noise(
+        let jagged_noise = noise(
             NoiseHandle::new(NormalNoise::create(
-                &mut NoiseSeed::from_hash_of(seed, "jagged"),
+                &mut jagged_random,
                 &create_noise_parameters(&NoiseKey::Jagged),
             )),
             1500.0,
             0.0,
-        ));
+        );
 
         // --- Register terrain noises (offset, factor, depth, jaggedness, sloped_cheese) ---
         let sloped_cheese = Self::register_terrain_noises(
             &mut functions,
-            &noises,
             jagged_noise,
-            continents,
-            erosion,
+            continents.clone(),
+            erosion.clone(),
+            ridge.clone(),
             amplified,
         );
 
@@ -805,12 +799,14 @@ impl NoiseRouterData {
         let vein_gap = noise(noises.ore_gap.clone(), 1.0, 1.0);
 
         // --- Temperature & vegetation ---
+        let mut temperature_random = positional.from_hash_of(&format!("minecraft:{}", temp_key.name()));
+        let mut vegetation_random = positional.from_hash_of(&format!("minecraft:{}", veg_key.name()));
         let temperature = shifted_noise_2d(
             shift_x.clone(),
             shift_z.clone(),
             0.25,
             NoiseHandle::new(NormalNoise::create(
-                &mut NoiseSeed::from_hash_of(seed, temp_key.name()),
+                &mut temperature_random,
                 &create_noise_parameters(&temp_key),
             )),
         );
@@ -820,15 +816,15 @@ impl NoiseRouterData {
             shift_z,
             0.25,
             NoiseHandle::new(NormalNoise::create(
-                &mut NoiseSeed::from_hash_of(seed, veg_key.name()),
+                &mut vegetation_random,
                 &create_noise_parameters(&veg_key),
             )),
         );
 
         // --- Aquifer noises ---
-        let barrier_noise = noise(noises.aquifer_barrier.clone(), 0.5, 0.5);
-        let fluid_floodedness = noise(noises.aquifer_fluid_floodedness.clone(), 0.67, 0.67);
-        let fluid_spread = noise(noises.aquifer_fluid_spread.clone(), 0.7142857142857143, 0.7142857142857143);
+        let barrier_noise = noise(noises.aquifer_barrier.clone(), 1.0, 0.5);
+        let fluid_floodedness = noise(noises.aquifer_fluid_floodedness.clone(), 1.0, 0.67);
+        let fluid_spread = noise(noises.aquifer_fluid_spread.clone(), 1.0, 0.7142857142857143);
         let lava_noise = noise(noises.aquifer_lava.clone(), 1.0, 1.0);
 
         NoiseRouter {
@@ -838,16 +834,8 @@ impl NoiseRouterData {
             lava_noise,
             temperature,
             vegetation,
-            continents: if large_biomes {
-                noise(noises.continentalness_large.clone(), 1.0, 0.0)
-            } else {
-                noise(noises.continentalness.clone(), 1.0, 0.0)
-            },
-            erosion: if large_biomes {
-                noise(noises.erosion_large.clone(), 1.0, 0.0)
-            } else {
-                noise(noises.erosion.clone(), 1.0, 0.0)
-            },
+            continents,
+            erosion,
             depth: functions.depth,
             ridges: ridge,
             preliminary_surface_level: preliminary_surface,
@@ -1069,8 +1057,7 @@ impl DensityFunction for BlendedNoiseDensity {
             pow /= 2.0;
         }
 
-        let blended = (blend_min / 512.0) + (blend_max / 512.0 - blend_min / 512.0) * factor;
-        blended / 128.0
+        (blend_min / 512.0) + (blend_max / 512.0 - blend_min / 512.0) * factor
     }
 
     fn min_value(&self) -> f64 {
@@ -1166,56 +1153,58 @@ impl NoiseMap {
         let veg_key = if large_biomes { NoiseKey::VegetationLarge } else { NoiseKey::Vegetation };
         let cont_key = if large_biomes { NoiseKey::ContinentalnessLarge } else { NoiseKey::Continentalness };
         let eros_key = if large_biomes { NoiseKey::ErosionLarge } else { NoiseKey::Erosion };
+        let mut root_random = NoiseSeed::new(seed);
+        let positional = root_random.fork_positional();
 
         NoiseMap {
-            temperature: Self::create_noise(seed, &temp_key),
-            vegetation: Self::create_noise(seed, &veg_key),
-            continentalness: Self::create_noise(seed, &cont_key),
-            erosion: Self::create_noise(seed, &eros_key),
-            temperature_large: Self::create_noise(seed, &NoiseKey::TemperatureLarge),
-            vegetation_large: Self::create_noise(seed, &NoiseKey::VegetationLarge),
-            continentalness_large: Self::create_noise(seed, &NoiseKey::ContinentalnessLarge),
-            erosion_large: Self::create_noise(seed, &NoiseKey::ErosionLarge),
-            ridge: Self::create_noise(seed, &NoiseKey::Ridge),
-            shift: Self::create_noise(seed, &NoiseKey::Shift),
-            aquifer_barrier: Self::create_noise(seed, &NoiseKey::AquiferBarrier),
-            aquifer_fluid_floodedness: Self::create_noise(seed, &NoiseKey::AquiferFluidLevelFloodedness),
-            aquifer_lava: Self::create_noise(seed, &NoiseKey::AquiferLava),
-            aquifer_fluid_spread: Self::create_noise(seed, &NoiseKey::AquiferFluidLevelSpread),
-            pillar: Self::create_noise(seed, &NoiseKey::Pillar),
-            pillar_rareness: Self::create_noise(seed, &NoiseKey::PillarRareness),
-            pillar_thickness: Self::create_noise(seed, &NoiseKey::PillarThickness),
-            spaghetti_2d: Self::create_noise(seed, &NoiseKey::Spaghetti2d),
-            spaghetti_2d_elevation: Self::create_noise(seed, &NoiseKey::Spaghetti2dElevation),
-            spaghetti_2d_modulator: Self::create_noise(seed, &NoiseKey::Spaghetti2dModulator),
-            spaghetti_2d_thickness: Self::create_noise(seed, &NoiseKey::Spaghetti2dThickness),
-            spaghetti_3d_1: Self::create_noise(seed, &NoiseKey::Spaghetti3d1),
-            spaghetti_3d_2: Self::create_noise(seed, &NoiseKey::Spaghetti3d2),
-            spaghetti_3d_rarity: Self::create_noise(seed, &NoiseKey::Spaghetti3dRarity),
-            spaghetti_3d_thickness: Self::create_noise(seed, &NoiseKey::Spaghetti3dThickness),
-            spaghetti_roughness: Self::create_noise(seed, &NoiseKey::SpaghettiRoughness),
-            spaghetti_roughness_modulator: Self::create_noise(seed, &NoiseKey::SpaghettiRoughnessModulator),
-            cave_entrance: Self::create_noise(seed, &NoiseKey::CaveEntrance),
-            cave_layer: Self::create_noise(seed, &NoiseKey::CaveLayer),
-            cave_cheese: Self::create_noise(seed, &NoiseKey::CaveCheese),
-            ore_veininess: Self::create_noise(seed, &NoiseKey::OreVeininess),
-            ore_vein_a: Self::create_noise(seed, &NoiseKey::OreVeinA),
-            ore_vein_b: Self::create_noise(seed, &NoiseKey::OreVeinB),
-            ore_gap: Self::create_noise(seed, &NoiseKey::OreGap),
-            noodle: Self::create_noise(seed, &NoiseKey::Noodle),
-            noodle_thickness: Self::create_noise(seed, &NoiseKey::NoodleThickness),
-            noodle_ridge_a: Self::create_noise(seed, &NoiseKey::NoodleRidgeA),
-            noodle_ridge_b: Self::create_noise(seed, &NoiseKey::NoodleRidgeB),
-            jagged: Self::create_noise(seed, &NoiseKey::Jagged),
-            surface: Self::create_noise(seed, &NoiseKey::Surface),
-            surface_secondary: Self::create_noise(seed, &NoiseKey::SurfaceSecondary),
-            clay_bands_offset: Self::create_noise(seed, &NoiseKey::ClayBandsOffset),
+            temperature: Self::create_noise(&positional, &temp_key),
+            vegetation: Self::create_noise(&positional, &veg_key),
+            continentalness: Self::create_noise(&positional, &cont_key),
+            erosion: Self::create_noise(&positional, &eros_key),
+            temperature_large: Self::create_noise(&positional, &NoiseKey::TemperatureLarge),
+            vegetation_large: Self::create_noise(&positional, &NoiseKey::VegetationLarge),
+            continentalness_large: Self::create_noise(&positional, &NoiseKey::ContinentalnessLarge),
+            erosion_large: Self::create_noise(&positional, &NoiseKey::ErosionLarge),
+            ridge: Self::create_noise(&positional, &NoiseKey::Ridge),
+            shift: Self::create_noise(&positional, &NoiseKey::Shift),
+            aquifer_barrier: Self::create_noise(&positional, &NoiseKey::AquiferBarrier),
+            aquifer_fluid_floodedness: Self::create_noise(&positional, &NoiseKey::AquiferFluidLevelFloodedness),
+            aquifer_lava: Self::create_noise(&positional, &NoiseKey::AquiferLava),
+            aquifer_fluid_spread: Self::create_noise(&positional, &NoiseKey::AquiferFluidLevelSpread),
+            pillar: Self::create_noise(&positional, &NoiseKey::Pillar),
+            pillar_rareness: Self::create_noise(&positional, &NoiseKey::PillarRareness),
+            pillar_thickness: Self::create_noise(&positional, &NoiseKey::PillarThickness),
+            spaghetti_2d: Self::create_noise(&positional, &NoiseKey::Spaghetti2d),
+            spaghetti_2d_elevation: Self::create_noise(&positional, &NoiseKey::Spaghetti2dElevation),
+            spaghetti_2d_modulator: Self::create_noise(&positional, &NoiseKey::Spaghetti2dModulator),
+            spaghetti_2d_thickness: Self::create_noise(&positional, &NoiseKey::Spaghetti2dThickness),
+            spaghetti_3d_1: Self::create_noise(&positional, &NoiseKey::Spaghetti3d1),
+            spaghetti_3d_2: Self::create_noise(&positional, &NoiseKey::Spaghetti3d2),
+            spaghetti_3d_rarity: Self::create_noise(&positional, &NoiseKey::Spaghetti3dRarity),
+            spaghetti_3d_thickness: Self::create_noise(&positional, &NoiseKey::Spaghetti3dThickness),
+            spaghetti_roughness: Self::create_noise(&positional, &NoiseKey::SpaghettiRoughness),
+            spaghetti_roughness_modulator: Self::create_noise(&positional, &NoiseKey::SpaghettiRoughnessModulator),
+            cave_entrance: Self::create_noise(&positional, &NoiseKey::CaveEntrance),
+            cave_layer: Self::create_noise(&positional, &NoiseKey::CaveLayer),
+            cave_cheese: Self::create_noise(&positional, &NoiseKey::CaveCheese),
+            ore_veininess: Self::create_noise(&positional, &NoiseKey::OreVeininess),
+            ore_vein_a: Self::create_noise(&positional, &NoiseKey::OreVeinA),
+            ore_vein_b: Self::create_noise(&positional, &NoiseKey::OreVeinB),
+            ore_gap: Self::create_noise(&positional, &NoiseKey::OreGap),
+            noodle: Self::create_noise(&positional, &NoiseKey::Noodle),
+            noodle_thickness: Self::create_noise(&positional, &NoiseKey::NoodleThickness),
+            noodle_ridge_a: Self::create_noise(&positional, &NoiseKey::NoodleRidgeA),
+            noodle_ridge_b: Self::create_noise(&positional, &NoiseKey::NoodleRidgeB),
+            jagged: Self::create_noise(&positional, &NoiseKey::Jagged),
+            surface: Self::create_noise(&positional, &NoiseKey::Surface),
+            surface_secondary: Self::create_noise(&positional, &NoiseKey::SurfaceSecondary),
+            clay_bands_offset: Self::create_noise(&positional, &NoiseKey::ClayBandsOffset),
         }
     }
 
-    fn create_noise(seed: u64, key: &NoiseKey) -> NoiseHandle {
+    fn create_noise(positional: &PositionalRandomFactory, key: &NoiseKey) -> NoiseHandle {
         let params = create_noise_parameters(key);
-        let mut rng = NoiseSeed::from_hash_of(seed, key.name());
+        let mut rng = positional.from_hash_of(&format!("minecraft:{}", key.name()));
         NoiseHandle::new(NormalNoise::create(&mut rng, &params))
     }
 }
@@ -1284,59 +1273,229 @@ fn noise_fn(handle: NoiseHandle, xz_scale: f64, y_scale: f64) -> DenseFn {
 /// Returns the `NoiseParameters` (first_octave + amplitudes) that match
 /// Minecraft's noise definitions for each key.
 pub fn create_noise_parameters(key: &NoiseKey) -> NoiseParameters {
+    fn parameters(first_octave: i32, first_amplitude: f64, amplitudes: &[f64]) -> NoiseParameters {
+        NoiseParameters::from_first(first_octave, first_amplitude, amplitudes)
+    }
+
     match key {
-        NoiseKey::Temperature => NoiseParameters::from_slice(-9, &[1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Vegetation => NoiseParameters::from_slice(-8, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Continentalness => NoiseParameters::from_slice(-9, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Erosion => NoiseParameters::from_slice(-9, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::TemperatureLarge => NoiseParameters::from_slice(-10, &[1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::VegetationLarge => NoiseParameters::from_slice(-9, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::ContinentalnessLarge => NoiseParameters::from_slice(-10, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::ErosionLarge => NoiseParameters::from_slice(-10, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Ridge => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Shift => NoiseParameters::from_slice(-6, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Jagged => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        NoiseKey::Temperature => parameters(-10, 1.5, &[0.0, 1.0, 0.0, 0.0, 0.0]),
+        NoiseKey::Vegetation => parameters(-8, 1.0, &[1.0, 0.0, 0.0, 0.0, 0.0]),
+        NoiseKey::Continentalness => parameters(-9, 1.0, &[1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0]),
+        NoiseKey::Erosion => parameters(-9, 1.0, &[1.0, 0.0, 1.0, 1.0]),
+        NoiseKey::TemperatureLarge => parameters(-12, 1.5, &[0.0, 1.0, 0.0, 0.0, 0.0]),
+        NoiseKey::VegetationLarge => parameters(-10, 1.0, &[1.0, 0.0, 0.0, 0.0, 0.0]),
+        NoiseKey::ContinentalnessLarge => parameters(-11, 1.0, &[1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0]),
+        NoiseKey::ErosionLarge => parameters(-11, 1.0, &[1.0, 0.0, 1.0, 1.0]),
+        NoiseKey::Ridge => parameters(-7, 1.0, &[2.0, 1.0, 0.0, 0.0, 0.0]),
+        NoiseKey::Shift => parameters(-3, 1.0, &[1.0, 1.0, 0.0]),
+        NoiseKey::TemperatureNether => parameters(-7, 1.0, &[1.0]),
+        NoiseKey::VegetationNether => parameters(-7, 1.0, &[1.0]),
 
         // Cave noises
-        NoiseKey::Spaghetti2d => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Spaghetti2dElevation => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Spaghetti2dModulator => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Spaghetti2dThickness => NoiseParameters::from_slice(-4, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Spaghetti3d1 => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Spaghetti3d2 => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Spaghetti3dRarity => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Spaghetti3dThickness => NoiseParameters::from_slice(-4, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::SpaghettiRoughness => NoiseParameters::from_slice(-6, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::SpaghettiRoughnessModulator => NoiseParameters::from_slice(-4, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::CaveEntrance => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::CaveLayer => NoiseParameters::from_slice(-1, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::CaveCheese => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::OreVeininess => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::OreVeinA => NoiseParameters::from_slice(-6, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::OreVeinB => NoiseParameters::from_slice(-6, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::OreGap => NoiseParameters::from_slice(-6, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::Noodle => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::NoodleThickness => NoiseParameters::from_slice(-4, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::NoodleRidgeA => NoiseParameters::from_slice(-6, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::NoodleRidgeB => NoiseParameters::from_slice(-6, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        NoiseKey::Spaghetti2d => parameters(-7, 1.0, &[]),
+        NoiseKey::Spaghetti2dElevation => parameters(-8, 1.0, &[]),
+        NoiseKey::Spaghetti2dModulator => parameters(-11, 1.0, &[]),
+        NoiseKey::Spaghetti2dThickness => parameters(-11, 1.0, &[]),
+        NoiseKey::Spaghetti3d1 => parameters(-7, 1.0, &[]),
+        NoiseKey::Spaghetti3d2 => parameters(-7, 1.0, &[]),
+        NoiseKey::Spaghetti3dRarity => parameters(-11, 1.0, &[]),
+        NoiseKey::Spaghetti3dThickness => parameters(-8, 1.0, &[]),
+        NoiseKey::SpaghettiRoughness => parameters(-5, 1.0, &[]),
+        NoiseKey::SpaghettiRoughnessModulator => parameters(-8, 1.0, &[]),
+        NoiseKey::CaveEntrance => parameters(-7, 0.4, &[0.5, 1.0]),
+        NoiseKey::CaveLayer => parameters(-8, 1.0, &[]),
+        NoiseKey::CaveCheese => parameters(-8, 0.5, &[1.0, 2.0, 1.0, 2.0, 1.0, 0.0, 2.0, 0.0]),
+        NoiseKey::OreVeininess => parameters(-8, 1.0, &[]),
+        NoiseKey::OreVeinA => parameters(-7, 1.0, &[]),
+        NoiseKey::OreVeinB => parameters(-7, 1.0, &[]),
+        NoiseKey::OreGap => parameters(-5, 1.0, &[]),
+        NoiseKey::Noodle => parameters(-8, 1.0, &[]),
+        NoiseKey::NoodleThickness => parameters(-8, 1.0, &[]),
+        NoiseKey::NoodleRidgeA => parameters(-7, 1.0, &[]),
+        NoiseKey::NoodleRidgeB => parameters(-7, 1.0, &[]),
 
         // Aquifer noises
-        NoiseKey::AquiferBarrier => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::AquiferFluidLevelFloodedness => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::AquiferLava => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::AquiferFluidLevelSpread => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        NoiseKey::AquiferBarrier => parameters(-3, 1.0, &[]),
+        NoiseKey::AquiferFluidLevelFloodedness => parameters(-7, 1.0, &[]),
+        NoiseKey::AquiferLava => parameters(-1, 1.0, &[]),
+        NoiseKey::AquiferFluidLevelSpread => parameters(-5, 1.0, &[]),
 
         // Surface noises
-        NoiseKey::Surface => NoiseParameters::from_slice(-6, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::SurfaceSecondary => NoiseParameters::from_slice(-6, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::ClayBandsOffset => NoiseParameters::from_slice(-6, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        NoiseKey::Surface => parameters(-6, 1.0, &[1.0, 1.0]),
+        NoiseKey::SurfaceSecondary => parameters(-6, 1.0, &[1.0, 0.0, 1.0]),
+        NoiseKey::ClayBandsOffset => parameters(-8, 1.0, &[]),
 
         // Pillar noises
-        NoiseKey::Pillar => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::PillarRareness => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        NoiseKey::PillarThickness => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        NoiseKey::Pillar => parameters(-7, 1.0, &[1.0]),
+        NoiseKey::PillarRareness => parameters(-8, 1.0, &[]),
+        NoiseKey::PillarThickness => parameters(-8, 1.0, &[]),
 
-        // Remaining keys (placeholder — same generic params)
-        _ => NoiseParameters::from_slice(-7, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        NoiseKey::BadlandsPillar => parameters(-2, 1.0, &[1.0, 1.0, 1.0]),
+        NoiseKey::BadlandsPillarRoof => parameters(-8, 1.0, &[]),
+        NoiseKey::BadlandsSurface => parameters(-6, 1.0, &[1.0, 1.0]),
+        NoiseKey::IcebergPillar => parameters(-6, 1.0, &[1.0, 1.0, 1.0]),
+        NoiseKey::IcebergPillarRoof => parameters(-3, 1.0, &[]),
+        NoiseKey::IcebergSurface => parameters(-6, 1.0, &[1.0, 1.0]),
+        NoiseKey::SulfurCaveGradient => parameters(-5, 1.0, &[0.0, 1.0]),
+        NoiseKey::Swamp => parameters(-2, 1.0, &[]),
+        NoiseKey::Calcite => parameters(-9, 1.0, &[1.0, 1.0, 1.0]),
+        NoiseKey::Gravel => parameters(-8, 1.0, &[1.0, 1.0, 1.0]),
+        NoiseKey::PowderSnow => parameters(-6, 1.0, &[1.0, 1.0, 1.0]),
+        NoiseKey::PackedIce => parameters(-7, 1.0, &[1.0, 1.0, 1.0]),
+        NoiseKey::Ice => parameters(-4, 1.0, &[1.0, 1.0, 1.0]),
+        NoiseKey::SoulSandLayer => parameters(-8, 1.0, &[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.013333333333333334]),
+        NoiseKey::GravelLayer => parameters(-8, 1.0, &[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.013333333333333334]),
+        NoiseKey::Patch => parameters(-5, 1.0, &[0.0, 0.0, 0.0, 0.0, 0.013333333333333334]),
+        NoiseKey::Netherrack => parameters(-3, 1.0, &[0.0, 0.0, 0.35]),
+        NoiseKey::NetherWart => parameters(-3, 1.0, &[0.0, 0.0, 0.9]),
+        NoiseKey::NetherStateSelector => parameters(-4, 1.0, &[]),
+
+        NoiseKey::Jagged => parameters(-16, 1.0, &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_parameters(key: NoiseKey, first_octave: i32, amplitudes: &[f64]) {
+        let actual = create_noise_parameters(&key);
+        assert_eq!(actual.first_octave, first_octave, "{} first octave", key.name());
+        assert_eq!(actual.amplitudes, amplitudes, "{} amplitudes", key.name());
+    }
+
+    #[test]
+    fn noise_parameters_match_minecraft_26_fixtures() {
+        let fixtures = [
+            (NoiseKey::Temperature, -10, &[1.5, 0.0, 1.0, 0.0, 0.0, 0.0][..]),
+            (NoiseKey::Vegetation, -8, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0][..]),
+            (NoiseKey::Continentalness, -9, &[1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0][..]),
+            (NoiseKey::Erosion, -9, &[1.0, 1.0, 0.0, 1.0, 1.0][..]),
+            (NoiseKey::TemperatureLarge, -12, &[1.5, 0.0, 1.0, 0.0, 0.0, 0.0][..]),
+            (NoiseKey::VegetationLarge, -10, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0][..]),
+            (NoiseKey::ContinentalnessLarge, -11, &[1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0][..]),
+            (NoiseKey::ErosionLarge, -11, &[1.0, 1.0, 0.0, 1.0, 1.0][..]),
+            (NoiseKey::Ridge, -7, &[1.0, 2.0, 1.0, 0.0, 0.0, 0.0][..]),
+            (NoiseKey::Shift, -3, &[1.0, 1.0, 1.0, 0.0][..]),
+            (NoiseKey::TemperatureNether, -7, &[1.0, 1.0][..]),
+            (NoiseKey::VegetationNether, -7, &[1.0, 1.0][..]),
+            (NoiseKey::AquiferBarrier, -3, &[1.0][..]),
+            (NoiseKey::AquiferFluidLevelFloodedness, -7, &[1.0][..]),
+            (NoiseKey::AquiferLava, -1, &[1.0][..]),
+            (NoiseKey::AquiferFluidLevelSpread, -5, &[1.0][..]),
+            (NoiseKey::Pillar, -7, &[1.0, 1.0][..]),
+            (NoiseKey::PillarRareness, -8, &[1.0][..]),
+            (NoiseKey::PillarThickness, -8, &[1.0][..]),
+            (NoiseKey::Spaghetti2d, -7, &[1.0][..]),
+            (NoiseKey::Spaghetti2dElevation, -8, &[1.0][..]),
+            (NoiseKey::Spaghetti2dModulator, -11, &[1.0][..]),
+            (NoiseKey::Spaghetti2dThickness, -11, &[1.0][..]),
+            (NoiseKey::Spaghetti3d1, -7, &[1.0][..]),
+            (NoiseKey::Spaghetti3d2, -7, &[1.0][..]),
+            (NoiseKey::Spaghetti3dRarity, -11, &[1.0][..]),
+            (NoiseKey::Spaghetti3dThickness, -8, &[1.0][..]),
+            (NoiseKey::SpaghettiRoughness, -5, &[1.0][..]),
+            (NoiseKey::SpaghettiRoughnessModulator, -8, &[1.0][..]),
+            (NoiseKey::CaveEntrance, -7, &[0.4, 0.5, 1.0][..]),
+            (NoiseKey::CaveLayer, -8, &[1.0][..]),
+            (NoiseKey::CaveCheese, -8, &[0.5, 1.0, 2.0, 1.0, 2.0, 1.0, 0.0, 2.0, 0.0][..]),
+            (NoiseKey::OreVeininess, -8, &[1.0][..]),
+            (NoiseKey::OreVeinA, -7, &[1.0][..]),
+            (NoiseKey::OreVeinB, -7, &[1.0][..]),
+            (NoiseKey::OreGap, -5, &[1.0][..]),
+            (NoiseKey::Noodle, -8, &[1.0][..]),
+            (NoiseKey::NoodleThickness, -8, &[1.0][..]),
+            (NoiseKey::NoodleRidgeA, -7, &[1.0][..]),
+            (NoiseKey::NoodleRidgeB, -7, &[1.0][..]),
+            (NoiseKey::Jagged, -16, &[1.0; 16][..]),
+            (NoiseKey::Surface, -6, &[1.0, 1.0, 1.0][..]),
+            (NoiseKey::SurfaceSecondary, -6, &[1.0, 1.0, 0.0, 1.0][..]),
+            (NoiseKey::ClayBandsOffset, -8, &[1.0][..]),
+            (NoiseKey::BadlandsPillar, -2, &[1.0, 1.0, 1.0, 1.0][..]),
+            (NoiseKey::BadlandsPillarRoof, -8, &[1.0][..]),
+            (NoiseKey::BadlandsSurface, -6, &[1.0, 1.0, 1.0][..]),
+            (NoiseKey::IcebergPillar, -6, &[1.0, 1.0, 1.0, 1.0][..]),
+            (NoiseKey::IcebergPillarRoof, -3, &[1.0][..]),
+            (NoiseKey::IcebergSurface, -6, &[1.0, 1.0, 1.0][..]),
+            (NoiseKey::SulfurCaveGradient, -5, &[1.0, 0.0, 1.0][..]),
+            (NoiseKey::Swamp, -2, &[1.0][..]),
+            (NoiseKey::Calcite, -9, &[1.0, 1.0, 1.0, 1.0][..]),
+            (NoiseKey::Gravel, -8, &[1.0, 1.0, 1.0, 1.0][..]),
+            (NoiseKey::PowderSnow, -6, &[1.0, 1.0, 1.0, 1.0][..]),
+            (NoiseKey::PackedIce, -7, &[1.0, 1.0, 1.0, 1.0][..]),
+            (NoiseKey::Ice, -4, &[1.0, 1.0, 1.0, 1.0][..]),
+            (NoiseKey::SoulSandLayer, -8, &[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.013333333333333334][..]),
+            (NoiseKey::GravelLayer, -8, &[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.013333333333333334][..]),
+            (NoiseKey::Patch, -5, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.013333333333333334][..]),
+            (NoiseKey::Netherrack, -3, &[1.0, 0.0, 0.0, 0.35][..]),
+            (NoiseKey::NetherWart, -3, &[1.0, 0.0, 0.0, 0.9][..]),
+            (NoiseKey::NetherStateSelector, -4, &[1.0][..]),
+        ];
+
+        for (key, first_octave, amplitudes) in fixtures {
+            assert_parameters(key, first_octave, amplitudes);
+        }
+    }
+
+    #[test]
+    fn overworld_router_uses_resource_hashed_shifted_biome_noises() {
+        let seed = 42;
+        let router = NoiseRouterData::create_overworld_router(seed, false, false);
+        let mut root = NoiseSeed::new(seed);
+        let positional = root.fork_positional();
+
+        let mut shift_random = positional.from_hash_of("minecraft:offset");
+        let shift = NoiseHandle::new(NormalNoise::create(
+            &mut shift_random,
+            &create_noise_parameters(&NoiseKey::Shift),
+        ));
+        let shift_x = flat_cache(cache2d(shift_a(shift.clone())));
+        let shift_z = flat_cache(cache2d(shift_b(shift)));
+        let ctx = SinglePointContext { block_x: 123, block_y: -37, block_z: -456 };
+
+        let mut ridge_random = positional.from_hash_of("minecraft:ridge");
+        let ridge = shifted_noise_2d(
+            shift_x.clone(),
+            shift_z.clone(),
+            0.25,
+            NoiseHandle::new(NormalNoise::create(
+                &mut ridge_random,
+                &create_noise_parameters(&NoiseKey::Ridge),
+            )),
+        );
+        assert_eq!(router.ridges.compute(&ctx), ridge.compute(&ctx));
+
+        let mut continents_random = positional.from_hash_of("minecraft:continentalness");
+        let continents = shifted_noise_2d(
+            shift_x,
+            shift_z,
+            0.25,
+            NoiseHandle::new(NormalNoise::create(
+                &mut continents_random,
+                &create_noise_parameters(&NoiseKey::Continentalness),
+            )),
+        );
+        assert_eq!(router.continents.compute(&ctx), continents.compute(&ctx));
+    }
+
+    #[test]
+    fn overworld_router_uses_noise_setting_aquifer_scales() {
+        let seed = 42;
+        let router = NoiseRouterData::create_overworld_router(seed, false, false);
+        let noises = NoiseMap::from_seed(seed, false);
+        let ctx = SinglePointContext { block_x: 123, block_y: -37, block_z: -456 };
+
+        assert_eq!(
+            router.barrier_noise.compute(&ctx),
+            noises.aquifer_barrier.sample(123.0, -18.5, -456.0),
+        );
+        assert_eq!(
+            router.fluid_level_floodedness_noise.compute(&ctx),
+            noises.aquifer_fluid_floodedness.sample(123.0, -37.0 * 0.67, -456.0),
+        );
+        assert_eq!(
+            router.fluid_level_spread_noise.compute(&ctx),
+            noises.aquifer_fluid_spread.sample(123.0, -37.0 * 0.7142857142857143, -456.0),
+        );
     }
 }

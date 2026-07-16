@@ -8,12 +8,18 @@ pub trait FunctionContext {
     fn block_x(&self) -> i32;
     fn block_y(&self) -> i32;
     fn block_z(&self) -> i32;
+    fn sample_interpolated(&self, _function: &DenseFn) -> Option<f64> {
+        None
+    }
 }
 
 impl FunctionContext for Box<dyn FunctionContext + '_> {
     fn block_x(&self) -> i32 { (**self).block_x() }
     fn block_y(&self) -> i32 { (**self).block_y() }
     fn block_z(&self) -> i32 { (**self).block_z() }
+    fn sample_interpolated(&self, function: &DenseFn) -> Option<f64> {
+        (**self).sample_interpolated(function)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -33,6 +39,68 @@ impl<'a> FunctionContext for &'a dyn FunctionContext {
     fn block_x(&self) -> i32 { (**self).block_x() }
     fn block_y(&self) -> i32 { (**self).block_y() }
     fn block_z(&self) -> i32 { (**self).block_z() }
+    fn sample_interpolated(&self, function: &DenseFn) -> Option<f64> {
+        (**self).sample_interpolated(function)
+    }
+}
+
+/// A block position inside one noise cell. Only an explicit interpolated
+/// marker asks this context for a cell interpolation; all other functions
+/// observe the exact block coordinate.
+pub struct InterpolatedContext {
+    pub block_x: i32,
+    pub block_y: i32,
+    pub block_z: i32,
+    pub cell_width: i32,
+    pub cell_height: i32,
+}
+
+impl InterpolatedContext {
+    pub const fn new(
+        block_x: i32,
+        block_y: i32,
+        block_z: i32,
+        cell_width: i32,
+        cell_height: i32,
+    ) -> Self {
+        Self { block_x, block_y, block_z, cell_width, cell_height }
+    }
+}
+
+impl FunctionContext for InterpolatedContext {
+    fn block_x(&self) -> i32 { self.block_x }
+    fn block_y(&self) -> i32 { self.block_y }
+    fn block_z(&self) -> i32 { self.block_z }
+
+    fn sample_interpolated(&self, function: &DenseFn) -> Option<f64> {
+        let x0 = self.block_x.div_euclid(self.cell_width) * self.cell_width;
+        let y0 = self.block_y.div_euclid(self.cell_height) * self.cell_height;
+        let z0 = self.block_z.div_euclid(self.cell_width) * self.cell_width;
+        let x1 = x0 + self.cell_width;
+        let y1 = y0 + self.cell_height;
+        let z1 = z0 + self.cell_width;
+        let sample = |x: i32, y: i32, z: i32| {
+            function.compute(&SinglePointContext { block_x: x, block_y: y, block_z: z })
+        };
+        let v000 = sample(x0, y0, z0);
+        let v100 = sample(x1, y0, z0);
+        let v010 = sample(x0, y1, z0);
+        let v110 = sample(x1, y1, z0);
+        let v001 = sample(x0, y0, z1);
+        let v101 = sample(x1, y0, z1);
+        let v011 = sample(x0, y1, z1);
+        let v111 = sample(x1, y1, z1);
+        let fx = (self.block_x - x0) as f64 / self.cell_width as f64;
+        let fy = (self.block_y - y0) as f64 / self.cell_height as f64;
+        let fz = (self.block_z - z0) as f64 / self.cell_width as f64;
+        let x00 = v000 + (v100 - v000) * fx;
+        let x10 = v010 + (v110 - v010) * fx;
+        let x01 = v001 + (v101 - v001) * fx;
+        let x11 = v011 + (v111 - v011) * fx;
+        let y00 = x00 + (x10 - x00) * fy;
+        let y01 = x01 + (x11 - x01) * fy;
+        Some(y00 + (y01 - y00) * fz)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +832,14 @@ impl Clone for Marker {
     fn clone(&self) -> Self { Marker(self.0, self.1.clone()) }
 }
 impl DensityFunction for Marker {
-    fn compute(&self, ctx: &dyn FunctionContext) -> f64 { self.1.compute(ctx) }
+    fn compute(&self, ctx: &dyn FunctionContext) -> f64 {
+        if self.0 == MarkerType::Interpolated {
+            if let Some(value) = ctx.sample_interpolated(&self.1) {
+                return value;
+            }
+        }
+        self.1.compute(ctx)
+    }
     fn fill_array(&self, output: &mut [f64], provider: &dyn ContextProvider) { self.1.fill_array(output, provider); }
     fn min_value(&self) -> f64 {
         if self.0 == MarkerType::BlendDensity { f64::NEG_INFINITY } else { self.1.min_value() }
@@ -1107,6 +1182,18 @@ mod tests {
         assert!((c.compute(&ctx) - 3.0).abs() < 1e-12);
         assert!((c.min_value() - 3.0).abs() < 1e-12);
         assert!((c.max_value() - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn interpolated_marker_only_interpolates_explicit_functions() {
+        let nonlinear = square(y_clamped_gradient(0, 8, 0.0, 8.0));
+        let marked = interpolated(nonlinear.clone());
+        let point = SinglePointContext { block_x: 1, block_y: 4, block_z: 1 };
+        let cell = InterpolatedContext::new(1, 4, 1, 4, 8);
+
+        assert!((nonlinear.compute(&cell) - 16.0).abs() < 1e-12);
+        assert!((marked.compute(&point) - 16.0).abs() < 1e-12);
+        assert!((marked.compute(&cell) - 32.0).abs() < 1e-12);
     }
 
     #[test]

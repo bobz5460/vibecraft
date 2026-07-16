@@ -7,15 +7,23 @@
 
 use std::sync::Arc;
 
-use ::noise::{NoiseFn, Simplex, SuperSimplex};
 use crate::world::block::{Block, BlockId};
-use crate::world::chunk::{Chunk, CHUNK_HEIGHT, CHUNK_SIZE};
+use crate::world::chunk::{Chunk, CHUNK_SIZE};
 use crate::world::world_gen::density_fn::{
-    DensityFunction, SinglePointContext,
+    DensityFunction, InterpolatedContext, SinglePointContext,
 };
-use crate::world::world_gen::noise::NoiseSettings;
+use crate::world::world_gen::noise::{NoiseSeed, NoiseSettings, PositionalRandomFactory};
 use crate::world::world_gen::noise_router::{NoiseRouter, NoiseRouterData};
+use crate::world::world_gen::biome_source::OverworldBiomeSource;
+use crate::world::world_gen::aquifer::NoiseBasedAquifer;
+use crate::world::world_gen::surface::{default_overworld_rules, OreVeinifier, StaticRuleSource, SurfaceSystem};
 use crate::world::world_gen::Biome;
+
+// Refine only the narrow material-boundary band. This removes visible cell
+// steps while keeping the current bounded cell cache practical until the
+// density graph's Java cache wrappers are fully implemented.
+const DENSITY_EXACT_REFINEMENT: f64 = 0.001;
+const DENSITY_BOUNDARY_REFINEMENT: f64 = 0.05;
 
 // ---------------------------------------------------------------------------
 // AquiferData
@@ -408,28 +416,6 @@ fn get_stone_type(y: i32, _noise_val: f64) -> BlockId {
     }
 }
 
-/// Determine the block to place from density, y-level, sea-level, and a noise value.
-fn density_to_block(
-    density: f64,
-    y: i32,
-    sea_level: i32,
-    default_stone: BlockId,
-    default_fluid: BlockId,
-    noise_val: f64,
-) -> BlockId {
-    if density > 0.0 {
-        if default_stone != BlockId::Stone {
-            default_stone
-        } else {
-            get_stone_type(y, noise_val)
-        }
-    } else if y < sea_level {
-        default_fluid
-    } else {
-        BlockId::Air
-    }
-}
-
 // ---------------------------------------------------------------------------
 // VanillaWorldGenerator
 // ---------------------------------------------------------------------------
@@ -443,23 +429,24 @@ pub struct VanillaWorldGenerator {
     pub router: Arc<NoiseRouter>,
     pub settings: NoiseSettings,
     pub aquifer: AquiferData,
-    temp_noise: Simplex,
-    humidity_noise: Simplex,
-    continental_noise: SuperSimplex,
-    weirdness_noise: Simplex,
+    seed: u64,
+    biome_source: OverworldBiomeSource,
+    ore_veins_random: PositionalRandomFactory,
 }
 
 impl VanillaWorldGenerator {
     /// Create a new generator from an existing router.
     pub fn new(router: Arc<NoiseRouter>, seed: u64) -> Self {
+        let biome_source = OverworldBiomeSource::from_router((*router).clone());
+        let random = NoiseSeed::new(seed).fork_positional();
+        let ore_veins_random = random.from_hash_of("minecraft:ore").fork_positional();
         VanillaWorldGenerator {
             router,
             settings: NoiseSettings::OVERWORLD,
             aquifer: AquiferData::overworld(),
-            temp_noise: Simplex::new(seed as u32),
-            humidity_noise: Simplex::new((seed.wrapping_add(1)) as u32),
-            continental_noise: SuperSimplex::new((seed.wrapping_add(2)) as u32),
-            weirdness_noise: Simplex::new((seed.wrapping_add(3)) as u32),
+            seed,
+            biome_source,
+            ore_veins_random,
         }
     }
 
@@ -479,69 +466,17 @@ impl VanillaWorldGenerator {
         self
     }
 
-    fn biome_from_climate(&self, temp: f64, humidity: f64, continental: f64, weirdness: f64) -> Biome {
-        if continental < -0.3 {
-            if temp > 0.3 {
-                if humidity > 0.0 { Biome::LukewarmOcean } else { Biome::WarmOcean }
-            } else if temp > -0.1 { Biome::LukewarmOcean }
-            else if temp > -0.4 { Biome::ColdOcean }
-            else { Biome::FrozenOcean }
-        } else if continental < -0.1 {
-            if temp > 0.3 {
-                if humidity > 0.0 { Biome::DeepLukewarmOcean } else { Biome::DeepWarmOcean }
-            } else if temp > -0.1 { Biome::DeepLukewarmOcean }
-            else if temp > -0.4 { Biome::DeepColdOcean }
-            else { Biome::DeepFrozenOcean }
-        } else if continental < 0.05 {
-            Biome::Beach
-        } else if continental > 0.6 && weirdness > 0.5 {
-            if temp < -0.4 { Biome::JaggedPeaks }
-            else if temp < -0.1 { Biome::FrozenPeaks }
-            else { Biome::StonyPeaks }
-        } else if continental > 0.5 && weirdness > 0.3 {
-            if temp > 0.2 {
-                if humidity > 0.0 { Biome::WindsweptForest } else { Biome::WindsweptSavanna }
-            } else if temp > -0.1 { Biome::WindsweptHills }
-            else if humidity > 0.0 { Biome::WindsweptGravellyHills }
-            else { Biome::WindsweptHills }
-        } else if temp > 0.3 {
-            if humidity > 0.3 {
-                if weirdness > 0.3 { Biome::BambooJungle } else { Biome::Jungle }
-            } else if humidity > -0.2 {
-                if continental > 0.0 { Biome::Forest } else { Biome::Savanna }
-            } else {
-                if weirdness > 0.2 { Biome::Badlands } else { Biome::Desert }
-            }
-        } else if temp > -0.1 {
-            if humidity > 0.5 { Biome::DarkForest }
-            else if humidity > 0.2 {
-                if continental > 0.2 {
-                    if weirdness > 0.1 { Biome::FlowerForest } else { Biome::Forest }
-                } else { Biome::Swamp }
-            } else if humidity > -0.3 { Biome::Forest }
-            else { if weirdness > 0.2 { Biome::SunflowerPlains } else { Biome::Plains } }
-        } else if temp > -0.4 {
-            if humidity > 0.3 { Biome::DarkForest }
-            else if humidity > 0.0 {
-                if continental > 0.4 {
-                    if weirdness > 0.3 { Biome::OldGrowthPineTaiga } else { Biome::OldGrowthSpruceTaiga }
-                } else { Biome::Taiga }
-            } else { Biome::Plains }
-        } else {
-            if humidity > 0.0 {
-                if weirdness > 0.4 { Biome::Grove }
-                else if weirdness > 0.1 { Biome::SnowySlopes }
-                else { Biome::SnowyTundra }
-            } else { Biome::Mountains }
-        }
+    pub fn get_biome(&self, wx: f64, wz: f64) -> Biome {
+        self.get_biome_at(wx.floor() as i32, 0, wz.floor() as i32)
     }
 
-    pub fn get_biome(&self, wx: f64, wz: f64) -> Biome {
-        let temp = self.temp_noise.get([wx * 0.0015, wz * 0.0015]);
-        let humidity = self.humidity_noise.get([wx * 0.002 + 1000.0, wz * 0.002 + 1000.0]);
-        let continental = self.continental_noise.get([wx * 0.0008, wz * 0.0008]);
-        let weirdness = self.weirdness_noise.get([wx * 0.0025 + 500.0, wz * 0.0025 + 500.0]);
-        self.biome_from_climate(temp, humidity, continental, weirdness)
+    pub fn get_biome_at(&self, x: i32, y: i32, z: i32) -> Biome {
+        self.biome_source
+            .get_biome(x, y, z)
+            .unwrap_or_else(|unsupported| {
+                log::warn!("{}; using plains compatibility biome", unsupported);
+                Biome::Plains
+            })
     }
 
     // ------------------------------------------------------------------
@@ -553,7 +488,8 @@ impl VanillaWorldGenerator {
     /// This is equivalent to `NoiseBasedChunkGenerator.doFill`:
     /// 1. Create the per-chunk interpolation state.
     /// 2. Iterate over cells in X, Z, Y order.
-    /// 3. For each cell, trilinearly interpolate density for every block.
+    /// 3. Interpolate the cached cell density and refine blocks near a
+    ///    material boundary with marker-aware per-block evaluation.
     /// 4. Place stone/deepslate/fluid/air based on density threshold.
     pub fn generate_chunk(&self, chunk: &mut Chunk) {
         let cell_width = self.settings.cell_width();
@@ -563,16 +499,12 @@ impl VanillaWorldGenerator {
         let cell_min_y = self.settings.min_y.div_euclid(cell_height);
         let sea_level = self.aquifer.sea_level;
 
-        // Pre-compute preliminary surface levels at 4-block intervals
-        // (same resolution as vanilla's preliminarySurfaceLevel cache).
-        let _prelim_surface: Vec<Vec<i32>> = vec![vec![sea_level; 4]; 4];
-        // Vanilla computes prelim surface at quart positions (4-block granularity).
-        // We compute it lazily: just compute it inline per column for now.
-
-        // Create per-chunk noise data
-        let mut nd = NoiseChunkData::new(chunk, self.router.clone(), self.settings, self.aquifer.clone());
-
-        nd.initialize_for_first_cell_x();
+        let mut aquifer = NoiseBasedAquifer::overworld(
+            chunk.cx,
+            chunk.cz,
+            self.router.clone(),
+            self.seed,
+        );
 
         // Place bedrock at the bottom of the world (y = min_y)
         let bottom_local = 0usize;
@@ -581,6 +513,9 @@ impl VanillaWorldGenerator {
                 chunk.set_block(x, bottom_local, z, Block::new(BlockId::Bedrock));
             }
         }
+
+        let mut nd = NoiseChunkData::new(chunk, self.router.clone(), self.settings, self.aquifer.clone());
+        nd.initialize_for_first_cell_x();
 
         // The main doFill loop.
         for cell_x_index in 0..cell_count_xz {
@@ -615,8 +550,7 @@ impl VanillaWorldGenerator {
                             nd.update_for_x(factor_x);
 
                             for z_in_cell in 0..cell_width {
-                                let pos_z =
-                                    nd.chunk_start_z + cell_z_index * cell_width + z_in_cell;
+                                let pos_z = nd.chunk_start_z + cell_z_index * cell_width + z_in_cell;
                                 let z_chunk = (pos_z - nd.chunk_start_z) as usize;
                                 if z_chunk >= CHUNK_SIZE {
                                     continue;
@@ -625,7 +559,26 @@ impl VanillaWorldGenerator {
                                 let factor_z = z_in_cell as f64 / cell_width as f64;
                                 nd.update_for_z(factor_z);
 
-                                let density = nd.value;
+                                let interpolated_density = nd.value;
+                                let context = InterpolatedContext::new(
+                                    pos_x,
+                                    pos_y,
+                                    pos_z,
+                                    cell_width,
+                                    cell_height,
+                                );
+                                let density = if interpolated_density.abs() < DENSITY_EXACT_REFINEMENT {
+                                    self.router.final_density.compute(&context)
+                                } else if interpolated_density.abs() < DENSITY_BOUNDARY_REFINEMENT {
+                                    let point_context = SinglePointContext {
+                                        block_x: pos_x,
+                                        block_y: pos_y,
+                                        block_z: pos_z,
+                                    };
+                                    self.router.final_density.compute(&point_context)
+                                } else {
+                                    interpolated_density
+                                };
 
                                 // Simple noise value for stone type blending.
                                 // Use the router's final_density at y=0  (a rough
@@ -634,17 +587,28 @@ impl VanillaWorldGenerator {
                                 let stone_noise = sample_density_2d(
                                     &self.router,
                                     pos_x,
-                                    nd.chunk_start_z + cell_z_index * cell_width,
+                                    pos_z,
                                 );
 
-                                let block_id = density_to_block(
-                                    density,
-                                    pos_y,
-                                    sea_level,
-                                    BlockId::Stone,
-                                    self.aquifer.default_fluid,
-                                    stone_noise,
-                                );
+                                let aquifer_block =
+                                    aquifer.compute_substance(pos_x, pos_y, pos_z, density);
+                                let block_id = if density > 0.0 || aquifer_block.is_none() {
+                                    let ore_context = SinglePointContext {
+                                        block_x: pos_x,
+                                        block_y: pos_y,
+                                        block_z: pos_z,
+                                    };
+                                    OreVeinifier::apply(
+                                        &self.router.vein_toggle,
+                                        &self.router.vein_ridged,
+                                        &self.router.vein_gap,
+                                        &self.ore_veins_random,
+                                        &ore_context,
+                                    )
+                                    .unwrap_or_else(|| get_stone_type(pos_y, stone_noise))
+                                } else {
+                                    aquifer_block.unwrap_or(BlockId::Air)
+                                };
 
                                 let y_usize = y_local as usize;
                                 if block_id != BlockId::Air {
@@ -659,90 +623,47 @@ impl VanillaWorldGenerator {
 
         nd.stop_interpolation();
 
-        // Apply surface rules (grass on top, sand near water, etc.)
-        self.apply_surface_rules(chunk);
+        let system = SurfaceSystem::create_ref_from_seed(
+            BlockId::Stone,
+            sea_level,
+            self.seed,
+        );
+        let surface_rules = default_overworld_rules(system.clone());
+        let surface_source = StaticRuleSource::new(surface_rules);
+        let base_x = chunk.cx * CHUNK_SIZE as i32;
+        let base_z = chunk.cz * CHUNK_SIZE as i32;
+        let mut column_biomes = vec![Biome::Plains; CHUNK_SIZE * CHUNK_SIZE];
+        for x in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                column_biomes[x * CHUNK_SIZE + z] = self
+                    .biome_source
+                    .get_biome(base_x + x as i32, 0, base_z + z as i32)
+                    .unwrap_or(Biome::Plains);
+            }
+        }
+        SurfaceSystem::build_surface_with_biome_provider(
+            system,
+            chunk,
+            &surface_source,
+            sea_level,
+            self.settings.min_y,
+            move |x, _y, z| {
+                let local_x = x - base_x;
+                let local_z = z - base_z;
+                if local_x >= 0
+                    && local_x < CHUNK_SIZE as i32
+                    && local_z >= 0
+                    && local_z < CHUNK_SIZE as i32
+                {
+                    column_biomes[local_x as usize * CHUNK_SIZE + local_z as usize]
+                } else {
+                    Biome::Plains
+                }
+            },
+        );
 
         chunk.recount_fluids();
         chunk.is_dirty = true;
-    }
-
-    /// Apply basic surface replacement rules.
-    ///
-    /// In vanilla this is handled by the SurfaceRule system; here we
-    /// do a simplified pass that places grass/dirt/sand near the top
-    /// of each column.
-    fn apply_surface_rules(&self, chunk: &mut Chunk) {
-        let sea_level = self.aquifer.sea_level;
-        let base_x = chunk.cx as i64 * CHUNK_SIZE as i64;
-        let base_z = chunk.cz as i64 * CHUNK_SIZE as i64;
-
-        for x in 0..CHUNK_SIZE {
-            for z in 0..CHUNK_SIZE {
-                let _wx = (base_x + x as i64) as i32;
-                let _wz = (base_z + z as i64) as i32;
-
-                // Find the top non-air block in this column.
-                let mut top_y = -1;
-                for y in (1..CHUNK_HEIGHT).rev() {
-                    let block = chunk.get_block(x, y, z);
-                    if !block.is_air() && block.id != BlockId::Water && block.id != BlockId::Lava
-                    {
-                        top_y = y as i32;
-                        break;
-                    }
-                }
-
-                if top_y < 0 {
-                    continue;
-                }
-
-                let top_idx = top_y as usize;
-
-                // If the top block is stone, replace with grass block (if above sea level
-                // and not in a cold biome — simplified: always grass above sea level).
-                let top_block = chunk.get_block(x, top_idx, z);
-                if top_block.id == BlockId::Stone {
-                    if top_y >= sea_level {
-                        chunk.set_block(x, top_idx, z, Block::new(BlockId::GrassBlock));
-                        // Place dirt below grass
-                        if top_idx > 0 {
-                            let below = chunk.get_block(x, top_idx - 1, z);
-                            if below.id == BlockId::Stone {
-                                for dy in 1..=3 {
-                                    let by = top_idx - dy;
-                                    if chunk.get_block(x, by, z).id == BlockId::Stone {
-                                        chunk.set_block(x, by, z, Block::new(BlockId::Dirt));
-                                    }
-                                }
-                                // Top 3 blocks of stone → dirt; below that stays stone
-                            }
-                        }
-                    } else if top_y >= sea_level - 4 {
-                        // Near sea level: sand on top
-                        chunk.set_block(x, top_idx, z, Block::new(BlockId::Sand));
-                        if top_idx > 0 {
-                            let below = chunk.get_block(x, top_idx - 1, z);
-                            if below.id == BlockId::Stone || below.id == BlockId::Dirt {
-                                chunk.set_block(x, top_idx - 1, z, Block::new(BlockId::Sand));
-                            }
-                        }
-                    }
-                }
-
-                // Fill water below sea level where air exists.
-                if top_y < sea_level {
-                    for y in top_y + 1..sea_level {
-                        let y_idx = y as usize;
-                        if y_idx < CHUNK_HEIGHT {
-                            let block = chunk.get_block(x, y_idx, z);
-                            if block.is_air() {
-                                chunk.set_block(x, y_idx, z, Block::new(BlockId::Water));
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 
     // ------------------------------------------------------------------
@@ -787,6 +708,7 @@ fn lerp(alpha: f64, a: f64, b: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::chunk::CHUNK_HEIGHT;
     use crate::world::world_gen::noise_router::NoiseRouterData;
 
     #[test]
@@ -804,30 +726,6 @@ mod tests {
         // At the center (fx=0.5, fy=0, fz=0) the value should be 0.5.
         let v = corners.trilerp(0.5, 0.0, 0.0);
         assert!((v - 0.5).abs() < 1e-12);
-    }
-
-    #[test]
-    fn test_density_to_block() {
-        // Positive density above sea level → stone
-        assert_eq!(
-            density_to_block(1.0, 70, 63, BlockId::Stone, BlockId::Water, 0.0),
-            BlockId::Stone
-        );
-        // Positive density below 0 → deepslate
-        assert_eq!(
-            density_to_block(1.0, -10, 63, BlockId::Stone, BlockId::Water, 0.0),
-            BlockId::Deepslate
-        );
-        // Negative density below sea level → water
-        assert_eq!(
-            density_to_block(-1.0, 50, 63, BlockId::Stone, BlockId::Water, 0.0),
-            BlockId::Water
-        );
-        // Negative density above sea level → air
-        assert_eq!(
-            density_to_block(-1.0, 70, 63, BlockId::Stone, BlockId::Water, 0.0),
-            BlockId::Air
-        );
     }
 
     #[test]
@@ -849,6 +747,30 @@ mod tests {
     }
 
     #[test]
+    fn test_ore_vein_inputs_reach_reference_thresholds() {
+        let router = NoiseRouterData::create_overworld_router(42, false, false);
+        let mut toggle_peak = f64::NEG_INFINITY;
+        let mut ridged_negative = false;
+        for x in (-32..=32).step_by(4) {
+            for y in (-60..=50).step_by(4) {
+                for z in (-32..=32).step_by(4) {
+                    let context = SinglePointContext {
+                        block_x: x,
+                        block_y: y,
+                        block_z: z,
+                    };
+                    let toggle = router.vein_toggle.compute(&context);
+                    let ridged = router.vein_ridged.compute(&context);
+                    toggle_peak = toggle_peak.max(toggle.abs());
+                    ridged_negative |= ridged < 0.0;
+                }
+            }
+        }
+        assert!(toggle_peak >= 0.4, "ore vein toggle peak was {toggle_peak}");
+        assert!(ridged_negative, "ore vein ridged input never crossed below zero");
+    }
+
+    #[test]
     fn test_generate_chunk_produces_terrain() {
         let gen = VanillaWorldGenerator::from_seed(42);
         let mut chunk = Chunk::new(0, 0);
@@ -856,12 +778,22 @@ mod tests {
         let mut solid_count = 0;
         let mut fluid_count = 0;
         let mut air_count = 0;
+        let mut vein_count = 0;
         let mut top_y_per_col: Vec<i32> = Vec::new();
         for x in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
                 let mut top = -1i32;
                 for y in (0..CHUNK_HEIGHT).rev() {
                     let block = chunk.get_block(x, y, z);
+                    if matches!(
+                        block.id,
+                        BlockId::CopperOre
+                            | BlockId::RawCopperBlock
+                            | BlockId::DeepslateIronOre
+                            | BlockId::RawIronBlock
+                    ) {
+                        vein_count += 1;
+                    }
                     if !block.is_air() && block.id != BlockId::Water && block.id != BlockId::Lava {
                         solid_count += 1;
                         if top < 0 { top = y as i32; }
@@ -874,15 +806,23 @@ mod tests {
                 top_y_per_col.push(top);
             }
         }
-        println!("solid={} fluid={} air={}", solid_count, fluid_count, air_count);
+        println!("solid={} fluid={} air={} veins={}", solid_count, fluid_count, air_count, vein_count);
         let min_top = top_y_per_col.iter().min().unwrap();
         let max_top = top_y_per_col.iter().max().unwrap();
         let avg_top: f64 = top_y_per_col.iter().sum::<i32>() as f64 / top_y_per_col.len() as f64;
         println!("top surface: min={} max={} avg={:.1}", min_top, max_top, avg_top);
         assert!(solid_count > 0, "Chunk must contain solid blocks, got 0");
-        // Check if top has ANY variation. If there's only 1 block difference,
-        // that's at least not perfectly flat.
         assert!(max_top - min_top >= 0, "Terrain must have height variation, got flat at {}", min_top);
+    }
+
+    #[test]
+    fn test_chunks_at_different_positions() {
+        let seed = 42u64;
+        let gen = VanillaWorldGenerator::from_seed(seed);
+        for &(cx, cz) in &[(0, 0), (10, 10)] {
+            let density = gen.get_density(cx * CHUNK_SIZE as i32 + 8, 0, cz * CHUNK_SIZE as i32 + 8);
+            assert!(density.is_finite(), "chunk ({},{}) density was not finite", cx, cz);
+        }
     }
 
 
@@ -906,17 +846,20 @@ mod tests {
     fn test_density_cross_section() {
         let router = Arc::new(NoiseRouterData::create_overworld_router(42, false, false));
         
-        // Key Y values breakdown
-        println!("=== Pipeline at (0, y, 0) at key Y values ===");
-        for y in [200, 240, 248, 252, 256, 260, 270, 300, 319] {
-            if y < -64 || y >= 320 { continue; }
+        println!("=== Full pipeline at (0, y, 0) ===");
+        for y in (0..260).step_by(10) {
             let ctx = SinglePointContext { block_x: 0, block_y: y, block_z: 0 };
-            let d = router.final_density.compute(&ctx);
+            let final_d = router.final_density.compute(&ctx);
+            let cont = router.continents.compute(&ctx);
+            let erosion = router.erosion.compute(&ctx);
+            let depth_val = router.depth.compute(&ctx);
             let prelim = router.preliminary_surface_level.compute(&ctx);
-            println!("y={:>4} prelim={:+.4} final={:+.4}", y, prelim, d);
+            if y % 20 == 0 || final_d > -0.1 {
+                println!("y={:>4}: final={:+.6} cont={:+.4} erosion={:+.4} depth={:+.4} prelim={:+.1}",
+                    y, final_d, cont, erosion, depth_val, prelim);
+            }
         }
         
-        // Vertical cross-section
         println!("\n=== Cross-section at (0, 0) descending ===");
         for y in (0..320).rev().step_by(8) {
             let ctx = SinglePointContext { block_x: 0, block_y: y, block_z: 0 };
@@ -929,7 +872,6 @@ mod tests {
         }
         println!("<y=0>");
         
-        // Highest solid per column
         println!("\n=== Highest solid per column ===");
         for (x, z) in [(0,0), (0,8), (8,0), (8,8), (4,4), (12, 12)] {
             let mut found_surface = None;

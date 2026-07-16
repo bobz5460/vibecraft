@@ -74,7 +74,7 @@ impl From<TerrainSpline> for SplineNode {
 struct TerrainControlPoint {
     location: f32,
     value: SplineNode,
-    derivative: Option<f32>,
+    derivative: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +85,6 @@ struct TerrainControlPoint {
 pub struct TerrainSpline {
     coordinate: SplineCoordinate,
     points: Vec<TerrainControlPoint>,
-    transformer: TransformFn,
     min_value: f64,
     max_value: f64,
 }
@@ -94,13 +93,11 @@ impl TerrainSpline {
     fn new(
         coordinate: SplineCoordinate,
         points: Vec<TerrainControlPoint>,
-        transformer: TransformFn,
     ) -> Self {
         let (min_value, max_value) = compute_bounds(&points);
         Self {
             coordinate,
             points,
-            transformer,
             min_value,
             max_value,
         }
@@ -119,66 +116,44 @@ impl TerrainSpline {
             return 0.0;
         }
 
-        let first_val = self.eval_node(&pts[0].value, ctx);
-        if x <= pts[0].location {
-            return first_val;
-        }
-
-        let last_val = self.eval_node(&pts[pts.len() - 1].value, ctx);
-        if x >= pts[pts.len() - 1].location {
-            return last_val;
-        }
-
+        // Java's CubicSpline finds the first location strictly greater than
+        // the input, then uses the preceding point as the interval start.
         let mut lo = 0usize;
-        let mut hi = pts.len() - 1;
-        while lo < hi - 1 {
+        let mut hi = pts.len();
+        while lo < hi {
             let mid = (lo + hi) / 2;
             if x < pts[mid].location {
                 hi = mid;
             } else {
-                lo = mid;
+                lo = mid + 1;
             }
         }
+        let start = lo as isize - 1;
 
-        let p1 = &pts[lo];
-        let p2 = &pts[hi];
+        if start < 0 {
+            let p = &pts[0];
+            return self.eval_node(&p.value, ctx) + p.derivative * (x - p.location);
+        }
 
+        let start = start as usize;
+        if start == pts.len() - 1 {
+            let p = &pts[start];
+            return self.eval_node(&p.value, ctx) + p.derivative * (x - p.location);
+        }
+
+        let p1 = &pts[start];
+        let p2 = &pts[start + 1];
         let y1 = self.eval_node(&p1.value, ctx);
         let y2 = self.eval_node(&p2.value, ctx);
-
-        let p0 = if lo > 0 {
-            &pts[lo - 1]
-        } else {
-            p1
-        };
-        let p3 = if hi < pts.len() - 1 {
-            &pts[hi + 1]
-        } else {
-            p2
-        };
-
-        let _y0 = self.eval_node(&p0.value, ctx);
-        let _y3 = self.eval_node(&p3.value, ctx);
-
         let dx = p2.location - p1.location;
         if dx == 0.0 {
-            return (y1 + y2) * 0.5;
+            return y1;
         }
 
         let t = (x - p1.location) / dx;
-        let t2 = t * t;
-        let t3 = t2 * t;
-
-        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
-        let h10 = t3 - 2.0 * t2 + t;
-        let h01 = -2.0 * t3 + 3.0 * t2;
-        let h11 = t3 - t2;
-
-        let slope = (y2 - y1) / dx;
-        let m1 = p1.derivative.unwrap_or(slope);
-        let m2 = p2.derivative.unwrap_or(slope);
-
-        h00 * y1 + h10 * m1 * dx + h01 * y2 + h11 * m2 * dx
+        let a = p1.derivative * dx - y2 - y1;
+        let b = -p2.derivative * dx + y2 - y1;
+        y1 + t * (y2 - y1) + t * (1.0 - t) * (a + t * (b - a))
     }
 }
 
@@ -225,8 +200,7 @@ impl DensityFunction for TerrainSpline {
             block_z: ctx.block_z(),
         });
         let coord = self.coordinate.evaluate(&point);
-        let x = (self.transformer)(coord);
-        self.evaluate_at(x, ctx) as f64
+        self.evaluate_at(coord, ctx) as f64
     }
 
     fn min_value(&self) -> f64 {
@@ -254,7 +228,6 @@ impl DensityFunction for TerrainSpline {
         DenseFn(Box::new(TerrainSpline::new(
             new_coord,
             new_points,
-            self.transformer,
         )))
     }
 
@@ -284,10 +257,17 @@ impl TerrainSplineBuilder {
     }
 
     pub fn point(mut self, location: f32, value: impl Into<SplineNode>) -> Self {
+        assert!(
+            self.points
+                .last()
+                .map_or(true, |previous| location > previous.location),
+            "spline control points must be in ascending order"
+        );
+        let value = transform_node(value.into(), self.transformer);
         self.points.push(TerrainControlPoint {
             location,
-            value: value.into(),
-            derivative: None,
+            value,
+            derivative: 0.0,
         });
         self
     }
@@ -298,16 +278,31 @@ impl TerrainSplineBuilder {
         value: impl Into<SplineNode>,
         derivative: f32,
     ) -> Self {
+        assert!(
+            self.points
+                .last()
+                .map_or(true, |previous| location > previous.location),
+            "spline control points must be in ascending order"
+        );
+        let value = transform_node(value.into(), self.transformer);
         self.points.push(TerrainControlPoint {
             location,
-            value: value.into(),
-            derivative: Some(derivative),
+            value,
+            derivative,
         });
         self
     }
 
     pub fn build(self) -> TerrainSpline {
-        TerrainSpline::new(self.coordinate, self.points, self.transformer)
+        assert!(!self.points.is_empty(), "spline must contain control points");
+        TerrainSpline::new(self.coordinate, self.points)
+    }
+}
+
+fn transform_node(node: SplineNode, transformer: TransformFn) -> SplineNode {
+    match node {
+        SplineNode::Constant(value) => SplineNode::Constant(transformer(value)),
+        SplineNode::Spline(spline) => SplineNode::Spline(spline),
     }
 }
 
@@ -919,4 +914,131 @@ pub fn overworld_jaggedness(
             ),
         )
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::world_gen::density_fn::{constant, SinglePointContext};
+
+    fn context() -> SinglePointContext {
+        SinglePointContext {
+            block_x: 0,
+            block_y: 0,
+            block_z: 0,
+        }
+    }
+
+    #[test]
+    fn java_cubic_spline_uses_zero_default_derivatives() {
+        let spline = TerrainSplineBuilder::new(
+            SplineCoordinate(constant(0.25)),
+            no_transform,
+        )
+        .point(0.0, 0.0)
+        .point(1.0, 10.0)
+        .build();
+
+        // CubicSpline.Multipoint.sample at t=.25 with d1=d2=0.
+        let expected = 1.5625;
+        assert!((spline.compute(&context()) - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn java_cubic_spline_linearly_extrapolates_with_endpoint_derivatives() {
+        let below = TerrainSplineBuilder::new(
+            SplineCoordinate(constant(-1.0)),
+            no_transform,
+        )
+        .point_with_derivative(0.0, 2.0, 3.0)
+        .point_with_derivative(1.0, 4.0, 5.0)
+        .build();
+        let above = TerrainSplineBuilder::new(
+            SplineCoordinate(constant(2.0)),
+            no_transform,
+        )
+        .point_with_derivative(0.0, 2.0, 3.0)
+        .point_with_derivative(1.0, 4.0, 5.0)
+        .build();
+
+        assert!((below.compute(&context()) + 1.0).abs() < 1e-6);
+        assert!((above.compute(&context()) - 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn amplified_transform_applies_to_control_values_not_coordinate() {
+        let spline = TerrainSplineBuilder::new(
+            SplineCoordinate(constant(0.25)),
+            amplified_offset,
+        )
+        .point(0.0, 1.0)
+        .point(1.0, 3.0)
+        .build();
+
+        // The Java builder stores values 2 and 6, while the coordinate stays .25.
+        assert!((spline.compute(&context()) - 2.0625).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ridge_spline_control_points_match_terrain_provider() {
+        let spline = ridge_spline(
+            SplineCoordinate(constant(0.0)),
+            -0.15,
+            0.05,
+            0.1,
+            0.2,
+            0.3,
+            0.5,
+            no_transform,
+        );
+
+        let locations: Vec<f32> = spline.points.iter().map(|point| point.location).collect();
+        let derivatives: Vec<f32> = spline.points.iter().map(|point| point.derivative).collect();
+        assert_eq!(locations, vec![-1.0, -0.4, 0.0, 0.4, 1.0]);
+        let expected_derivatives = [0.5, 0.25, 0.25, 0.2, 0.07];
+        for (actual, expected) in derivatives.iter().zip(expected_derivatives) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn overworld_control_locations_match_terrain_provider() {
+        let coordinate = SplineCoordinate(constant(0.0));
+        let spline = overworld_offset(coordinate.clone(), coordinate.clone(), coordinate, false);
+        let locations: Vec<f32> = spline.points.iter().map(|point| point.location).collect();
+
+        assert_eq!(
+            locations,
+            vec![-1.1, -1.02, -0.51, -0.44, -0.18, -0.16, -0.15, -0.1, 0.25, 1.0]
+        );
+    }
+
+    #[test]
+    fn factor_and_jaggedness_control_locations_match_terrain_provider() {
+        let coordinate = SplineCoordinate(constant(0.0));
+        let factor = overworld_factor(
+            coordinate.clone(),
+            coordinate.clone(),
+            coordinate.clone(),
+            coordinate.clone(),
+            false,
+        );
+        let jaggedness = overworld_jaggedness(
+            coordinate.clone(),
+            coordinate.clone(),
+            coordinate.clone(),
+            coordinate,
+            false,
+        );
+
+        let factor_locations: Vec<f32> =
+            factor.points.iter().map(|point| point.location).collect();
+        let jaggedness_locations: Vec<f32> = jaggedness
+            .points
+            .iter()
+            .map(|point| point.location)
+            .collect();
+        assert_eq!(factor_locations, vec![-0.19, -0.15, -0.1, 0.03, 0.06]);
+        assert_eq!(jaggedness_locations, vec![-0.11, 0.03, 0.65]);
+    }
 }

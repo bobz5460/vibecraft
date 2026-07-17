@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Native on-disk envelope format. This is unrelated to Minecraft's save format.
 pub const FORMAT_VERSION: u32 = 1;
 /// Version of the native game data encoded inside each envelope.
-pub const DATA_VERSION: u32 = 9;
+pub const DATA_VERSION: u32 = 10;
 
 const LEVEL_FILE: &str = "level.json";
 const PLAYER_FILE: &str = "player.json";
@@ -1036,6 +1036,9 @@ fn migrate_data(
                 }
             }
             (8, FileKind::Player | FileKind::Chunk) => {}
+            // Version 10 adds a new explicit generation-profile enum value.
+            // Existing version-9 worlds retain their persisted profile exactly.
+            (9, FileKind::Level | FileKind::Player | FileKind::Chunk) => {}
             _ => {
                 return Err(StorageError::Version {
                     path: path.to_path_buf(),
@@ -1545,6 +1548,40 @@ mod tests {
             rewritten["data"]["generation_profile"],
             "minecraft26_base",
         );
+    }
+
+    #[test]
+    fn version_nine_level_retains_its_existing_generation_profile() {
+        let world = TempWorld::new();
+        let storage = WorldStorage::new(&world.path);
+        let mut data = serde_json::to_value(level(12)).unwrap();
+        data.as_object_mut().unwrap().insert(
+            "generation_profile".to_string(),
+            Value::String("minecraft26_native_decoration_preview".to_string()),
+        );
+        let old_level = serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "data_version": 9,
+            "kind": "level",
+            "data": data,
+        });
+        fs::write(storage.level_path(), serde_json::to_vec(&old_level).unwrap()).unwrap();
+
+        let migrated = storage.load_level().unwrap();
+        assert_eq!(
+            migrated.generation_profile,
+            WorldGenerationProfile::Minecraft26NativeDecorationPreview
+        );
+    }
+
+    #[test]
+    fn current_level_round_trips_minecraft26_geometry_profile() {
+        let world = TempWorld::new();
+        let storage = WorldStorage::new(&world.path);
+        let mut data = level(13);
+        data.generation_profile = WorldGenerationProfile::Minecraft26Geometry;
+        storage.save_level(&data).unwrap();
+        assert_eq!(storage.load_level().unwrap().generation_profile, data.generation_profile);
     }
 
     #[test]

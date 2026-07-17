@@ -8,7 +8,10 @@
 
 use crate::world::world_gen::density_fn::*;
 use crate::world::world_gen::noise::*;
-use crate::world::world_gen::terrain::{overworld_factor, overworld_jaggedness, overworld_offset};
+use crate::world::world_gen::terrain::{
+    overworld_factor, overworld_factor_reference, overworld_jaggedness,
+    overworld_jaggedness_reference, overworld_offset, overworld_offset_reference,
+};
 
 // ---------------------------------------------------------------------------
 // Bridge: implement NoiseSampler for NormalNoise so it can be used with
@@ -288,9 +291,25 @@ impl NoiseRouterData {
     // ------------------------------------------------------------------
 
     /// Port of `spaghettiRoughnessFunction(HolderGetter)`.
-    fn spaghetti_roughness_function(noises: &NoiseMap) -> DenseFn {
+    fn spaghetti_roughness_function(noises: &NoiseMap, reference: bool) -> DenseFn {
         let rough_noise = noise(noises.spaghetti_roughness.clone(), 1.0, 1.0);
-        let rough_mod = mapped_noise(noises.spaghetti_roughness_modulator.clone(), 1.0, 1.0, 0.0, -0.1);
+        let rough_mod = if reference {
+            mapped_noise_reference(
+                noises.spaghetti_roughness_modulator.clone(),
+                1.0,
+                1.0,
+                0.0,
+                -0.1,
+            )
+        } else {
+            mapped_noise(
+                noises.spaghetti_roughness_modulator.clone(),
+                1.0,
+                1.0,
+                0.0,
+                -0.1,
+            )
+        };
 
         cache_once(mul(
             rough_mod,
@@ -299,9 +318,25 @@ impl NoiseRouterData {
     }
 
     /// Port of `entrances(HolderGetter, HolderGetter)`.
-    pub fn entrances(functions: &DensityFnMap, noises: &NoiseMap) -> DenseFn {
+    pub fn entrances(functions: &DensityFnMap, noises: &NoiseMap, reference: bool) -> DenseFn {
         let rarity_mod = cache_once(noise(noises.spaghetti_3d_rarity.clone(), 2.0, 1.0));
-        let thickness_mod = mapped_noise(noises.spaghetti_3d_thickness.clone(), 1.0, 1.0, -0.065, -0.088);
+        let thickness_mod = if reference {
+            mapped_noise_reference(
+                noises.spaghetti_3d_thickness.clone(),
+                1.0,
+                1.0,
+                -0.065,
+                -0.088,
+            )
+        } else {
+            mapped_noise(
+                noises.spaghetti_3d_thickness.clone(),
+                1.0,
+                1.0,
+                -0.065,
+                -0.088,
+            )
+        };
 
         let cave_3d_1 = quantized_spaghetti_rarity_3d(&rarity_mod, noises.spaghetti_3d_1.clone());
         let cave_3d_2 = quantized_spaghetti_rarity_3d(&rarity_mod, noises.spaghetti_3d_2.clone());
@@ -324,7 +359,7 @@ impl NoiseRouterData {
     }
 
     /// Port of `noodle(HolderGetter, HolderGetter)`.
-    pub fn noodle(functions: &DensityFnMap, noises: &NoiseMap) -> DenseFn {
+    pub fn noodle(functions: &DensityFnMap, noises: &NoiseMap, reference: bool) -> DenseFn {
         let y = functions.y.clone();
         let noodle_toggle = Self::y_limited_interpolatable(
             y.clone(),
@@ -336,7 +371,23 @@ impl NoiseRouterData {
 
         let noodle_thickness = Self::y_limited_interpolatable(
             y.clone(),
-            mapped_noise(noises.noodle_thickness.clone(), 1.0, 1.0, -0.05, -0.1),
+            if reference {
+                mapped_noise_reference(
+                    noises.noodle_thickness.clone(),
+                    1.0,
+                    1.0,
+                    -0.05,
+                    -0.1,
+                )
+            } else {
+                mapped_noise(
+                    noises.noodle_thickness.clone(),
+                    1.0,
+                    1.0,
+                    -0.05,
+                    -0.1,
+                )
+            },
             NOODLE_MIN_Y,
             NOODLE_MAX_Y,
             0.0,
@@ -373,10 +424,18 @@ impl NoiseRouterData {
     }
 
     /// Port of `pillars(HolderGetter)`.
-    pub fn pillars(noises: &NoiseMap) -> DenseFn {
+    pub fn pillars(noises: &NoiseMap, reference: bool) -> DenseFn {
         let pillar_noise = noise(noises.pillar.clone(), 25.0, 0.3);
-        let pillar_rareness = mapped_noise_2(noises.pillar_rareness.clone(), 0.0, -2.0);
-        let pillar_thickness = mapped_noise_2(noises.pillar_thickness.clone(), 0.0, 1.1);
+        let pillar_rareness = if reference {
+            mapped_noise_reference(noises.pillar_rareness.clone(), 1.0, 1.0, 0.0, -2.0)
+        } else {
+            mapped_noise_2(noises.pillar_rareness.clone(), 0.0, -2.0)
+        };
+        let pillar_thickness = if reference {
+            mapped_noise_reference(noises.pillar_thickness.clone(), 1.0, 1.0, 0.0, 1.1)
+        } else {
+            mapped_noise_2(noises.pillar_thickness.clone(), 0.0, 1.1)
+        };
 
         let pillars_with_rareness = add(
             mul(pillar_noise, constant(2.0)),
@@ -387,17 +446,31 @@ impl NoiseRouterData {
     }
 
     /// Port of `spaghetti2D(HolderGetter, HolderGetter)`.
-    pub fn spaghetti_2d(functions: &DensityFnMap, noises: &NoiseMap) -> DenseFn {
+    pub fn spaghetti_2d(
+        functions: &DensityFnMap,
+        noises: &NoiseMap,
+        reference: bool,
+    ) -> DenseFn {
         let rarity_mod = noise(noises.spaghetti_2d_modulator.clone(), 2.0, 1.0);
         let spaghetti_2d_cave =
             quantized_spaghetti_rarity_2d(&rarity_mod, noises.spaghetti_2d.clone());
 
-        let elevation_mod = mapped_noise_3(
-            noises.spaghetti_2d_elevation.clone(),
-            0.0,
-            (-64.0_f64 / 8.0).floor(),
-            8.0,
-        );
+        let elevation_mod = if reference {
+            mapped_noise_reference(
+                noises.spaghetti_2d_elevation.clone(),
+                1.0,
+                0.0,
+                -8.0,
+                8.0,
+            )
+        } else {
+            mapped_noise_3(
+                noises.spaghetti_2d_elevation.clone(),
+                0.0,
+                (-64.0_f64 / 8.0).floor(),
+                8.0,
+            )
+        };
 
         let thickness_mod = functions.spaghetti_2d_thickness_modulator.clone();
 
@@ -418,14 +491,27 @@ impl NoiseRouterData {
     }
 
     /// Port of `underground(HolderGetter, HolderGetter, DensityFunction)`.
-    pub fn underground(functions: &DensityFnMap, noises: &NoiseMap, sloped_cheese: DenseFn) -> DenseFn {
+    pub fn underground(
+        functions: &DensityFnMap,
+        noises: &NoiseMap,
+        sloped_cheese: DenseFn,
+        reference: bool,
+    ) -> DenseFn {
         let spaghetti_2d_fn = functions.spaghetti_2d.clone();
         let roughness_fn = functions.spaghetti_roughness_function.clone();
 
-        let layer_noise = noise(noises.cave_layer.clone(), 8.0, 8.0);
+        let layer_noise = noise(
+            noises.cave_layer.clone(),
+            if reference { 1.0 } else { 8.0 },
+            8.0,
+        );
         let layered_caverns = mul(constant(4.0), square(layer_noise));
 
-        let cheese = noise(noises.cave_cheese.clone(), 0.6666666666666666, 0.6666666666666666);
+        let cheese = noise(
+            noises.cave_cheese.clone(),
+            if reference { 1.0 } else { 0.6666666666666666 },
+            0.6666666666666666,
+        );
 
         let solidified_cheese = add(
             clamp(add(constant(0.27), cheese), -1.0, 1.0),
@@ -512,11 +598,16 @@ impl NoiseRouterData {
         erosion: DenseFn,
         ridges: DenseFn,
         amplified: bool,
+        reference: bool,
     ) -> DenseFn {
         let c = SplineCoordinate(continents);
         let e = SplineCoordinate(erosion);
         let r = SplineCoordinate(ridges);
-        DenseFn(Box::new(overworld_offset(c, e, r, amplified)))
+        if reference {
+            DenseFn(Box::new(overworld_offset_reference(c, e, r, amplified)))
+        } else {
+            DenseFn(Box::new(overworld_offset(c, e, r, amplified)))
+        }
     }
 
     /// Uses the actual TerrainProvider cubic spline for overworld factor.
@@ -526,12 +617,17 @@ impl NoiseRouterData {
         weirdness: DenseFn,
         ridges: DenseFn,
         amplified: bool,
+        reference: bool,
     ) -> DenseFn {
         let c = SplineCoordinate(continents);
         let e = SplineCoordinate(erosion);
         let w = SplineCoordinate(weirdness);
         let r = SplineCoordinate(ridges);
-        DenseFn(Box::new(overworld_factor(c, e, w, r, amplified)))
+        if reference {
+            DenseFn(Box::new(overworld_factor_reference(c, e, w, r, amplified)))
+        } else {
+            DenseFn(Box::new(overworld_factor(c, e, w, r, amplified)))
+        }
     }
 
     /// Uses the actual TerrainProvider cubic spline for overworld jaggedness.
@@ -541,12 +637,17 @@ impl NoiseRouterData {
         weirdness: DenseFn,
         ridges: DenseFn,
         amplified: bool,
+        reference: bool,
     ) -> DenseFn {
         let c = SplineCoordinate(continents);
         let e = SplineCoordinate(erosion);
         let w = SplineCoordinate(weirdness);
         let r = SplineCoordinate(ridges);
-        DenseFn(Box::new(overworld_jaggedness(c, e, w, r, amplified)))
+        if reference {
+            DenseFn(Box::new(overworld_jaggedness_reference(c, e, w, r, amplified)))
+        } else {
+            DenseFn(Box::new(overworld_jaggedness(c, e, w, r, amplified)))
+        }
     }
 
     // ------------------------------------------------------------------
@@ -561,6 +662,7 @@ impl NoiseRouterData {
         erosion_function: DenseFn,
         ridge_function: DenseFn,
         amplified: bool,
+        reference: bool,
     ) -> DenseFn {
         // Java keeps both the raw ridge value ("weirdness") and its
         // peaks-and-valleys transform ("ridges_folded"). The terrain
@@ -574,6 +676,7 @@ impl NoiseRouterData {
             erosion_function.clone(),
             ridge_fn.clone(),
             amplified,
+            reference,
         );
         let offset = Self::spline_with_blending(
             add(constant(GLOBAL_OFFSET), offset_spline),
@@ -587,6 +690,7 @@ impl NoiseRouterData {
             weirdness_fn.clone(),
             ridge_fn.clone(),
             amplified,
+            reference,
         );
         let factor = Self::spline_with_blending(factor_spline, constant(BLENDING_FACTOR_VALUE));
         functions.factor = factor.clone();
@@ -600,6 +704,7 @@ impl NoiseRouterData {
             weirdness_fn,
             ridge_fn,
             amplified,
+            reference,
         );
         let unscaled_jaggedness = Self::spline_with_blending(
             unscaled_jaggedness_spline,
@@ -624,6 +729,23 @@ impl NoiseRouterData {
     ///
     /// Creates a fully-wired `NoiseRouter` for the overworld dimension.
     pub fn create_overworld_router(seed: u64, large_biomes: bool, amplified: bool) -> NoiseRouter {
+        Self::create_overworld_router_with_semantics(seed, large_biomes, amplified, false)
+    }
+
+    pub fn create_overworld_router_reference(
+        seed: u64,
+        large_biomes: bool,
+        amplified: bool,
+    ) -> NoiseRouter {
+        Self::create_overworld_router_with_semantics(seed, large_biomes, amplified, true)
+    }
+
+    fn create_overworld_router_with_semantics(
+        seed: u64,
+        large_biomes: bool,
+        amplified: bool,
+        reference: bool,
+    ) -> NoiseRouter {
         let mut functions = DensityFnMap::new();
         let noises = NoiseMap::from_seed(seed, large_biomes);
         let mut root_random = NoiseSeed::new(seed);
@@ -644,7 +766,15 @@ impl NoiseRouterData {
 
         // --- Base 3D noise (BlendedNoise) ---
         let mut terrain_random = positional.from_hash_of("minecraft:terrain");
-        functions.base_3d_noise = create_blended_noise(&mut terrain_random, 0.25, 0.125, 80.0, 160.0, 8.0);
+        functions.base_3d_noise = create_blended_noise(
+            &mut terrain_random,
+            0.25,
+            0.125,
+            80.0,
+            160.0,
+            8.0,
+            reference,
+        );
 
         // --- Continentalness, erosion, ridge ---
         let continents_key = if large_biomes {
@@ -722,6 +852,7 @@ impl NoiseRouterData {
             erosion.clone(),
             ridge.clone(),
             amplified,
+            reference,
         );
 
         // --- Cache the sloped cheese ---
@@ -729,18 +860,28 @@ impl NoiseRouterData {
 
         // --- Cave functions ---
         functions.spaghetti_roughness_function =
-            Self::spaghetti_roughness_function(&noises);
-        functions.spaghetti_2d_thickness_modulator = cache_once(mapped_noise(
-            noises.spaghetti_2d_thickness.clone(),
-            2.0,
-            1.0,
-            -0.6,
-            -1.3,
-        ));
-        functions.spaghetti_2d = Self::spaghetti_2d(&functions, &noises);
-        functions.entrances = Self::entrances(&functions, &noises);
-        functions.noodle = Self::noodle(&functions, &noises);
-        functions.pillars = Self::pillars(&noises);
+            Self::spaghetti_roughness_function(&noises, reference);
+        functions.spaghetti_2d_thickness_modulator = cache_once(if reference {
+            mapped_noise_reference(
+                noises.spaghetti_2d_thickness.clone(),
+                2.0,
+                1.0,
+                -0.6,
+                -1.3,
+            )
+        } else {
+            mapped_noise(
+                noises.spaghetti_2d_thickness.clone(),
+                2.0,
+                1.0,
+                -0.6,
+                -1.3,
+            )
+        });
+        functions.spaghetti_2d = Self::spaghetti_2d(&functions, &noises, reference);
+        functions.entrances = Self::entrances(&functions, &noises, reference);
+        functions.noodle = Self::noodle(&functions, &noises, reference);
+        functions.pillars = Self::pillars(&noises, reference);
 
         // --- Preliminary surface level ---
         let offset_fn = functions.offset.clone();
@@ -758,7 +899,12 @@ impl NoiseRouterData {
             -1000000.0,
             SURFACE_DENSITY_THRESHOLD,
             surface_with_entrances,
-            Self::underground(&functions, &noises, sloped_cheese_cached.clone()),
+            Self::underground(
+                &functions,
+                &noises,
+                sloped_cheese_cached.clone(),
+                reference,
+            ),
         );
 
         let full_noise = min(
@@ -931,6 +1077,23 @@ fn mapped_noise(noise: NoiseHandle, xz_scale: f64, y_scale: f64, flatness: f64, 
     }))
 }
 
+/// Java's mapped-noise helpers accept output endpoints for samples at -1 and 1.
+fn mapped_noise_reference(
+    noise: NoiseHandle,
+    xz_scale: f64,
+    y_scale: f64,
+    from_value: f64,
+    to_value: f64,
+) -> DenseFn {
+    mapped_noise(
+        noise,
+        xz_scale,
+        y_scale,
+        (to_value - from_value) * 0.5,
+        (to_value + from_value) * 0.5,
+    )
+}
+
 /// Convenience: xz_scale, y_scale, flatness, offset=0.
 fn mapped_noise_3(noise: NoiseHandle, xz_scale: f64, y_scale: f64, flatness: f64) -> DenseFn {
     mapped_noise(noise, xz_scale, y_scale, flatness, 0.0)
@@ -992,6 +1155,35 @@ impl BlendedNoiseDensity {
             y_factor,
             smear_scale_multiplier,
             max_value: max_val,
+        }
+    }
+
+    pub fn new_reference(
+        random: &mut NoiseSeed,
+        xz_scale: f64,
+        y_scale: f64,
+        xz_factor: f64,
+        y_factor: f64,
+        smear_scale_multiplier: f64,
+    ) -> Self {
+        let limit_octaves: Vec<i32> = (-15..=0).collect();
+        let main_octaves: Vec<i32> = (-7..=0).collect();
+        let min_noise = PerlinNoise::create_legacy_for_blended_noise(random, &limit_octaves);
+        let max_noise = PerlinNoise::create_legacy_for_blended_noise(random, &limit_octaves);
+        let main = PerlinNoise::create_legacy_for_blended_noise(random, &main_octaves);
+        let xz_multiplier = 684.412 * xz_scale;
+        let y_multiplier = 684.412 * y_scale;
+        let max_value = min_noise.max_broken_value(y_multiplier);
+        Self {
+            min_limit_noise: min_noise,
+            max_limit_noise: max_noise,
+            main_noise: main,
+            xz_multiplier,
+            y_multiplier,
+            xz_factor,
+            y_factor,
+            smear_scale_multiplier,
+            max_value,
         }
     }
 }
@@ -1086,15 +1278,18 @@ fn create_blended_noise(
     xz_factor: f64,
     y_factor: f64,
     smear_scale_multiplier: f64,
+    reference: bool,
 ) -> DenseFn {
-    DenseFn(Box::new(BlendedNoiseDensity::new(
-        random,
-        xz_scale,
-        y_scale,
-        xz_factor,
-        y_factor,
-        smear_scale_multiplier,
-    )))
+    let blended = if reference {
+        BlendedNoiseDensity::new_reference(
+            random, xz_scale, y_scale, xz_factor, y_factor, smear_scale_multiplier,
+        )
+    } else {
+        BlendedNoiseDensity::new(
+            random, xz_scale, y_scale, xz_factor, y_factor, smear_scale_multiplier,
+        )
+    };
+    DenseFn(Box::new(blended))
 }
 
 // ============================================================================
@@ -1359,10 +1554,101 @@ pub fn create_noise_parameters(key: &NoiseKey) -> NoiseParameters {
 mod tests {
     use super::*;
 
+    struct CoordinateNoise;
+
+    impl NoiseSampler for CoordinateNoise {
+        fn sample(&self, x: f64, y: f64, z: f64) -> f64 {
+            x + y * 10.0 + z * 100.0
+        }
+
+        fn max_value(&self) -> f64 {
+            1.0
+        }
+    }
+
     fn assert_parameters(key: NoiseKey, first_octave: i32, amplitudes: &[f64]) {
         let actual = create_noise_parameters(&key);
         assert_eq!(actual.first_octave, first_octave, "{} first octave", key.name());
         assert_eq!(actual.amplitudes, amplitudes, "{} amplitudes", key.name());
+    }
+
+    #[test]
+    fn reference_mapped_noise_uses_java_endpoints_and_coordinate_scales() {
+        let mapped = mapped_noise_reference(
+            NoiseHandle::new(CoordinateNoise),
+            2.0,
+            3.0,
+            -2.0,
+            2.0,
+        );
+        let context = SinglePointContext {
+            block_x: 1,
+            block_y: 2,
+            block_z: 3,
+        };
+
+        // sample(2, 6, 6)=662, then map [-1, 1] to [-2, 2].
+        assert_eq!(mapped.compute(&context), 1324.0);
+        let reversed = mapped_noise_reference(
+            NoiseHandle::new(CoordinateNoise),
+            0.0,
+            0.0,
+            0.0,
+            -0.1,
+        );
+        assert_eq!(reversed.compute(&context), -0.05);
+    }
+
+    #[test]
+    fn reference_blended_noise_uses_legacy_sequential_octaves() {
+        let mut root = NoiseSeed::new(0x5EED);
+        let positional = root.fork_positional();
+        let mut terrain = positional.from_hash_of("minecraft:terrain");
+        let mut first_octave_random = positional.from_hash_of("minecraft:terrain");
+        let first_sequential_octave = ImprovedNoise::new(&mut first_octave_random);
+        let blended = BlendedNoiseDensity::new_reference(
+            &mut terrain,
+            0.25,
+            0.125,
+            80.0,
+            160.0,
+            8.0,
+        );
+        let actual = [
+            SinglePointContext { block_x: 0, block_y: 0, block_z: 0 },
+            SinglePointContext { block_x: 17, block_y: -31, block_z: 29 },
+            SinglePointContext { block_x: -257, block_y: 96, block_z: 511 },
+        ]
+        .map(|context| blended.compute(&context).to_bits());
+
+        let first_min_octave = blended.min_limit_noise.get_octave_noise(0).unwrap();
+        assert_eq!(first_min_octave.xo.to_bits(), first_sequential_octave.xo.to_bits());
+        assert_eq!(first_min_octave.yo.to_bits(), first_sequential_octave.yo.to_bits());
+        assert_eq!(first_min_octave.zo.to_bits(), first_sequential_octave.zo.to_bits());
+        assert_eq!(
+            actual,
+            [
+                13_806_657_722_006_680_984,
+                13_825_007_683_985_784_421,
+                4_591_413_675_873_959_646,
+            ]
+        );
+
+        let mut compatibility_terrain = positional.from_hash_of("minecraft:terrain");
+        let compatibility = BlendedNoiseDensity::new(
+            &mut compatibility_terrain,
+            0.25,
+            0.125,
+            80.0,
+            160.0,
+            8.0,
+        );
+        assert_ne!(
+            compatibility
+                .compute(&SinglePointContext { block_x: 0, block_y: 0, block_z: 0 })
+                .to_bits(),
+            actual[0]
+        );
     }
 
     #[test]

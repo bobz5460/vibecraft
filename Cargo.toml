@@ -10,7 +10,7 @@ winit = "0.30"
 nalgebra = "0.33"
 bytemuck = { version = "1.21", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-noise = "0.9"
+flate2 = "1.1"
 futures = "0.3"
 pollster = "0.4"
 log = "0.4"

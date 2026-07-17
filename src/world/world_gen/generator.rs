@@ -12,7 +12,7 @@ use crate::world::block::{Block, BlockId};
 use crate::world::chunk::{Chunk, CHUNK_HEIGHT, CHUNK_SIZE};
 use crate::world::generation::WorldGenerationProfile;
 use crate::world::world_gen::density_fn::{
-    DensityFunction, InterpolatedContext, SinglePointContext,
+    DenseFn, DensityFunction, InterpolatedContext, ReferenceCellContext, SinglePointContext,
 };
 use crate::world::world_gen::noise::{NoiseSeed, NoiseSettings, PositionalRandomFactory};
 use crate::world::world_gen::noise_router::{NoiseRouter, NoiseRouterData};
@@ -25,9 +25,8 @@ use crate::world::world_gen::decoration::{
     MAX_DECORATION_OPERATIONS,
 };
 
-// Refine only the narrow material-boundary band. This removes visible cell
-// steps while keeping the current bounded cell cache practical until the
-// density graph's Java cache wrappers are fully implemented.
+// Compatibility profiles refine only this narrow material-boundary band.
+// Minecraft26Geometry evaluates the marker-aware graph at every block instead.
 const DENSITY_EXACT_REFINEMENT: f64 = 0.001;
 const DENSITY_BOUNDARY_REFINEMENT: f64 = 0.05;
 const ORE_VEIN_MIN_Y: i32 = -60;
@@ -467,6 +466,29 @@ fn sample_density(router: &NoiseRouter, x: i32, y: i32, z: i32) -> f64 {
     router.final_density.compute(&ctx)
 }
 
+fn block_density(
+    profile: WorldGenerationProfile,
+    final_density: &DenseFn,
+    interpolated_density: f64,
+    compatibility_context: &InterpolatedContext,
+    reference_context: &ReferenceCellContext,
+) -> f64 {
+    if profile.uses_minecraft26_geometry() {
+        return final_density.compute(reference_context);
+    }
+    if interpolated_density.abs() < DENSITY_EXACT_REFINEMENT {
+        final_density.compute(compatibility_context)
+    } else if interpolated_density.abs() < DENSITY_BOUNDARY_REFINEMENT {
+        final_density.compute(&SinglePointContext {
+            block_x: compatibility_context.block_x,
+            block_y: compatibility_context.block_y,
+            block_z: compatibility_context.block_z,
+        })
+    } else {
+        interpolated_density
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Preliminary surface level
 // ---------------------------------------------------------------------------
@@ -521,6 +543,26 @@ fn fallback_stone_type(
     }
 }
 
+fn reference_stone_type(
+    random: &PositionalRandomFactory,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> BlockId {
+    if y <= 0 {
+        BlockId::Deepslate
+    } else if y >= 8 {
+        BlockId::Stone
+    } else {
+        let deepslate_probability = 1.0 - y as f32 / 8.0;
+        if random.at(x, y, z).next_float() < deepslate_probability {
+            BlockId::Deepslate
+        } else {
+            BlockId::Stone
+        }
+    }
+}
+
 fn can_apply_ore_veinifier(y: i32) -> bool {
     y >= ORE_VEIN_MIN_Y && y <= ORE_VEIN_MAX_Y
 }
@@ -542,7 +584,24 @@ pub struct VanillaWorldGenerator {
     biome_source: OverworldBiomeSource,
     aquifer_random: PositionalRandomFactory,
     ore_veins_random: PositionalRandomFactory,
+    deepslate_random: PositionalRandomFactory,
     generation_profile: WorldGenerationProfile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BasePostDensityStage {
+    Surface,
+    Carvers,
+}
+
+fn base_post_density_stages(
+    profile: WorldGenerationProfile,
+) -> [BasePostDensityStage; 2] {
+    if profile.uses_minecraft26_geometry() {
+        [BasePostDensityStage::Surface, BasePostDensityStage::Carvers]
+    } else {
+        [BasePostDensityStage::Carvers, BasePostDensityStage::Surface]
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -564,13 +623,19 @@ impl VanillaWorldGenerator {
         seed: u64,
         generation_profile: WorldGenerationProfile,
     ) -> Self {
-        let biome_source = OverworldBiomeSource::from_router((*router).clone());
+        let biome_source = if generation_profile.uses_minecraft26_geometry() {
+            OverworldBiomeSource::from_router((*router).clone())
+        } else {
+            OverworldBiomeSource::from_router_compatibility((*router).clone())
+        };
         let mut root_seed = NoiseSeed::new(seed);
         let random = root_seed.fork_positional();
         let mut aquifer_seed = random.from_hash_of("minecraft:aquifer");
         let mut ore_seed = random.from_hash_of("minecraft:ore");
+        let mut deepslate_seed = random.from_hash_of("minecraft:deepslate");
         let aquifer_random = aquifer_seed.fork_positional();
         let ore_veins_random = ore_seed.fork_positional();
+        let deepslate_random = deepslate_seed.fork_positional();
         VanillaWorldGenerator {
             router,
             settings: NoiseSettings::OVERWORLD,
@@ -579,13 +644,18 @@ impl VanillaWorldGenerator {
             biome_source,
             aquifer_random,
             ore_veins_random,
+            deepslate_random,
             generation_profile,
         }
     }
 
     /// Convenience constructor that creates the router from a seed.
     pub fn from_seed(seed: u64, generation_profile: WorldGenerationProfile) -> Self {
-        let router = Arc::new(NoiseRouterData::create_overworld_router(seed, false, false));
+        let router = Arc::new(if generation_profile.uses_minecraft26_geometry() {
+            NoiseRouterData::create_overworld_router_reference(seed, false, false)
+        } else {
+            NoiseRouterData::create_overworld_router(seed, false, false)
+        });
         Self::new(router, seed, generation_profile)
     }
 
@@ -624,6 +694,21 @@ impl VanillaWorldGenerator {
         self.generate_undecorated_chunk(chunk);
         if self.generation_profile.uses_native_decoration_preview() {
             self.apply_native_decoration_preview(chunk);
+        } else if self.generation_profile.uses_minecraft26_geometry() {
+            crate::world::world_gen::structure_geometry::apply_minecraft26_structure_geometry(
+                self,
+                self.seed,
+                self.settings.min_y,
+                self.settings.height,
+                chunk,
+            );
+            crate::world::world_gen::features::apply_minecraft26_geometry(
+                self,
+                self.seed,
+                self.settings.min_y,
+                self.settings.height,
+                chunk,
+            );
         }
     }
 
@@ -749,6 +834,7 @@ impl VanillaWorldGenerator {
                         Biome::Plains
                         | Biome::Forest
                         | Biome::BirchForest
+                        | Biome::OldGrowthBirchForest
                         | Biome::FlowerForest
                         | Biome::SunflowerPlains => Some(PreviewTreeKind::Oak),
                         Biome::Taiga
@@ -988,8 +1074,8 @@ impl VanillaWorldGenerator {
     /// This is equivalent to `NoiseBasedChunkGenerator.doFill`:
     /// 1. Create the per-chunk interpolation state.
     /// 2. Iterate over cells in X, Z, Y order.
-    /// 3. Interpolate the cached cell density and refine blocks near a
-    ///    material boundary with marker-aware per-block evaluation.
+    /// 3. Use compatibility interpolation/refinement for old profiles, or
+    ///    marker-aware per-block evaluation for the Geometry profile.
     /// 4. Place stone/deepslate/fluid/air based on density threshold.
     pub fn generate_undecorated_chunk(&self, chunk: &mut Chunk) {
         let cell_width = self.settings.cell_width();
@@ -1014,27 +1100,45 @@ impl VanillaWorldGenerator {
             ),
         );
 
-        // Place bedrock at the bottom of the world (y = min_y)
-        let bottom_local = 0usize;
-        for x in 0..CHUNK_SIZE {
-            for z in 0..CHUNK_SIZE {
-                chunk.set_block(x, bottom_local, z, Block::new(BlockId::Bedrock));
+        if !self.generation_profile.uses_minecraft26_geometry() {
+            // Compatibility profiles retain their single solid bedrock layer.
+            let bottom_local = 0usize;
+            for x in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
+                    chunk.set_block(x, bottom_local, z, Block::new(BlockId::Bedrock));
+                }
             }
         }
 
         let mut nd = NoiseChunkData::new(chunk, self.router.clone(), self.settings, self.aquifer.clone());
-        nd.initialize_for_first_cell_x();
+        let reference_density = self.generation_profile.uses_minecraft26_geometry();
+        if !reference_density {
+            nd.initialize_for_first_cell_x();
+        }
         let mut column_stone_noise = [None; CHUNK_SIZE * CHUNK_SIZE];
 
         // The main doFill loop.
         for cell_x_index in 0..cell_count_xz {
-            nd.advance_cell_x(cell_x_index);
+            if !reference_density {
+                nd.advance_cell_x(cell_x_index);
+            }
 
             for cell_z_index in 0..cell_count_xz {
                 for cell_y_index in (0..cell_count_y).rev() {
-                    nd.select_cell_yz(cell_y_index, cell_z_index);
+                    if !reference_density {
+                        nd.select_cell_yz(cell_y_index, cell_z_index);
+                    }
 
                     let cell_start_y = (cell_min_y + cell_y_index) * cell_height;
+                    let cell_start_x = nd.chunk_start_x + cell_x_index * cell_width;
+                    let cell_start_z = nd.chunk_start_z + cell_z_index * cell_width;
+                    let reference_context = ReferenceCellContext::new(
+                        cell_start_x,
+                        cell_start_y,
+                        cell_start_z,
+                        cell_width,
+                        cell_height,
+                    );
 
                     for y_in_cell in (0..cell_height).rev() {
                         let pos_y = cell_start_y + y_in_cell;
@@ -1046,7 +1150,9 @@ impl VanillaWorldGenerator {
                         let y_local = pos_y - self.settings.min_y;
 
                         let factor_y = y_in_cell as f64 / cell_height as f64;
-                        nd.update_for_y(factor_y);
+                        if !reference_density {
+                            nd.update_for_y(factor_y);
+                        }
 
                         for x_in_cell in 0..cell_width {
                             let pos_x = nd.chunk_start_x + cell_x_index * cell_width + x_in_cell;
@@ -1056,7 +1162,9 @@ impl VanillaWorldGenerator {
                             }
 
                             let factor_x = x_in_cell as f64 / cell_width as f64;
-                            nd.update_for_x(factor_x);
+                            if !reference_density {
+                                nd.update_for_x(factor_x);
+                            }
 
                             for z_in_cell in 0..cell_width {
                                 let pos_z = nd.chunk_start_z + cell_z_index * cell_width + z_in_cell;
@@ -1066,39 +1174,46 @@ impl VanillaWorldGenerator {
                                 }
 
                                 let factor_z = z_in_cell as f64 / cell_width as f64;
-                                nd.update_for_z(factor_z);
+                                if !reference_density {
+                                    nd.update_for_z(factor_z);
+                                }
 
                                 let interpolated_density = nd.value;
-                                let context = InterpolatedContext::new(
+                                let compatibility_context = InterpolatedContext::new(
                                     pos_x,
                                     pos_y,
                                     pos_z,
                                     cell_width,
                                     cell_height,
                                 );
-                                let density = if interpolated_density.abs() < DENSITY_EXACT_REFINEMENT {
-                                    self.router.final_density.compute(&context)
-                                } else if interpolated_density.abs() < DENSITY_BOUNDARY_REFINEMENT {
-                                    let point_context = SinglePointContext {
-                                        block_x: pos_x,
-                                        block_y: pos_y,
-                                        block_z: pos_z,
-                                    };
-                                    self.router.final_density.compute(&point_context)
-                                } else {
-                                    interpolated_density
-                                };
+                                reference_context.set_position(pos_x, pos_y, pos_z);
+                                let density = block_density(
+                                    self.generation_profile,
+                                    &self.router.final_density,
+                                    interpolated_density,
+                                    &compatibility_context,
+                                    &reference_context,
+                                );
 
                                 let aquifer_block =
                                     aquifer.compute_substance(pos_x, pos_y, pos_z, density);
                                 let block_id = if density > 0.0 || aquifer_block.is_none() {
                                     let column_index = x_chunk * CHUNK_SIZE + z_chunk;
                                     let mut fallback_stone = || {
-                                        fallback_stone_type(
-                                            pos_y,
-                                            &mut column_stone_noise[column_index],
-                                            || sample_density_2d(&self.router, pos_x, pos_z),
-                                        )
+                                        if self.generation_profile.uses_minecraft26_geometry() {
+                                            reference_stone_type(
+                                                &self.deepslate_random,
+                                                pos_x,
+                                                pos_y,
+                                                pos_z,
+                                            )
+                                        } else {
+                                            fallback_stone_type(
+                                                pos_y,
+                                                &mut column_stone_noise[column_index],
+                                                || sample_density_2d(&self.router, pos_x, pos_z),
+                                            )
+                                        }
                                     };
                                     if can_apply_ore_veinifier(pos_y) {
                                         let ore_context = SinglePointContext {
@@ -1130,27 +1245,75 @@ impl VanillaWorldGenerator {
                     }
                 }
             }
-            if self.generation_profile.uses_corrected_interpolation() {
+            if !reference_density && self.generation_profile.uses_corrected_interpolation() {
                 nd.swap_slices();
             }
         }
 
-        nd.stop_interpolation();
+        if !reference_density {
+            nd.stop_interpolation();
+        }
 
-        // Carve caves and canyons (post-density, pre-surface-rules, matching Java order)
-        crate::world::world_gen::carver::carve_overworld_chunk(
-            chunk,
-            self.seed,
-            &mut aquifer,
-            self.settings.min_y,
-            self.settings.height,
-        );
+        for stage in base_post_density_stages(self.generation_profile) {
+            match stage {
+                BasePostDensityStage::Surface => self.apply_surface(chunk, sea_level),
+                BasePostDensityStage::Carvers => {
+                    if self.generation_profile.uses_minecraft26_geometry() {
+                        crate::world::world_gen::carver::carve_overworld_chunk_reference(
+                            chunk,
+                            self.seed,
+                            &mut aquifer,
+                            self.settings.min_y,
+                            self.settings.height,
+                            |x, y, z| self.get_biome_at(x, y, z),
+                        );
+                    } else {
+                        crate::world::world_gen::carver::carve_overworld_chunk(
+                            chunk,
+                            self.seed,
+                            &mut aquifer,
+                            self.settings.min_y,
+                            self.settings.height,
+                        );
+                    }
+                }
+            }
+        }
 
-        let system = SurfaceSystem::create_ref_from_seed(
-            BlockId::Stone,
-            sea_level,
-            self.seed,
-        );
+        chunk.recount_fluids();
+        chunk.is_dirty = true;
+    }
+
+    fn apply_surface(&self, chunk: &mut Chunk, sea_level: i32) {
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, sea_level, self.seed);
+        if self.generation_profile.uses_minecraft26_geometry() {
+            let mut surface_biomes =
+                SurfaceBiomeQuartCache::new(chunk.cx, chunk.cz, self.settings.min_y);
+            let biome_source = self.biome_source.clone();
+            let router = self.router.clone();
+            SurfaceSystem::build_reference_overworld_surface(
+                system,
+                chunk,
+                sea_level,
+                self.settings.min_y,
+                move |x, y, z| {
+                    surface_biomes.get_or_insert_with(x, y, z, |quart_x, quart_y, quart_z| {
+                        match biome_source.get_biome_quart(quart_x, quart_y, quart_z) {
+                            Ok(biome) => biome,
+                            Err(unsupported) => {
+                                log::warn!(
+                                    "{} at quart ({quart_x}, {quart_y}, {quart_z}); using plains compatibility biome",
+                                    unsupported
+                                );
+                                Biome::Plains
+                            }
+                        }
+                    })
+                },
+                move |x, z| preliminary_surface_level(&router, x, z),
+            );
+            return;
+        }
         let surface_rules = default_overworld_rules(system.clone());
         let surface_source = StaticRuleSource::new(surface_rules);
         let mut surface_biomes =
@@ -1177,9 +1340,6 @@ impl VanillaWorldGenerator {
                 })
             },
         );
-
-        chunk.recount_fluids();
-        chunk.is_dirty = true;
     }
 
     // ------------------------------------------------------------------
@@ -1190,6 +1350,21 @@ impl VanillaWorldGenerator {
     /// preliminary_surface_level function.
     pub fn get_height(&self, x: i32, z: i32) -> i32 {
         preliminary_surface_level(&self.router, x, z)
+    }
+
+    /// Returns the final surface/carver base column used by Geometry structures.
+    /// This deliberately excludes structures and placed features, so callers can
+    /// query source-owned starts without reading a loaded neighbor chunk.
+    pub(crate) fn geometry_base_column(&self, x: i32, z: i32) -> Vec<Block> {
+        let chunk_x = x.div_euclid(CHUNK_SIZE as i32);
+        let chunk_z = z.div_euclid(CHUNK_SIZE as i32);
+        let mut chunk = Chunk::new(chunk_x, chunk_z);
+        self.generate_undecorated_chunk(&mut chunk);
+        let local_x = x.rem_euclid(CHUNK_SIZE as i32) as usize;
+        let local_z = z.rem_euclid(CHUNK_SIZE as i32) as usize;
+        (0..crate::world::chunk::CHUNK_HEIGHT)
+            .map(|local_y| chunk.get_block(local_x, local_y, local_z))
+            .collect()
     }
 
     /// Return the density value at a single block position (for debugging).
@@ -1286,6 +1461,14 @@ mod tests {
     use crate::world::coordinates::WorldCoordinateProfile;
     use crate::world::world_gen::noise_router::NoiseRouterData;
 
+    fn chunk_fingerprint(chunk: &Chunk) -> u64 {
+        chunk.blocks.iter().fold(0xcbf29ce484222325_u64, |hash, block| {
+            let block_bits =
+                (block.id as u64) | ((block.state as u64) << 16) | ((block.data as u64) << 32);
+            (hash ^ block_bits).wrapping_mul(0x100000001b3)
+        })
+    }
+
     #[test]
     fn test_cell_corners_trilerp() {
         let corners = CellCorners {
@@ -1345,6 +1528,39 @@ mod tests {
     }
 
     #[test]
+    fn reference_deepslate_uses_named_positional_zero_to_eight_transition() {
+        let mut root = NoiseSeed::new(0x5EED);
+        let positional = root.fork_positional();
+        let mut named = positional.from_hash_of("minecraft:deepslate");
+        let random = named.fork_positional();
+
+        assert_eq!(reference_stone_type(&random, 4, 0, -7), BlockId::Deepslate);
+        assert_eq!(reference_stone_type(&random, 4, 8, -7), BlockId::Stone);
+        assert_eq!(
+            reference_stone_type(&random, 4, 3, -7),
+            reference_stone_type(&random, 4, 3, -7)
+        );
+    }
+
+    #[test]
+    fn geometry_uses_java_surface_before_carvers_stage_order() {
+        assert_eq!(
+            base_post_density_stages(WorldGenerationProfile::Minecraft26Geometry),
+            [BasePostDensityStage::Surface, BasePostDensityStage::Carvers]
+        );
+        for profile in [
+            WorldGenerationProfile::LegacyPreCorrectedInterpolation,
+            WorldGenerationProfile::Minecraft26Base,
+            WorldGenerationProfile::Minecraft26NativeDecorationPreview,
+        ] {
+            assert_eq!(
+                base_post_density_stages(profile),
+                [BasePostDensityStage::Carvers, BasePostDensityStage::Surface]
+            );
+        }
+    }
+
+    #[test]
     fn surface_biome_cache_uses_canonical_negative_quart_keys() {
         assert_eq!(SurfaceBiomeQuartCache::quart_key(-1, -1, -1), (-1, -1, -1));
         assert_eq!(SurfaceBiomeQuartCache::quart_key(-4, -4, -4), (-1, -1, -1));
@@ -1393,11 +1609,59 @@ mod tests {
         let mut chunk = Chunk::new(3, -2);
         generator.generate_undecorated_chunk(&mut chunk);
 
-        let fingerprint = chunk.blocks.iter().fold(0xcbf29ce484222325_u64, |hash, block| {
-            let block_bits = (block.id as u64) | ((block.state as u64) << 16) | ((block.data as u64) << 32);
-            (hash ^ block_bits).wrapping_mul(0x100000001b3)
-        });
+        let fingerprint = chunk_fingerprint(&chunk);
         assert_eq!(fingerprint, 13_316_232_380_495_532_990);
+    }
+
+    #[test]
+    fn compatibility_profile_fingerprints_remain_isolated_from_geometry() {
+        let fixtures = [
+            (
+                WorldGenerationProfile::LegacyPreCorrectedInterpolation,
+                6_017_666_923_416_231_718,
+            ),
+            (
+                WorldGenerationProfile::Minecraft26Base,
+                13_316_232_380_495_532_990,
+            ),
+            (
+                WorldGenerationProfile::Minecraft26NativeDecorationPreview,
+                13_316_232_380_495_532_990,
+            ),
+        ];
+
+        for (profile, expected) in fixtures {
+            let generator = VanillaWorldGenerator::from_seed(0x5EED, profile);
+            let mut chunk = Chunk::new(3, -2);
+            generator.generate_chunk(&mut chunk);
+            assert_eq!(chunk_fingerprint(&chunk), expected, "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn geometry_density_is_independent_of_compatibility_refinement_thresholds() {
+        let density = crate::world::world_gen::density_fn::y_clamped_gradient(0, 8, 0.0, 8.0);
+        let compatibility_context = InterpolatedContext::new(1, 4, 1, 4, 8);
+        let reference_context = ReferenceCellContext::new(0, 0, 0, 4, 8);
+        reference_context.set_position(1, 4, 1);
+
+        for interpolated in [
+            DENSITY_EXACT_REFINEMENT * 0.5,
+            DENSITY_EXACT_REFINEMENT * 2.0,
+            DENSITY_BOUNDARY_REFINEMENT * 0.5,
+            DENSITY_BOUNDARY_REFINEMENT * 2.0,
+        ] {
+            assert_eq!(
+                block_density(
+                    WorldGenerationProfile::Minecraft26Geometry,
+                    &density,
+                    interpolated,
+                    &compatibility_context,
+                    &reference_context,
+                ),
+                4.0,
+            );
+        }
     }
 
     #[test]
@@ -1568,6 +1832,7 @@ mod tests {
             assert_eq!(&*generated.blocks, &*base.blocks, "{profile:?} gained preview decoration");
         }
         assert!(!WorldGenerationProfile::new_world().uses_native_decoration_preview());
+        assert!(WorldGenerationProfile::new_world().uses_minecraft26_geometry());
     }
 
     #[test]

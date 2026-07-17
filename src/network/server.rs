@@ -1453,7 +1453,7 @@ mod tests {
                 username: "Alex".to_string(),
                 world_seed: 42,
                 coordinate_profile: WorldCoordinateProfile::JavaOverworld,
-                generation_profile: WorldGenerationProfile::Minecraft26Base,
+                generation_profile: WorldGenerationProfile::Minecraft26Geometry,
                 spawn: [0.0, 75.0, 0.0],
                 server_tick: 0,
                 view_distance: DEFAULT_RENDER_DISTANCE as u8,

@@ -1,3 +1,5 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -8,7 +10,7 @@ pub trait FunctionContext {
     fn block_x(&self) -> i32;
     fn block_y(&self) -> i32;
     fn block_z(&self) -> i32;
-    fn sample_interpolated(&self, _function: &DenseFn) -> Option<f64> {
+    fn sample_interpolated(&self, _marker_identity: usize, _function: &DenseFn) -> Option<f64> {
         None
     }
 }
@@ -17,8 +19,8 @@ impl FunctionContext for Box<dyn FunctionContext + '_> {
     fn block_x(&self) -> i32 { (**self).block_x() }
     fn block_y(&self) -> i32 { (**self).block_y() }
     fn block_z(&self) -> i32 { (**self).block_z() }
-    fn sample_interpolated(&self, function: &DenseFn) -> Option<f64> {
-        (**self).sample_interpolated(function)
+    fn sample_interpolated(&self, marker_identity: usize, function: &DenseFn) -> Option<f64> {
+        (**self).sample_interpolated(marker_identity, function)
     }
 }
 
@@ -39,8 +41,8 @@ impl<'a> FunctionContext for &'a dyn FunctionContext {
     fn block_x(&self) -> i32 { (**self).block_x() }
     fn block_y(&self) -> i32 { (**self).block_y() }
     fn block_z(&self) -> i32 { (**self).block_z() }
-    fn sample_interpolated(&self, function: &DenseFn) -> Option<f64> {
-        (**self).sample_interpolated(function)
+    fn sample_interpolated(&self, marker_identity: usize, function: &DenseFn) -> Option<f64> {
+        (**self).sample_interpolated(marker_identity, function)
     }
 }
 
@@ -72,7 +74,7 @@ impl FunctionContext for InterpolatedContext {
     fn block_y(&self) -> i32 { self.block_y }
     fn block_z(&self) -> i32 { self.block_z }
 
-    fn sample_interpolated(&self, function: &DenseFn) -> Option<f64> {
+    fn sample_interpolated(&self, _marker_identity: usize, function: &DenseFn) -> Option<f64> {
         let x0 = self.block_x.div_euclid(self.cell_width) * self.cell_width;
         let y0 = self.block_y.div_euclid(self.cell_height) * self.cell_height;
         let z0 = self.block_z.div_euclid(self.cell_width) * self.cell_width;
@@ -100,6 +102,122 @@ impl FunctionContext for InterpolatedContext {
         let y00 = x00 + (x10 - x00) * fy;
         let y01 = x01 + (x11 - x01) * fy;
         Some(y00 + (y01 - y00) * fz)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InterpolationCorners([f64; 8]);
+
+impl InterpolationCorners {
+    fn sample(
+        function: &DenseFn,
+        x0: i32,
+        y0: i32,
+        z0: i32,
+        cell_width: i32,
+        cell_height: i32,
+    ) -> Self {
+        let x1 = x0 + cell_width;
+        let y1 = y0 + cell_height;
+        let z1 = z0 + cell_width;
+        let sample = |block_x, block_y, block_z| {
+            function.compute(&SinglePointContext { block_x, block_y, block_z })
+        };
+        Self([
+            sample(x0, y0, z0),
+            sample(x1, y0, z0),
+            sample(x0, y1, z0),
+            sample(x1, y1, z0),
+            sample(x0, y0, z1),
+            sample(x1, y0, z1),
+            sample(x0, y1, z1),
+            sample(x1, y1, z1),
+        ])
+    }
+
+    fn trilerp(self, factor_x: f64, factor_y: f64, factor_z: f64) -> f64 {
+        let [v000, v100, v010, v110, v001, v101, v011, v111] = self.0;
+        let x00 = v000 + (v100 - v000) * factor_x;
+        let x10 = v010 + (v110 - v010) * factor_x;
+        let x01 = v001 + (v101 - v001) * factor_x;
+        let x11 = v011 + (v111 - v011) * factor_x;
+        let y0 = x00 + (x10 - x00) * factor_y;
+        let y1 = x01 + (x11 - x01) * factor_y;
+        y0 + (y1 - y0) * factor_z
+    }
+}
+
+/// Java-style block context for one 4x8x4 noise cell. Unmarked functions see
+/// the current block position; each explicit interpolated marker owns one
+/// lazily sampled set of cell corners.
+pub struct ReferenceCellContext {
+    block_x: Cell<i32>,
+    block_y: Cell<i32>,
+    block_z: Cell<i32>,
+    cell_min_x: i32,
+    cell_min_y: i32,
+    cell_min_z: i32,
+    cell_width: i32,
+    cell_height: i32,
+    interpolated: RefCell<HashMap<usize, InterpolationCorners>>,
+}
+
+impl ReferenceCellContext {
+    pub fn new(
+        cell_min_x: i32,
+        cell_min_y: i32,
+        cell_min_z: i32,
+        cell_width: i32,
+        cell_height: i32,
+    ) -> Self {
+        Self {
+            block_x: Cell::new(cell_min_x),
+            block_y: Cell::new(cell_min_y),
+            block_z: Cell::new(cell_min_z),
+            cell_min_x,
+            cell_min_y,
+            cell_min_z,
+            cell_width,
+            cell_height,
+            interpolated: RefCell::new(HashMap::new()),
+        }
+    }
+
+    pub fn set_position(&self, block_x: i32, block_y: i32, block_z: i32) {
+        debug_assert!((self.cell_min_x..self.cell_min_x + self.cell_width).contains(&block_x));
+        debug_assert!((self.cell_min_y..self.cell_min_y + self.cell_height).contains(&block_y));
+        debug_assert!((self.cell_min_z..self.cell_min_z + self.cell_width).contains(&block_z));
+        self.block_x.set(block_x);
+        self.block_y.set(block_y);
+        self.block_z.set(block_z);
+    }
+}
+
+impl FunctionContext for ReferenceCellContext {
+    fn block_x(&self) -> i32 { self.block_x.get() }
+    fn block_y(&self) -> i32 { self.block_y.get() }
+    fn block_z(&self) -> i32 { self.block_z.get() }
+
+    fn sample_interpolated(&self, marker_identity: usize, function: &DenseFn) -> Option<f64> {
+        let cached = self.interpolated.borrow().get(&marker_identity).copied();
+        let corners = if let Some(corners) = cached {
+            corners
+        } else {
+            let corners = InterpolationCorners::sample(
+                function,
+                self.cell_min_x,
+                self.cell_min_y,
+                self.cell_min_z,
+                self.cell_width,
+                self.cell_height,
+            );
+            self.interpolated.borrow_mut().insert(marker_identity, corners);
+            corners
+        };
+        let factor_x = (self.block_x.get() - self.cell_min_x) as f64 / self.cell_width as f64;
+        let factor_y = (self.block_y.get() - self.cell_min_y) as f64 / self.cell_height as f64;
+        let factor_z = (self.block_z.get() - self.cell_min_z) as f64 / self.cell_width as f64;
+        Some(corners.trilerp(factor_x, factor_y, factor_z))
     }
 }
 
@@ -834,7 +952,8 @@ impl Clone for Marker {
 impl DensityFunction for Marker {
     fn compute(&self, ctx: &dyn FunctionContext) -> f64 {
         if self.0 == MarkerType::Interpolated {
-            if let Some(value) = ctx.sample_interpolated(&self.1) {
+            let identity = self as *const Marker as usize;
+            if let Some(value) = ctx.sample_interpolated(identity, &self.1) {
                 return value;
             }
         }
@@ -1174,6 +1293,25 @@ fn clamped_map(value: f64, from_start: f64, from_end: f64, to_start: f64, to_end
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct CountingCoordinates(Arc<AtomicUsize>);
+
+    impl DensityFunction for CountingCoordinates {
+        fn compute(&self, ctx: &dyn FunctionContext) -> f64 {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            let x = ctx.block_x() as f64;
+            let y = ctx.block_y() as f64;
+            let z = ctx.block_z() as f64;
+            x * x + y * y + z * z
+        }
+
+        fn min_value(&self) -> f64 { 0.0 }
+        fn max_value(&self) -> f64 { f64::INFINITY }
+        fn map_children(&self, _visitor: &dyn Visitor) -> DenseFn { self.clone_dyn() }
+        fn clone_dyn(&self) -> DenseFn { DenseFn(Box::new(self.clone())) }
+    }
 
     #[test]
     fn test_constant() {
@@ -1189,11 +1327,30 @@ mod tests {
         let nonlinear = square(y_clamped_gradient(0, 8, 0.0, 8.0));
         let marked = interpolated(nonlinear.clone());
         let point = SinglePointContext { block_x: 1, block_y: 4, block_z: 1 };
-        let cell = InterpolatedContext::new(1, 4, 1, 4, 8);
+        let cell = ReferenceCellContext::new(0, 0, 0, 4, 8);
+        cell.set_position(1, 4, 1);
 
         assert!((nonlinear.compute(&cell) - 16.0).abs() < 1e-12);
         assert!((marked.compute(&point) - 16.0).abs() < 1e-12);
         assert!((marked.compute(&cell) - 32.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reference_cell_context_caches_each_markers_corners_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let marked = interpolated(DenseFn(Box::new(CountingCoordinates(calls.clone()))));
+        let cell = ReferenceCellContext::new(0, 0, 0, 4, 8);
+
+        cell.set_position(1, 4, 1);
+        assert_eq!(marked.compute(&cell), 40.0);
+        cell.set_position(3, 7, 3);
+        assert_eq!(marked.compute(&cell), 80.0);
+        assert_eq!(calls.load(Ordering::Relaxed), 8);
+
+        let next_cell = ReferenceCellContext::new(4, 0, 0, 4, 8);
+        next_cell.set_position(5, 4, 1);
+        marked.compute(&next_cell);
+        assert_eq!(calls.load(Ordering::Relaxed), 16);
     }
 
     #[test]

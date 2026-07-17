@@ -87,12 +87,20 @@ pub struct TerrainSpline {
     points: Vec<TerrainControlPoint>,
     min_value: f64,
     max_value: f64,
+    evaluation: SplineEvaluation,
+}
+
+#[derive(Clone, Copy)]
+enum SplineEvaluation {
+    Legacy,
+    Java,
 }
 
 impl TerrainSpline {
     fn new(
         coordinate: SplineCoordinate,
         points: Vec<TerrainControlPoint>,
+        evaluation: SplineEvaluation,
     ) -> Self {
         let (min_value, max_value) = compute_bounds(&points);
         Self {
@@ -100,6 +108,7 @@ impl TerrainSpline {
             points,
             min_value,
             max_value,
+            evaluation,
         }
     }
 
@@ -151,7 +160,10 @@ impl TerrainSpline {
         }
 
         let t = (x - p1.location) / dx;
-        let a = p1.derivative * dx - y2 - y1;
+        let a = match self.evaluation {
+            SplineEvaluation::Legacy => p1.derivative * dx - y2 - y1,
+            SplineEvaluation::Java => p1.derivative * dx - (y2 - y1),
+        };
         let b = -p2.derivative * dx + y2 - y1;
         y1 + t * (y2 - y1) + t * (1.0 - t) * (a + t * (b - a))
     }
@@ -228,6 +240,7 @@ impl DensityFunction for TerrainSpline {
         DenseFn(Box::new(TerrainSpline::new(
             new_coord,
             new_points,
+            self.evaluation,
         )))
     }
 
@@ -245,6 +258,7 @@ pub struct TerrainSplineBuilder {
     coordinate: SplineCoordinate,
     points: Vec<TerrainControlPoint>,
     transformer: TransformFn,
+    evaluation: SplineEvaluation,
 }
 
 impl TerrainSplineBuilder {
@@ -253,6 +267,27 @@ impl TerrainSplineBuilder {
             coordinate,
             points: Vec::new(),
             transformer,
+            evaluation: SplineEvaluation::Legacy,
+        }
+    }
+
+    fn new_reference(coordinate: SplineCoordinate, transformer: TransformFn) -> Self {
+        Self {
+            coordinate,
+            points: Vec::new(),
+            transformer,
+            evaluation: SplineEvaluation::Java,
+        }
+    }
+
+    fn with_evaluation(
+        coordinate: SplineCoordinate,
+        transformer: TransformFn,
+        evaluation: SplineEvaluation,
+    ) -> Self {
+        match evaluation {
+            SplineEvaluation::Legacy => Self::new(coordinate, transformer),
+            SplineEvaluation::Java => Self::new_reference(coordinate, transformer),
         }
     }
 
@@ -295,7 +330,7 @@ impl TerrainSplineBuilder {
 
     pub fn build(self) -> TerrainSpline {
         assert!(!self.points.is_empty(), "spline must contain control points");
-        TerrainSpline::new(self.coordinate, self.points)
+        TerrainSpline::new(self.coordinate, self.points, self.evaluation)
     }
 }
 
@@ -356,10 +391,11 @@ fn ridge_spline(
     peaks: f32,
     min_valley_steepness: f32,
     transformer: TransformFn,
+    evaluation: SplineEvaluation,
 ) -> TerrainSpline {
     let d1 = (0.5 * (low - valley)).max(min_valley_steepness);
     let d2 = 5.0 * (mid - low);
-    TerrainSplineBuilder::new(ridges, transformer)
+    TerrainSplineBuilder::with_evaluation(ridges, transformer, evaluation)
         .point_with_derivative(-1.0, valley, d1)
         .point_with_derivative(-0.4, low, d1.min(d2))
         .point_with_derivative(0.0, mid, d2)
@@ -377,6 +413,7 @@ fn build_mountain_ridge_spline_with_points(
     modulation: f32,
     saddle: bool,
     transformer: TransformFn,
+    evaluation: SplineEvaluation,
 ) -> TerrainSpline {
     let allow_rivers_below = -0.7;
     let min_point_continentalness = mountain_continentalness(-1.0, modulation, allow_rivers_below);
@@ -386,7 +423,7 @@ fn build_mountain_ridge_spline_with_points(
 
     let after_river_point = -0.65;
 
-    let mut builder = TerrainSplineBuilder::new(ridges, transformer);
+    let mut builder = TerrainSplineBuilder::with_evaluation(ridges, transformer, evaluation);
 
     if after_river_point < ridge_zero_point && ridge_zero_point < 1.0
     {
@@ -464,24 +501,28 @@ fn build_erosion_offset_spline(
     include_extreme_hills: bool,
     saddle: bool,
     offset_transformer: TransformFn,
+    evaluation: SplineEvaluation,
 ) -> TerrainSpline {
     let very_low_erosion_mountains = build_mountain_ridge_spline_with_points(
         ridges.clone(),
         lerp(mountain_factor, 0.6, 1.5),
         saddle,
         offset_transformer,
+        evaluation,
     );
     let low_erosion_mountains = build_mountain_ridge_spline_with_points(
         ridges.clone(),
         lerp(mountain_factor, 0.6, 1.0),
         saddle,
         offset_transformer,
+        evaluation,
     );
     let mountains = build_mountain_ridge_spline_with_points(
         ridges.clone(),
         mountain_factor,
         saddle,
         offset_transformer,
+        evaluation,
     );
 
     let mid_wide = lerp(0.5, 0.5, 0.5) * mountain_factor;
@@ -495,6 +536,7 @@ fn build_erosion_offset_spline(
         0.6 * mountain_factor,
         0.5,
         offset_transformer,
+        evaluation,
     );
 
     let narrow_plateau = ridge_spline(
@@ -506,6 +548,7 @@ fn build_erosion_offset_spline(
         0.6 * mountain_factor,
         0.5,
         offset_transformer,
+        evaluation,
     );
 
     let plains = ridge_spline(
@@ -517,6 +560,7 @@ fn build_erosion_offset_spline(
         tall_hill,
         0.5,
         offset_transformer,
+        evaluation,
     );
 
     let plains_far_inland = ridge_spline(
@@ -528,9 +572,14 @@ fn build_erosion_offset_spline(
         tall_hill,
         0.5,
         offset_transformer,
+        evaluation,
     );
 
-    let extreme_hills = TerrainSplineBuilder::new(ridges.clone(), offset_transformer)
+    let extreme_hills = TerrainSplineBuilder::with_evaluation(
+        ridges.clone(),
+        offset_transformer,
+        evaluation,
+    )
         .point(-1.0, low_valley)
         .point(-0.4, plains.clone())
         .point(0.0, tall_hill + 0.07)
@@ -545,9 +594,14 @@ fn build_erosion_offset_spline(
         tall_hill,
         0.0,
         offset_transformer,
+        evaluation,
     );
 
-    let mut builder = TerrainSplineBuilder::new(erosion, offset_transformer)
+    let mut builder = TerrainSplineBuilder::with_evaluation(
+        erosion,
+        offset_transformer,
+        evaluation,
+    )
         .point(-0.85, very_low_erosion_mountains)
         .point(-0.7, low_erosion_mountains)
         .point(-0.4, mountains)
@@ -579,25 +633,34 @@ fn get_erosion_factor(
     base_value: f32,
     shattered_terrain: bool,
     factor_transformer: TransformFn,
+    evaluation: SplineEvaluation,
 ) -> TerrainSpline {
-    let base_spline = TerrainSplineBuilder::new(weirdness.clone(), factor_transformer)
+    let base_spline = TerrainSplineBuilder::with_evaluation(
+        weirdness.clone(),
+        factor_transformer,
+        evaluation,
+    )
         .point(-0.2, 6.3)
         .point(0.2, base_value)
         .build();
 
     let weirdness_spline_neg =
-        TerrainSplineBuilder::new(weirdness.clone(), factor_transformer)
+        TerrainSplineBuilder::with_evaluation(weirdness.clone(), factor_transformer, evaluation)
             .point(-0.05, 6.3)
             .point(0.05, 2.67)
             .build();
 
     let weirdness_spline_pos =
-        TerrainSplineBuilder::new(weirdness.clone(), factor_transformer)
+        TerrainSplineBuilder::with_evaluation(weirdness.clone(), factor_transformer, evaluation)
             .point(-0.05, 2.67)
             .point(0.05, 6.3)
             .build();
 
-    let mut erosion_points = TerrainSplineBuilder::new(erosion, factor_transformer)
+    let mut erosion_points = TerrainSplineBuilder::with_evaluation(
+        erosion,
+        factor_transformer,
+        evaluation,
+    )
         .point(-0.6, base_spline.clone())
         .point(-0.5, weirdness_spline_neg)
         .point(-0.35, base_spline.clone())
@@ -607,12 +670,13 @@ fn get_erosion_factor(
 
     if shattered_terrain {
         let weirdness_shattered =
-            TerrainSplineBuilder::new(weirdness, factor_transformer)
+            TerrainSplineBuilder::with_evaluation(weirdness, factor_transformer, evaluation)
                 .point(0.0, base_value)
                 .point(0.1, 0.625)
                 .build();
 
-        let ridges_shattered = TerrainSplineBuilder::new(ridges, factor_transformer)
+        let ridges_shattered =
+            TerrainSplineBuilder::with_evaluation(ridges, factor_transformer, evaluation)
             .point(-0.9, base_value)
             .point(-0.69, weirdness_shattered)
             .build();
@@ -624,13 +688,13 @@ fn get_erosion_factor(
             .point(0.62, base_value);
     } else {
         let extreme_hills_terrain_from_mid_slice_and_up =
-            TerrainSplineBuilder::new(ridges.clone(), factor_transformer)
+            TerrainSplineBuilder::with_evaluation(ridges.clone(), factor_transformer, evaluation)
                 .point(-0.7, base_spline.clone())
                 .point(-0.15, 1.37)
                 .build();
 
         let extra_3d_noise_on_peaks_only =
-            TerrainSplineBuilder::new(ridges, factor_transformer)
+            TerrainSplineBuilder::with_evaluation(ridges, factor_transformer, evaluation)
                 .point(0.45, base_spline.clone())
                 .point(0.7, 1.56)
                 .build();
@@ -654,11 +718,12 @@ fn build_weirdness_jaggedness_spline(
     weirdness: SplineCoordinate,
     jaggedness_factor: f32,
     jaggedness_transformer: TransformFn,
+    evaluation: SplineEvaluation,
 ) -> TerrainSpline {
     let max_jaggedness_at_negative_weirdness = 0.63 * jaggedness_factor;
     let max_jaggedness_at_positive_weirdness = 0.3 * jaggedness_factor;
 
-    TerrainSplineBuilder::new(weirdness, jaggedness_transformer)
+    TerrainSplineBuilder::with_evaluation(weirdness, jaggedness_transformer, evaluation)
         .point(-0.01, max_jaggedness_at_negative_weirdness)
         .point(0.01, max_jaggedness_at_positive_weirdness)
         .build()
@@ -670,13 +735,14 @@ fn build_ridge_jaggedness_spline(
     jaggedness_factor_at_peak_ridge: f32,
     jaggedness_factor_at_high_ridge: f32,
     jaggedness_transformer: TransformFn,
+    evaluation: SplineEvaluation,
 ) -> TerrainSpline {
     let high_slice_start = peaks_and_valleys(0.4);
     let high_slice_end = peaks_and_valleys(0.56666666);
     let high_slice_middle = (high_slice_start + high_slice_end) / 2.0;
 
     let mut ridge_spline_builder =
-        TerrainSplineBuilder::new(ridges, jaggedness_transformer);
+        TerrainSplineBuilder::with_evaluation(ridges, jaggedness_transformer, evaluation);
     ridge_spline_builder = ridge_spline_builder.point(high_slice_start, 0.0);
 
     if jaggedness_factor_at_high_ridge > 0.0 {
@@ -684,6 +750,7 @@ fn build_ridge_jaggedness_spline(
             weirdness.clone(),
             jaggedness_factor_at_high_ridge,
             jaggedness_transformer,
+            evaluation,
         );
         ridge_spline_builder =
             ridge_spline_builder.point(high_slice_middle, weirdness_jaggedness_spline);
@@ -696,6 +763,7 @@ fn build_ridge_jaggedness_spline(
             weirdness,
             jaggedness_factor_at_peak_ridge,
             jaggedness_transformer,
+            evaluation,
         );
         ridge_spline_builder =
             ridge_spline_builder.point(1.0, weirdness_jaggedness_spline);
@@ -715,6 +783,7 @@ fn build_erosion_jaggedness_spline(
     jaggedness_factor_at_high_ridge_and_erosion_index_0: f32,
     jaggedness_factor_at_high_ridge_and_erosion_index_1: f32,
     jaggedness_transformer: TransformFn,
+    evaluation: SplineEvaluation,
 ) -> TerrainSpline {
     let ridge_jaggedness_spline_at_erosion_0 = build_ridge_jaggedness_spline(
         weirdness.clone(),
@@ -722,6 +791,7 @@ fn build_erosion_jaggedness_spline(
         jaggedness_factor_at_peak_ridge_and_erosion_index_0,
         jaggedness_factor_at_high_ridge_and_erosion_index_0,
         jaggedness_transformer,
+        evaluation,
     );
     let ridge_jaggedness_spline_at_erosion_1 = build_ridge_jaggedness_spline(
         weirdness,
@@ -729,9 +799,10 @@ fn build_erosion_jaggedness_spline(
         jaggedness_factor_at_peak_ridge_and_erosion_index_1,
         jaggedness_factor_at_high_ridge_and_erosion_index_1,
         jaggedness_transformer,
+        evaluation,
     );
 
-    TerrainSplineBuilder::new(erosion, jaggedness_transformer)
+    TerrainSplineBuilder::with_evaluation(erosion, jaggedness_transformer, evaluation)
         .point(-1.0, ridge_jaggedness_spline_at_erosion_0)
         .point(-0.78, ridge_jaggedness_spline_at_erosion_1.clone())
         .point(-0.5775, ridge_jaggedness_spline_at_erosion_1)
@@ -761,6 +832,37 @@ pub fn overworld_offset(
     ridges: SplineCoordinate,
     amplified: bool,
 ) -> TerrainSpline {
+    overworld_offset_with_evaluation(
+        continents,
+        erosion,
+        ridges,
+        amplified,
+        SplineEvaluation::Legacy,
+    )
+}
+
+pub fn overworld_offset_reference(
+    continents: SplineCoordinate,
+    erosion: SplineCoordinate,
+    ridges: SplineCoordinate,
+    amplified: bool,
+) -> TerrainSpline {
+    overworld_offset_with_evaluation(
+        continents,
+        erosion,
+        ridges,
+        amplified,
+        SplineEvaluation::Java,
+    )
+}
+
+fn overworld_offset_with_evaluation(
+    continents: SplineCoordinate,
+    erosion: SplineCoordinate,
+    ridges: SplineCoordinate,
+    amplified: bool,
+    evaluation: SplineEvaluation,
+) -> TerrainSpline {
     let offset_transformer: TransformFn = if amplified {
         amplified_offset
     } else {
@@ -773,6 +875,7 @@ pub fn overworld_offset(
         -0.15, 0.0, 0.0, 0.1, 0.0, -0.03,
         false, false,
         offset_transformer,
+        evaluation,
     );
     let low_spline = build_erosion_offset_spline(
         erosion.clone(),
@@ -780,6 +883,7 @@ pub fn overworld_offset(
         -0.1, 0.03, 0.1, 0.1, 0.01, -0.03,
         false, false,
         offset_transformer,
+        evaluation,
     );
     let mid_spline = build_erosion_offset_spline(
         erosion.clone(),
@@ -787,6 +891,7 @@ pub fn overworld_offset(
         -0.1, 0.03, 0.1, 0.7, 0.01, -0.03,
         true, true,
         offset_transformer,
+        evaluation,
     );
     let high_spline = build_erosion_offset_spline(
         erosion,
@@ -794,9 +899,10 @@ pub fn overworld_offset(
         -0.05, 0.03, 0.1, 1.0, 0.01, 0.01,
         true, true,
         offset_transformer,
+        evaluation,
     );
 
-    TerrainSplineBuilder::new(continents, offset_transformer)
+    TerrainSplineBuilder::with_evaluation(continents, offset_transformer, evaluation)
         .point(-1.1, 0.044)
         .point(-1.02, -0.2222)
         .point(-0.51, -0.2222)
@@ -821,13 +927,48 @@ pub fn overworld_factor(
     ridges: SplineCoordinate,
     amplified: bool,
 ) -> TerrainSpline {
+    overworld_factor_with_evaluation(
+        continents,
+        erosion,
+        weirdness,
+        ridges,
+        amplified,
+        SplineEvaluation::Legacy,
+    )
+}
+
+pub fn overworld_factor_reference(
+    continents: SplineCoordinate,
+    erosion: SplineCoordinate,
+    weirdness: SplineCoordinate,
+    ridges: SplineCoordinate,
+    amplified: bool,
+) -> TerrainSpline {
+    overworld_factor_with_evaluation(
+        continents,
+        erosion,
+        weirdness,
+        ridges,
+        amplified,
+        SplineEvaluation::Java,
+    )
+}
+
+fn overworld_factor_with_evaluation(
+    continents: SplineCoordinate,
+    erosion: SplineCoordinate,
+    weirdness: SplineCoordinate,
+    ridges: SplineCoordinate,
+    amplified: bool,
+    evaluation: SplineEvaluation,
+) -> TerrainSpline {
     let factor_transformer: TransformFn = if amplified {
         amplified_factor
     } else {
         no_transform
     };
 
-    TerrainSplineBuilder::new(continents, no_transform)
+    TerrainSplineBuilder::with_evaluation(continents, no_transform, evaluation)
         .point(-0.19, 3.95)
         .point(
             -0.15,
@@ -838,6 +979,7 @@ pub fn overworld_factor(
                 6.25,
                 true,
                 no_transform,
+                evaluation,
             ),
         )
         .point(
@@ -849,6 +991,7 @@ pub fn overworld_factor(
                 5.47,
                 true,
                 factor_transformer,
+                evaluation,
             ),
         )
         .point(
@@ -860,6 +1003,7 @@ pub fn overworld_factor(
                 5.08,
                 true,
                 factor_transformer,
+                evaluation,
             ),
         )
         .point(
@@ -871,6 +1015,7 @@ pub fn overworld_factor(
                 4.69,
                 false,
                 factor_transformer,
+                evaluation,
             ),
         )
         .build()
@@ -887,13 +1032,48 @@ pub fn overworld_jaggedness(
     ridges: SplineCoordinate,
     amplified: bool,
 ) -> TerrainSpline {
+    overworld_jaggedness_with_evaluation(
+        continents,
+        erosion,
+        weirdness,
+        ridges,
+        amplified,
+        SplineEvaluation::Legacy,
+    )
+}
+
+pub fn overworld_jaggedness_reference(
+    continents: SplineCoordinate,
+    erosion: SplineCoordinate,
+    weirdness: SplineCoordinate,
+    ridges: SplineCoordinate,
+    amplified: bool,
+) -> TerrainSpline {
+    overworld_jaggedness_with_evaluation(
+        continents,
+        erosion,
+        weirdness,
+        ridges,
+        amplified,
+        SplineEvaluation::Java,
+    )
+}
+
+fn overworld_jaggedness_with_evaluation(
+    continents: SplineCoordinate,
+    erosion: SplineCoordinate,
+    weirdness: SplineCoordinate,
+    ridges: SplineCoordinate,
+    amplified: bool,
+    evaluation: SplineEvaluation,
+) -> TerrainSpline {
     let jaggedness_transformer: TransformFn = if amplified {
         amplified_jaggedness
     } else {
         no_transform
     };
 
-    TerrainSplineBuilder::new(continents, jaggedness_transformer)
+    TerrainSplineBuilder::with_evaluation(continents, jaggedness_transformer, evaluation)
         .point(-0.11, 0.0)
         .point(
             0.03,
@@ -903,6 +1083,7 @@ pub fn overworld_jaggedness(
                 ridges.clone(),
                 1.0, 0.5, 0.0, 0.0,
                 jaggedness_transformer,
+                evaluation,
             ),
         )
         .point(
@@ -911,6 +1092,7 @@ pub fn overworld_jaggedness(
                 erosion, weirdness, ridges,
                 1.0, 1.0, 1.0, 0.0,
                 jaggedness_transformer,
+                evaluation,
             ),
         )
         .build()
@@ -930,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn java_cubic_spline_uses_zero_default_derivatives() {
+    fn legacy_cubic_spline_uses_zero_default_derivatives() {
         let spline = TerrainSplineBuilder::new(
             SplineCoordinate(constant(0.25)),
             no_transform,
@@ -942,6 +1124,20 @@ mod tests {
         // CubicSpline.Multipoint.sample at t=.25 with d1=d2=0.
         let expected = 1.5625;
         assert!((spline.compute(&context()) - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn java_cubic_spline_uses_delta_for_first_hermite_term() {
+        let spline = TerrainSplineBuilder::new_reference(
+            SplineCoordinate(constant(0.5)),
+            no_transform,
+        )
+        .point_with_derivative(0.0, 2.0, 1.0)
+        .point_with_derivative(2.0, 5.0, -2.0)
+        .build();
+
+        // Java float arithmetic: t=.25, a=1*2-(5-2)=-1, b=-(-2)*2+(5-2)=7.
+        assert_eq!(spline.compute(&context()) as f32, 2.9375);
     }
 
     #[test]
@@ -990,6 +1186,7 @@ mod tests {
             0.3,
             0.5,
             no_transform,
+            SplineEvaluation::Legacy,
         );
 
         let locations: Vec<f32> = spline.points.iter().map(|point| point.location).collect();

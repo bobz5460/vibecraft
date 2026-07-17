@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "data_version": 10,
+  "kind": "level",
+  "data": {
+    "name": "New World123456",
+    "created_at": 1784319369850,
+    "last_played": 1784319820371,
+    "coordinate_profile": "java_overworld",
+    "generation_profile": "minecraft26_geometry",
+    "seed": 98543321,
+    "tick": 7655,
+    "game_time": 16653,
+    "spawn": [
+      0,
+      71,
+      0
+    ],
+    "gamemode": "creative",
+    "difficulty": "normal",
+    "hardcore": false,
+    "do_daylight_cycle": true,
+    "keep_inventory": false,
+    "experience": 0,
+    "scheduled_ticks": [],
+    "dropped_items": [],
+    "xp_orbs": [],
+    "players": []
+  }
+}

@@ -12,8 +12,28 @@ use crate::world::chunk::{Chunk, CHUNK_HEIGHT, CHUNK_SIZE};
 use crate::world::world_gen::density_fn::{DensityFunction, FunctionContext, NoiseHandle};
 use crate::world::world_gen::noise::{NoiseKey, NormalNoise, NoiseSeed, PositionalRandomFactory};
 use crate::world::world_gen::noise_router::NoiseRouter;
+use crate::world::world_gen::structures::JavaLegacyRandom;
 use crate::world::world_gen::Biome;
-use std::sync::Arc;
+use std::sync::{Arc, Once, OnceLock};
+
+/// Reference branches whose Java output cannot be represented by the current
+/// native block/state model. They are preserved in-place rather than replaced
+/// with a visually similar block.
+pub const MINECRAFT26_REFERENCE_SURFACE_UNSUPPORTED: &[&str] = &[
+    "minecraft:sulfur_caves surface bands require minecraft:cinnabar and minecraft:sulfur",
+    "badlands cave ceilings require minecraft:red_sandstone (only smooth_red_sandstone is registered)",
+    "minecraft:blue_ice is a placed-feature output, not a SurfaceRuleData/SurfaceSystem surface branch",
+];
+
+static REPORT_REFERENCE_SURFACE_UNSUPPORTED: Once = Once::new();
+
+pub fn report_minecraft26_reference_surface_unsupported() {
+    REPORT_REFERENCE_SURFACE_UNSUPPORTED.call_once(|| {
+        for branch in MINECRAFT26_REFERENCE_SURFACE_UNSUPPORTED {
+            log::warn!("unsupported Minecraft 26.2 reference surface branch: {branch}");
+        }
+    });
+}
 
 /// Ordinary fallback materials may reach this far below the preliminary
 /// surface. The current preliminary surface comes from the chunk heightmap;
@@ -139,6 +159,7 @@ pub struct SurfaceContext {
     pub(crate) water_height: i32,
     pub(crate) stone_depth_above: i32,
     pub(crate) stone_depth_below: i32,
+    pub(crate) current_block: BlockId,
     pub(crate) biome: Option<Biome>,
     pub(crate) last_update_y: u64,
 
@@ -150,6 +171,8 @@ pub struct SurfaceContext {
     pub(crate) get_height: Box<dyn FnMut(i32, i32, i32) -> Biome + Send>,
     // Preliminary surface level getter (x, z) -> y
     pub(crate) get_preliminary_surface: Box<dyn Fn(i32, i32) -> i32 + Send + Sync>,
+    pub(crate) reference_preliminary_interpolation: bool,
+    pub(crate) world_surface_heightmap: Option<Vec<i32>>,
 }
 
 impl SurfaceContext {
@@ -184,6 +207,7 @@ impl SurfaceContext {
             water_height: i32::MIN,
             stone_depth_above: 0,
             stone_depth_below: 0,
+            current_block: BlockId::Stone,
             biome: None,
             last_update_y: 0,
             sea_level,
@@ -191,6 +215,8 @@ impl SurfaceContext {
             world_height,
             get_height,
             get_preliminary_surface,
+            reference_preliminary_interpolation: false,
+            world_surface_heightmap: None,
         }
     }
 
@@ -212,6 +238,18 @@ impl SurfaceContext {
         self.stone_depth_below = stone_depth_below;
     }
 
+    fn update_y_with_block(
+        &mut self,
+        stone_depth_above: i32,
+        stone_depth_below: i32,
+        water_height: i32,
+        block_y: i32,
+        current_block: BlockId,
+    ) {
+        self.update_y(stone_depth_above, stone_depth_below, water_height, block_y);
+        self.current_block = current_block;
+    }
+
     pub fn get_surface_secondary(&mut self) -> f64 {
         if self.last_surface_secondary_xz != self.last_update_xz {
             self.last_surface_secondary_xz = self.last_update_xz;
@@ -230,7 +268,23 @@ impl SurfaceContext {
     pub fn get_min_surface_level(&mut self) -> i32 {
         if self.last_min_surface_level_xz != self.last_update_xz {
             self.last_min_surface_level_xz = self.last_update_xz;
-            let prelim = (self.get_preliminary_surface)(self.block_x, self.block_z);
+            let prelim = if self.reference_preliminary_interpolation {
+                let cell_x = self.block_x.div_euclid(16);
+                let cell_z = self.block_z.div_euclid(16);
+                let x0 = cell_x * 16;
+                let z0 = cell_z * 16;
+                let fx = (self.block_x.rem_euclid(16) as f32 / 16.0) as f64;
+                let fz = (self.block_z.rem_euclid(16) as f32 / 16.0) as f64;
+                let p00 = (self.get_preliminary_surface)(x0, z0) as f64;
+                let p10 = (self.get_preliminary_surface)(x0 + 16, z0) as f64;
+                let p01 = (self.get_preliminary_surface)(x0, z0 + 16) as f64;
+                let p11 = (self.get_preliminary_surface)(x0 + 16, z0 + 16) as f64;
+                let north = p00 + fx * (p10 - p00);
+                let south = p01 + fx * (p11 - p01);
+                (north + fz * (south - north)).floor() as i32
+            } else {
+                (self.get_preliminary_surface)(self.block_x, self.block_z)
+            };
             self.min_surface_level = prelim + self.surface_depth - 8;
         }
         self.min_surface_level
@@ -367,10 +421,10 @@ impl WaterConditionEx {
 impl ConditionEx for WaterConditionEx {
     fn test(&self, ctx: &mut SurfaceContext) -> bool {
         if ctx.water_height == i32::MIN {
-            return false;
+            return true;
         }
         let y = ctx.block_y + if self.add_stone_depth { ctx.stone_depth_above } else { 0 };
-        y + self.offset >= ctx.water_height + ctx.surface_depth * self.surface_depth_multiplier
+        y >= ctx.water_height + self.offset + ctx.surface_depth * self.surface_depth_multiplier
     }
 
     fn clone_box(&self) -> Box<dyn ConditionEx> {
@@ -429,38 +483,39 @@ impl ConditionEx for NoiseThresholdConditionEx {
 pub struct VerticalGradientConditionEx {
     true_at_and_below: VerticalAnchor,
     false_at_and_above: VerticalAnchor,
-    random_noise: NoiseHandle,
+    random_factory: PositionalRandomFactory,
 }
 
 impl VerticalGradientConditionEx {
     pub fn new(
         seed: u64,
-        _random_name: &str,
+        random_name: &str,
         true_at_and_below: VerticalAnchor,
         false_at_and_above: VerticalAnchor,
     ) -> Self {
-        let mut rng = NoiseSeed::new(seed);
-        let params = crate::world::world_gen::noise_router::create_noise_parameters(
-            &crate::world::world_gen::noise::NoiseKey::Temperature,
-        );
-        let noise = NormalNoise::create(&mut rng, &params);
+        let mut world_random = NoiseSeed::new(seed);
+        let positional = world_random.fork_positional();
+        let mut named = positional.from_hash_of(random_name);
         VerticalGradientConditionEx {
             true_at_and_below,
             false_at_and_above,
-            random_noise: NoiseHandle::new(noise),
+            random_factory: named.fork_positional(),
         }
     }
 }
 
 impl ConditionEx for VerticalGradientConditionEx {
     fn test(&self, ctx: &mut SurfaceContext) -> bool {
-        let true_y = self.true_at_and_below.resolve(0, 384);
-        let false_y = self.false_at_and_above.resolve(0, 384);
-        let noise = self.random_noise.sample(ctx.block_x as f64, 0.0, ctx.block_z as f64);
-        let gradient = (ctx.block_y as f64 - true_y as f64) / (false_y - true_y) as f64;
-        let gradient = gradient.clamp(0.0, 1.0);
-        let threshold = gradient + noise * 0.2;
-        threshold <= 0.5
+        let true_y = self.true_at_and_below.resolve(ctx.world_min_y, ctx.world_height);
+        let false_y = self.false_at_and_above.resolve(ctx.world_min_y, ctx.world_height);
+        if ctx.block_y <= true_y {
+            return true;
+        }
+        if ctx.block_y >= false_y {
+            return false;
+        }
+        let probability = 1.0 - (ctx.block_y - true_y) as f32 / (false_y - true_y) as f32;
+        self.random_factory.at(ctx.block_x, ctx.block_y, ctx.block_z).next_float() < probability
     }
 
     fn clone_box(&self) -> Box<dyn ConditionEx> {
@@ -470,23 +525,148 @@ impl ConditionEx for VerticalGradientConditionEx {
 
 // --- TemperatureCondition ---
 
+// Biome's static temperature noises use WorldgenRandom(LegacyRandomSource),
+// not the Xoroshiro RandomState noise factory used by terrain generation.
+struct LegacySimplexNoise {
+    permutation: [i32; 256],
+}
+
+impl LegacySimplexNoise {
+    const GRADIENT: [[i32; 3]; 12] = [
+        [1, 1, 0], [-1, 1, 0], [1, -1, 0], [-1, -1, 0],
+        [1, 0, 1], [-1, 0, 1], [1, 0, -1], [-1, 0, -1],
+        [0, 1, 1], [0, -1, 1], [0, 1, -1], [0, -1, -1],
+    ];
+
+    fn new(random: &mut JavaLegacyRandom) -> Self {
+        random.next_double();
+        random.next_double();
+        random.next_double();
+        let mut permutation = [0; 256];
+        for (index, value) in permutation.iter_mut().enumerate() {
+            *value = index as i32;
+        }
+        for index in 0..256 {
+            let offset = random.next_int_bound(256 - index as i32) as usize;
+            permutation.swap(index, index + offset);
+        }
+        Self { permutation }
+    }
+
+    fn permutation(&self, index: i32) -> i32 {
+        self.permutation[index as usize & 0xff]
+    }
+
+    fn corner(&self, index: i32, x: f64, z: f64) -> f64 {
+        let mut falloff = 0.5 - x * x - z * z;
+        if falloff < 0.0 {
+            return 0.0;
+        }
+        falloff *= falloff;
+        let gradient = Self::GRADIENT[index as usize];
+        falloff * falloff * (gradient[0] as f64 * x + gradient[1] as f64 * z)
+    }
+
+    fn sample(&self, x: f64, z: f64) -> f64 {
+        const F2: f64 = 0.3660254037844386;
+        const G2: f64 = 0.21132486540518713;
+        let skew = (x + z) * F2;
+        let cell_x = (x + skew).floor() as i32;
+        let cell_z = (z + skew).floor() as i32;
+        let unskew = (cell_x + cell_z) as f64 * G2;
+        let local_x = x - (cell_x as f64 - unskew);
+        let local_z = z - (cell_z as f64 - unskew);
+        let (step_x, step_z) = if local_x > local_z { (1, 0) } else { (0, 1) };
+        let middle_x = local_x - step_x as f64 + G2;
+        let middle_z = local_z - step_z as f64 + G2;
+        let far_x = local_x - 1.0 + 2.0 * G2;
+        let far_z = local_z - 1.0 + 2.0 * G2;
+        let cell_x = cell_x & 0xff;
+        let cell_z = cell_z & 0xff;
+        let first = self.permutation(cell_x + self.permutation(cell_z)) % 12;
+        let middle = self.permutation(cell_x + step_x + self.permutation(cell_z + step_z)) % 12;
+        let last = self.permutation(cell_x + 1 + self.permutation(cell_z + 1)) % 12;
+        70.0
+            * (self.corner(first, local_x, local_z)
+                + self.corner(middle, middle_x, middle_z)
+                + self.corner(last, far_x, far_z))
+    }
+}
+
+struct BiomeTemperatureNoises {
+    temperature: LegacySimplexNoise,
+    frozen: [LegacySimplexNoise; 3],
+    biome_info: LegacySimplexNoise,
+}
+
+fn biome_temperature_noises() -> &'static BiomeTemperatureNoises {
+    static NOISES: OnceLock<BiomeTemperatureNoises> = OnceLock::new();
+    NOISES.get_or_init(|| {
+        let mut temperature = JavaLegacyRandom::new(1234);
+        let mut frozen = JavaLegacyRandom::new(3456);
+        let mut biome_info = JavaLegacyRandom::new(2345);
+        BiomeTemperatureNoises {
+            temperature: LegacySimplexNoise::new(&mut temperature),
+            frozen: [
+                LegacySimplexNoise::new(&mut frozen),
+                LegacySimplexNoise::new(&mut frozen),
+                LegacySimplexNoise::new(&mut frozen),
+            ],
+            biome_info: LegacySimplexNoise::new(&mut biome_info),
+        }
+    })
+}
+
+fn frozen_ocean_temperature(block_x: i32, block_y: i32, block_z: i32, sea_level: i32) -> f32 {
+    let noises = biome_temperature_noises();
+    let x = block_x as f64;
+    let z = block_z as f64;
+    let mut frozen_value = 0.0;
+    let mut input_factor = 1.0;
+    let mut value_factor = 1.0 / 7.0;
+    for noise in &noises.frozen {
+        frozen_value += noise.sample(x * 0.05 * input_factor, z * 0.05 * input_factor) * value_factor;
+        input_factor /= 2.0;
+        value_factor *= 2.0;
+    }
+    let large_variation = frozen_value * 7.0;
+    let edge_variation = noises.biome_info.sample(x * 0.2, z * 0.2);
+    let mut temperature = if large_variation + edge_variation < 0.3
+        && noises.biome_info.sample(x * 0.09, z * 0.09) < 0.8
+    {
+        0.2_f32
+    } else {
+        0.0_f32
+    };
+    let snow_level = sea_level + 17;
+    if block_y > snow_level {
+        let height_noise = (noises.temperature.sample(x / 8.0, z / 8.0) * 8.0) as f32;
+        temperature -= (height_noise + (block_y - snow_level) as f32) * 0.05_f32 / 40.0_f32;
+    }
+    temperature
+}
+
+fn frozen_ocean_iceberg_melts_slightly(block_x: i32, block_z: i32, sea_level: i32) -> bool {
+    frozen_ocean_temperature(block_x, sea_level, block_z, sea_level) > 0.1
+}
+
 #[derive(Clone)]
 pub struct TemperatureConditionEx;
 
 impl ConditionEx for TemperatureConditionEx {
     fn test(&self, ctx: &mut SurfaceContext) -> bool {
         let biome = ctx.get_biome(ctx.block_y);
+        if matches!(biome, Biome::FrozenOcean | Biome::DeepFrozenOcean) {
+            return frozen_ocean_temperature(ctx.block_x, ctx.block_y, ctx.block_z, ctx.sea_level) < 0.15;
+        }
         matches!(
             biome,
-            Biome::SnowyTundra
+            Biome::SnowyPlains
                 | Biome::Taiga
-                | Biome::FrozenOcean
-                | Biome::DeepFrozenOcean
                 | Biome::FrozenPeaks
                 | Biome::JaggedPeaks
                 | Biome::SnowySlopes
                 | Biome::Grove
-                | Biome::Mountains
         )
     }
 
@@ -502,24 +682,19 @@ pub struct SteepConditionEx;
 
 impl ConditionEx for SteepConditionEx {
     fn test(&self, ctx: &mut SurfaceContext) -> bool {
-        let chunk_x = ctx.block_x & 0xF;
-        let chunk_z = ctx.block_z & 0xF;
-
-        let z_north = chunk_z.saturating_sub(1).max(0);
-        let z_south = (chunk_z + 1).min(15);
-
-        let height_north = 0;
-        let height_south = 0;
-        let _ = (z_north, z_south, height_north, height_south);
-
-        let x_west = chunk_x.saturating_sub(1).max(0);
-        let x_east = (chunk_x + 1).min(15);
-
-        let height_west = 0;
-        let height_east = 0;
-        let _ = (x_west, x_east, height_west, height_east);
-
-        false
+        let Some(heightmap) = &ctx.world_surface_heightmap else {
+            return false;
+        };
+        let x = ctx.block_x.rem_euclid(16) as usize;
+        let z = ctx.block_z.rem_euclid(16) as usize;
+        let north = z.saturating_sub(1);
+        let south = (z + 1).min(15);
+        if heightmap[x * CHUNK_SIZE + south] >= heightmap[x * CHUNK_SIZE + north] + 4 {
+            return true;
+        }
+        let west = x.saturating_sub(1);
+        let east = (x + 1).min(15);
+        heightmap[west * CHUNK_SIZE + z] >= heightmap[east * CHUNK_SIZE + z] + 4
     }
 
     fn clone_box(&self) -> Box<dyn ConditionEx> {
@@ -589,6 +764,19 @@ impl ConditionEx for NotConditionEx {
 #[derive(Clone)]
 pub struct StateRuleEx {
     state: BlockId,
+}
+
+#[derive(Clone)]
+struct PreserveRuleEx;
+
+impl SurfaceRuleEx for PreserveRuleEx {
+    fn try_apply(&self, ctx: &mut SurfaceContext, _x: i32, _y: i32, _z: i32) -> Option<BlockId> {
+        Some(ctx.current_block)
+    }
+
+    fn clone_box(&self) -> Box<dyn SurfaceRuleEx> {
+        Box::new(self.clone())
+    }
 }
 
 impl StateRuleEx {
@@ -944,6 +1132,274 @@ impl SurfaceSystem {
             }
         }
     }
+
+    /// Geometry-only Minecraft 26.2 surface entry point. Unlike the
+    /// compatibility builder, this uses WORLD_SURFACE_WG (all non-air), the
+    /// density router's preliminary surface, and the complete reference rule
+    /// scan without an additional heuristic depth gate.
+    pub fn build_reference_overworld_surface(
+        system: Arc<SurfaceSystemRef>,
+        chunk: &mut Chunk,
+        sea_level: i32,
+        world_min_y: i32,
+        mut biome_provider: impl FnMut(i32, i32, i32) -> Biome + Send + 'static,
+        preliminary_surface: impl Fn(i32, i32) -> i32 + Send + Sync + 'static,
+    ) {
+        report_minecraft26_reference_surface_unsupported();
+        let mut heightmap = build_world_surface_wg_heightmap(chunk, world_min_y);
+        let base_x = chunk.cx as i64 * CHUNK_SIZE as i64;
+        let base_z = chunk.cz as i64 * CHUNK_SIZE as i64;
+        let mut ctx = SurfaceContext::new_with_height(
+            system.clone(),
+            sea_level,
+            world_min_y,
+            CHUNK_HEIGHT as i32,
+            Box::new(move |x, y, z| biome_provider(x, y, z)),
+            Box::new(preliminary_surface),
+        );
+        ctx.reference_preliminary_interpolation = true;
+        ctx.world_surface_heightmap = Some(heightmap.clone());
+        let rule = minecraft26_reference_overworld_rules(system.clone());
+
+        for x in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                let index = x * CHUNK_SIZE + z;
+                let block_x = (base_x + x as i64) as i32;
+                let block_z = (base_z + z as i64) as i32;
+                ctx.update_xz(block_x, block_z);
+                let initial_top = heightmap[index];
+                let surface_biome = ctx.get_biome(initial_top + 1);
+
+                if surface_biome == Biome::ErodedBadlands {
+                    reference_eroded_badlands_extension(
+                        &system,
+                        chunk,
+                        x,
+                        z,
+                        block_x,
+                        block_z,
+                        initial_top + 1,
+                        world_min_y,
+                    );
+                    heightmap[index] = reference_column_top(chunk, x, z, world_min_y, true);
+                    if let Some(context_heightmap) = &mut ctx.world_surface_heightmap {
+                        context_heightmap[index] = heightmap[index];
+                    }
+                }
+
+                let top = heightmap[index];
+                let starting_local = (top + 1 - world_min_y).clamp(0, CHUNK_HEIGHT as i32 - 1);
+                let mut stone_below_depth = vec![0i32; starting_local as usize + 1];
+                let mut solid_run = 0;
+                for local_y in 0..=starting_local {
+                    let block = chunk.get_block(x, local_y as usize, z);
+                    if block.is_air() || matches!(block.id, BlockId::Water | BlockId::Lava) {
+                        solid_run = 0;
+                    } else {
+                        solid_run += 1;
+                        stone_below_depth[local_y as usize] = solid_run;
+                    }
+                }
+
+                let mut stone_above_depth = 0;
+                let mut water_height = i32::MIN;
+                for local_y in (0..=starting_local).rev() {
+                    let block = chunk.get_block(x, local_y as usize, z);
+                    let world_y = world_min_y + local_y;
+                    if block.is_air() {
+                        stone_above_depth = 0;
+                        water_height = i32::MIN;
+                    } else if matches!(block.id, BlockId::Water | BlockId::Lava) {
+                        if water_height == i32::MIN {
+                            water_height = world_y + 1;
+                        }
+                    } else {
+                        stone_above_depth += 1;
+                        ctx.update_y_with_block(
+                            stone_above_depth,
+                            stone_below_depth[local_y as usize],
+                            water_height,
+                            world_y,
+                            block.id,
+                        );
+                        // Density fill preclassifies deepslate for this profile;
+                        // treating it as factored default stone lets the Java
+                        // bedrock/deepslate surface rules retain their ordering.
+                        if matches!(block.id, BlockId::Stone | BlockId::Deepslate) {
+                            if let Some(new_state) = rule.try_apply(&mut ctx, block_x, world_y, block_z) {
+                                chunk.set_block(x, local_y as usize, z, Block::new(new_state));
+                            }
+                        }
+                    }
+                }
+
+                if matches!(surface_biome, Biome::FrozenOcean | Biome::DeepFrozenOcean) {
+                    reference_frozen_ocean_extension(
+                        &system,
+                        chunk,
+                        x,
+                        z,
+                        block_x,
+                        block_z,
+                        top + 1,
+                        ctx.get_min_surface_level(),
+                        world_min_y,
+                    );
+                    heightmap[index] = reference_column_top(chunk, x, z, world_min_y, true);
+                    if let Some(context_heightmap) = &mut ctx.world_surface_heightmap {
+                        context_heightmap[index] = heightmap[index];
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn reference_column_top(chunk: &Chunk, x: usize, z: usize, world_min_y: i32, include_fluids: bool) -> i32 {
+    for y in (0..CHUNK_HEIGHT).rev() {
+        let block = chunk.get_block(x, y, z);
+        if !block.is_air() && (include_fluids || !matches!(block.id, BlockId::Water | BlockId::Lava)) {
+            return world_min_y + y as i32;
+        }
+    }
+    world_min_y - 1
+}
+
+fn build_world_surface_wg_heightmap(chunk: &Chunk, world_min_y: i32) -> Vec<i32> {
+    let mut heightmap = vec![world_min_y - 1; CHUNK_SIZE * CHUNK_SIZE];
+    for x in 0..CHUNK_SIZE {
+        for z in 0..CHUNK_SIZE {
+            heightmap[x * CHUNK_SIZE + z] = reference_column_top(chunk, x, z, world_min_y, true);
+        }
+    }
+    heightmap
+}
+
+fn reference_eroded_badlands_extension(
+    system: &SurfaceSystemRef,
+    chunk: &mut Chunk,
+    x: usize,
+    z: usize,
+    block_x: i32,
+    block_z: i32,
+    height: i32,
+    world_min_y: i32,
+) {
+    let pillar_buffer = (system.badlands_surface_noise.sample(block_x as f64, 0.0, block_z as f64) * 8.25)
+        .abs()
+        .min(system.badlands_pillar_noise.sample(block_x as f64 * 0.2, 0.0, block_z as f64 * 0.2) * 15.0);
+    if pillar_buffer <= 0.0 {
+        return;
+    }
+    let pillar_floor = (system
+        .badlands_pillar_roof_noise
+        .sample(block_x as f64 * 0.75, 0.0, block_z as f64 * 0.75)
+        * 1.5)
+        .abs();
+    let start_y =
+        (64.0 + (pillar_buffer * pillar_buffer * 2.5).min((pillar_floor * 50.0).ceil() + 24.0)).floor() as i32;
+    if height > start_y {
+        return;
+    }
+    for world_y in (world_min_y..=start_y).rev() {
+        let local_y = world_y - world_min_y;
+        if !(0..CHUNK_HEIGHT as i32).contains(&local_y) {
+            continue;
+        }
+        let block = chunk.get_block(x, local_y as usize, z);
+        if block.id == system.default_block {
+            break;
+        }
+        if block.id == BlockId::Water {
+            return;
+        }
+    }
+    for world_y in (world_min_y..=start_y).rev() {
+        let local_y = world_y - world_min_y;
+        if !(0..CHUNK_HEIGHT as i32).contains(&local_y) {
+            continue;
+        }
+        if !chunk.get_block(x, local_y as usize, z).is_air() {
+            break;
+        }
+        chunk.set_block(x, local_y as usize, z, Block::new(system.default_block));
+    }
+}
+
+fn reference_frozen_ocean_extension(
+    system: &SurfaceSystemRef,
+    chunk: &mut Chunk,
+    x: usize,
+    z: usize,
+    block_x: i32,
+    block_z: i32,
+    height: i32,
+    min_surface_level: i32,
+    world_min_y: i32,
+) {
+    let iceberg = (system.iceberg_surface_noise.sample(block_x as f64, 0.0, block_z as f64) * 8.25)
+        .abs()
+        .min(system.iceberg_pillar_noise.sample(block_x as f64 * 1.28, 0.0, block_z as f64 * 1.28) * 15.0);
+    if iceberg <= 1.8 {
+        return;
+    }
+    let roof = (system
+        .iceberg_pillar_roof_noise
+        .sample(block_x as f64 * 1.17, 0.0, block_z as f64 * 1.17)
+        * 1.5)
+        .abs();
+    let Some((top, bottom)) = frozen_ocean_extension_bounds(
+        iceberg,
+        roof,
+        system.sea_level,
+        frozen_ocean_iceberg_melts_slightly(block_x, block_z, system.sea_level),
+    ) else {
+        return;
+    };
+    let mut world_random = NoiseSeed::new(system.noise_random_seed);
+    let positional = world_random.fork_positional();
+    let mut random = positional.at(block_x, 0, block_z);
+    let max_snow_depth = 2 + random.next_int(4);
+    let min_snow_height = system.sea_level + 18 + random.next_int(10);
+    let mut snow_depth = 0;
+    let start = height.max(top as i32 + 1).min(world_min_y + CHUNK_HEIGHT as i32 - 1);
+    let end = min_surface_level.max(world_min_y);
+    for world_y in (end..=start).rev() {
+        let local_y = (world_y - world_min_y) as usize;
+        let block = chunk.get_block(x, local_y, z);
+        let replace = (block.is_air() && world_y < top as i32 && random.next_double() > 0.01)
+            || (block.id == BlockId::Water
+                && world_y > bottom as i32
+                && world_y < system.sea_level
+                && bottom != 0.0
+                && random.next_double() > 0.15);
+        if replace {
+            let state = if snow_depth <= max_snow_depth && world_y > min_snow_height {
+                snow_depth += 1;
+                BlockId::SnowBlock
+            } else {
+                BlockId::PackedIce
+            };
+            chunk.set_block(x, local_y, z, Block::new(state));
+        }
+    }
+}
+
+fn frozen_ocean_extension_bounds(
+    iceberg: f64,
+    roof: f64,
+    sea_level: i32,
+    melts_slightly: bool,
+) -> Option<(f64, f64)> {
+    let mut top = (iceberg * iceberg * 1.2).min((roof * 40.0).ceil() + 14.0);
+    if melts_slightly {
+        top -= 2.0;
+    }
+    if top <= 2.0 {
+        return None;
+    }
+    let bottom = sea_level as f64 - top - 7.0;
+    Some((top + sea_level as f64, bottom))
 }
 
 fn generate_bands(random: &mut NoiseSeed) -> Vec<BlockId> {
@@ -1158,6 +1614,435 @@ impl OreVeinifier {
 // Default Overworld Rules
 // ============================================================================
 
+fn reference_state(state: BlockId) -> Box<dyn SurfaceRuleEx> {
+    Box::new(StateRuleEx::new(state))
+}
+
+fn reference_preserve() -> Box<dyn SurfaceRuleEx> {
+    Box::new(PreserveRuleEx)
+}
+
+fn reference_if(condition: Box<dyn ConditionEx>, rule: Box<dyn SurfaceRuleEx>) -> Box<dyn SurfaceRuleEx> {
+    Box::new(TestRuleEx::new(condition, rule))
+}
+
+fn reference_sequence(rules: Vec<Box<dyn SurfaceRuleEx>>) -> Box<dyn SurfaceRuleEx> {
+    Box::new(SequenceRuleEx::new(rules))
+}
+
+fn reference_biome(biomes: &[Biome]) -> Box<dyn ConditionEx> {
+    Box::new(BiomeConditionEx::new(biomes.to_vec()))
+}
+
+fn reference_stone_depth(
+    offset: i32,
+    add_surface_depth: bool,
+    secondary_depth_range: i32,
+    surface: CaveSurface,
+) -> Box<dyn ConditionEx> {
+    Box::new(StoneDepthConditionEx::new(offset, add_surface_depth, secondary_depth_range, surface))
+}
+
+fn reference_y(anchor: i32, multiplier: i32, add_stone_depth: bool) -> Box<dyn ConditionEx> {
+    Box::new(YConditionEx::new(VerticalAnchor::Absolute(anchor), multiplier, add_stone_depth))
+}
+
+fn reference_water(offset: i32, multiplier: i32, add_stone_depth: bool) -> Box<dyn ConditionEx> {
+    Box::new(WaterConditionEx::new(offset, multiplier, add_stone_depth))
+}
+
+fn reference_noise(system: &SurfaceSystemRef, key: NoiseKey, min: f64, max: f64) -> Box<dyn ConditionEx> {
+    let mut world_random = NoiseSeed::new(system.noise_random_seed);
+    let positional = world_random.fork_positional();
+    Box::new(NoiseThresholdConditionEx::new_2d(
+        seeded_surface_noise(&positional, key),
+        min,
+        max,
+    ))
+}
+
+fn reference_noise_3d(system: &SurfaceSystemRef, key: NoiseKey, min: f64, max: f64) -> Box<dyn ConditionEx> {
+    let mut world_random = NoiseSeed::new(system.noise_random_seed);
+    let positional = world_random.fork_positional();
+    Box::new(NoiseThresholdConditionEx::new_3d(
+        seeded_surface_noise(&positional, key),
+        min,
+        max,
+    ))
+}
+
+fn reference_surface_noise_above(system: &SurfaceSystemRef, threshold: f64) -> Box<dyn ConditionEx> {
+    reference_noise(system, NoiseKey::Surface, threshold / 8.25, f64::MAX)
+}
+
+fn reference_sulfur_cave_bands(system: &SurfaceSystemRef) -> Box<dyn SurfaceRuleEx> {
+    reference_sequence(vec![
+        reference_if(
+            reference_noise_3d(system, NoiseKey::SulfurCaveGradient, -0.4, -0.1),
+            reference_preserve(),
+        ),
+        reference_if(
+            reference_noise_3d(system, NoiseKey::SulfurCaveGradient, 0.0, 0.4),
+            reference_preserve(),
+        ),
+        reference_if(
+            reference_noise_3d(system, NoiseKey::SulfurCaveGradient, 0.4, f64::MAX),
+            reference_preserve(),
+        ),
+    ])
+}
+
+fn reference_not(condition: Box<dyn ConditionEx>) -> Box<dyn ConditionEx> {
+    Box::new(NotConditionEx::new(condition))
+}
+
+fn reference_on_floor() -> Box<dyn ConditionEx> {
+    reference_stone_depth(0, false, 0, CaveSurface::Floor)
+}
+
+fn reference_under_floor() -> Box<dyn ConditionEx> {
+    reference_stone_depth(0, true, 0, CaveSurface::Floor)
+}
+
+fn reference_on_ceiling() -> Box<dyn ConditionEx> {
+    reference_stone_depth(0, false, 0, CaveSurface::Ceiling)
+}
+
+fn reference_grass_or_dirt() -> Box<dyn SurfaceRuleEx> {
+    reference_sequence(vec![
+        reference_if(reference_water(0, 0, false), reference_state(BlockId::GrassBlock)),
+        reference_state(BlockId::Dirt),
+    ])
+}
+
+fn reference_sand_or_sandstone() -> Box<dyn SurfaceRuleEx> {
+    reference_sequence(vec![
+        reference_if(reference_on_ceiling(), reference_state(BlockId::Sandstone)),
+        reference_state(BlockId::Sand),
+    ])
+}
+
+fn reference_gravel_or_stone() -> Box<dyn SurfaceRuleEx> {
+    reference_sequence(vec![
+        reference_if(reference_on_ceiling(), reference_state(BlockId::Stone)),
+        reference_state(BlockId::Gravel),
+    ])
+}
+
+fn reference_common_surface_rules(system: &Arc<SurfaceSystemRef>) -> Box<dyn SurfaceRuleEx> {
+    reference_sequence(vec![
+        reference_if(
+            reference_biome(&[Biome::StonyPeaks]),
+            reference_sequence(vec![
+                reference_if(reference_noise(system, NoiseKey::Calcite, -0.0125, 0.0125), reference_state(BlockId::Calcite)),
+                reference_state(BlockId::Stone),
+            ]),
+        ),
+        reference_if(
+            reference_biome(&[Biome::StonyShore]),
+            reference_sequence(vec![
+                reference_if(reference_noise(system, NoiseKey::Gravel, -0.05, 0.05), reference_gravel_or_stone()),
+                reference_state(BlockId::Stone),
+            ]),
+        ),
+        reference_if(
+            reference_biome(&[Biome::WindsweptHills]),
+            reference_if(reference_surface_noise_above(system, 1.0), reference_state(BlockId::Stone)),
+        ),
+        reference_if(
+            reference_biome(&[Biome::WarmOcean, Biome::Beach, Biome::SnowyBeach]),
+            reference_sand_or_sandstone(),
+        ),
+        reference_if(reference_biome(&[Biome::Desert]), reference_sand_or_sandstone()),
+        reference_if(reference_biome(&[Biome::DripstoneCaves]), reference_state(BlockId::Stone)),
+        reference_if(
+            reference_biome(&[Biome::SulfurCaves]),
+            reference_sequence(vec![reference_sulfur_cave_bands(system), reference_state(BlockId::Stone)]),
+        ),
+    ])
+}
+
+fn reference_powder_snow(system: &Arc<SurfaceSystemRef>, min: f64, max: f64) -> Box<dyn SurfaceRuleEx> {
+    reference_if(
+        reference_noise(system, NoiseKey::PowderSnow, min, max),
+        reference_if(reference_water(0, 0, false), reference_state(BlockId::PowderSnow)),
+    )
+}
+
+fn reference_biome_under_surface_rule(system: &Arc<SurfaceSystemRef>) -> Box<dyn SurfaceRuleEx> {
+    reference_sequence(vec![
+        reference_if(
+            reference_biome(&[Biome::FrozenPeaks]),
+            reference_sequence(vec![
+                reference_if(Box::new(SteepConditionEx), reference_state(BlockId::PackedIce)),
+                reference_if(reference_noise(system, NoiseKey::PackedIce, -0.5, 0.2), reference_state(BlockId::PackedIce)),
+                reference_if(reference_noise(system, NoiseKey::Ice, -0.0625, 0.025), reference_state(BlockId::Ice)),
+                reference_if(reference_water(0, 0, false), reference_state(BlockId::SnowBlock)),
+            ]),
+        ),
+        reference_if(
+            reference_biome(&[Biome::SnowySlopes]),
+            reference_sequence(vec![
+                reference_if(Box::new(SteepConditionEx), reference_state(BlockId::Stone)),
+                reference_powder_snow(system, 0.45, 0.58),
+                reference_if(reference_water(0, 0, false), reference_state(BlockId::SnowBlock)),
+            ]),
+        ),
+        reference_if(reference_biome(&[Biome::JaggedPeaks]), reference_state(BlockId::Stone)),
+        reference_if(
+            reference_biome(&[Biome::Grove]),
+            reference_sequence(vec![reference_powder_snow(system, 0.45, 0.58), reference_state(BlockId::Dirt)]),
+        ),
+        reference_common_surface_rules(system),
+        reference_if(
+            reference_biome(&[Biome::WindsweptSavanna]),
+            reference_if(reference_surface_noise_above(system, 1.75), reference_state(BlockId::Stone)),
+        ),
+        reference_if(
+            reference_biome(&[Biome::WindsweptGravellyHills]),
+            reference_sequence(vec![
+                reference_if(reference_surface_noise_above(system, 2.0), reference_gravel_or_stone()),
+                reference_if(reference_surface_noise_above(system, 1.0), reference_state(BlockId::Stone)),
+                reference_if(reference_surface_noise_above(system, -1.0), reference_state(BlockId::Dirt)),
+                reference_gravel_or_stone(),
+            ]),
+        ),
+        reference_if(reference_biome(&[Biome::MangroveSwamp]), reference_state(BlockId::Mud)),
+        reference_state(BlockId::Dirt),
+    ])
+}
+
+fn reference_biome_surface_rule(system: &Arc<SurfaceSystemRef>) -> Box<dyn SurfaceRuleEx> {
+    reference_sequence(vec![
+        reference_if(
+            reference_biome(&[Biome::FrozenPeaks]),
+            reference_sequence(vec![
+                reference_if(Box::new(SteepConditionEx), reference_state(BlockId::PackedIce)),
+                reference_if(reference_noise(system, NoiseKey::PackedIce, 0.0, 0.2), reference_state(BlockId::PackedIce)),
+                reference_if(reference_noise(system, NoiseKey::Ice, 0.0, 0.025), reference_state(BlockId::Ice)),
+                reference_if(reference_water(0, 0, false), reference_state(BlockId::SnowBlock)),
+            ]),
+        ),
+        reference_if(
+            reference_biome(&[Biome::SnowySlopes]),
+            reference_sequence(vec![
+                reference_if(Box::new(SteepConditionEx), reference_state(BlockId::Stone)),
+                reference_powder_snow(system, 0.35, 0.6),
+                reference_if(reference_water(0, 0, false), reference_state(BlockId::SnowBlock)),
+            ]),
+        ),
+        reference_if(
+            reference_biome(&[Biome::JaggedPeaks]),
+            reference_sequence(vec![
+                reference_if(Box::new(SteepConditionEx), reference_state(BlockId::Stone)),
+                reference_if(reference_water(0, 0, false), reference_state(BlockId::SnowBlock)),
+            ]),
+        ),
+        reference_if(
+            reference_biome(&[Biome::Grove]),
+            reference_sequence(vec![
+                reference_powder_snow(system, 0.35, 0.6),
+                reference_if(reference_water(0, 0, false), reference_state(BlockId::SnowBlock)),
+            ]),
+        ),
+        reference_common_surface_rules(system),
+        reference_if(
+            reference_biome(&[Biome::WindsweptSavanna]),
+            reference_sequence(vec![
+                reference_if(reference_surface_noise_above(system, 1.75), reference_state(BlockId::Stone)),
+                reference_if(reference_surface_noise_above(system, -0.5), reference_state(BlockId::CoarseDirt)),
+            ]),
+        ),
+        reference_if(
+            reference_biome(&[Biome::WindsweptGravellyHills]),
+            reference_sequence(vec![
+                reference_if(reference_surface_noise_above(system, 2.0), reference_gravel_or_stone()),
+                reference_if(reference_surface_noise_above(system, 1.0), reference_state(BlockId::Stone)),
+                reference_if(reference_surface_noise_above(system, -1.0), reference_grass_or_dirt()),
+                reference_gravel_or_stone(),
+            ]),
+        ),
+        reference_if(
+            reference_biome(&[Biome::OldGrowthPineTaiga, Biome::OldGrowthSpruceTaiga]),
+            reference_sequence(vec![
+                reference_if(reference_surface_noise_above(system, 1.75), reference_state(BlockId::CoarseDirt)),
+                reference_if(reference_surface_noise_above(system, -0.95), reference_state(BlockId::Podzol)),
+            ]),
+        ),
+        reference_if(
+            reference_biome(&[Biome::IceSpikes]),
+            reference_if(reference_water(0, 0, false), reference_state(BlockId::SnowBlock)),
+        ),
+        reference_if(reference_biome(&[Biome::MangroveSwamp]), reference_state(BlockId::Mud)),
+        reference_if(reference_biome(&[Biome::MushroomFields]), reference_state(BlockId::Mycelium)),
+        reference_grass_or_dirt(),
+    ])
+}
+
+/// Minecraft 26.2 `SurfaceRuleData.overworld()` with unavailable outputs
+/// represented by explicit preserve rules rather than compatibility fallbacks.
+pub fn minecraft26_reference_overworld_rules(system: Arc<SurfaceSystemRef>) -> Box<dyn SurfaceRuleEx> {
+    let badlands = [Biome::Badlands, Biome::ErodedBadlands, Biome::WoodedBadlands];
+    let frozen_ocean = [Biome::FrozenOcean, Biome::DeepFrozenOcean];
+    let sand_biomes = [Biome::WarmOcean, Biome::Beach, Biome::SnowyBeach];
+    let clay_band = |min, max| reference_noise(&system, NoiseKey::Surface, min, max);
+    let sulfur_cave_bands = reference_sulfur_cave_bands(&system);
+
+    let wooded_badlands_and_swamps = reference_if(
+        reference_on_floor(),
+        reference_sequence(vec![
+            reference_if(
+                reference_biome(&[Biome::WoodedBadlands]),
+                reference_if(
+                    reference_y(97, 2, false),
+                    reference_sequence(vec![
+                        reference_if(clay_band(-0.909, -0.5454), reference_state(BlockId::CoarseDirt)),
+                        reference_if(clay_band(-0.1818, 0.1818), reference_state(BlockId::CoarseDirt)),
+                        reference_if(clay_band(0.5454, 0.909), reference_state(BlockId::CoarseDirt)),
+                        reference_grass_or_dirt(),
+                    ]),
+                ),
+            ),
+            reference_if(
+                reference_biome(&[Biome::Swamp]),
+                reference_if(
+                    reference_y(62, 0, false),
+                    reference_if(
+                        reference_not(reference_y(63, 0, false)),
+                        reference_if(reference_noise(&system, NoiseKey::Swamp, 0.0, f64::MAX), reference_state(BlockId::Water)),
+                    ),
+                ),
+            ),
+            reference_if(
+                reference_biome(&[Biome::MangroveSwamp]),
+                reference_if(
+                    reference_y(60, 0, false),
+                    reference_if(
+                        reference_not(reference_y(63, 0, false)),
+                        reference_if(reference_noise(&system, NoiseKey::Swamp, 0.0, f64::MAX), reference_state(BlockId::Water)),
+                    ),
+                ),
+            ),
+        ]),
+    );
+
+    let badlands_rule = reference_if(
+        reference_biome(&badlands),
+        reference_sequence(vec![
+            reference_if(
+                reference_on_floor(),
+                reference_sequence(vec![
+                    reference_if(reference_y(256, 0, false), reference_state(BlockId::OrangeTerracotta)),
+                    reference_if(
+                        reference_y(74, 1, true),
+                        reference_sequence(vec![
+                            reference_if(clay_band(-0.909, -0.5454), reference_state(BlockId::Terracotta)),
+                            reference_if(clay_band(-0.1818, 0.1818), reference_state(BlockId::Terracotta)),
+                            reference_if(clay_band(0.5454, 0.909), reference_state(BlockId::Terracotta)),
+                            Box::new(BandlandsRuleEx::new(system.clone())),
+                        ]),
+                    ),
+                    reference_if(
+                        reference_water(-1, 0, false),
+                        reference_sequence(vec![reference_if(reference_on_ceiling(), reference_preserve()), reference_state(BlockId::RedSand)]),
+                    ),
+                    reference_if(reference_not(Box::new(HoleConditionEx)), reference_state(BlockId::OrangeTerracotta)),
+                    reference_if(reference_water(-6, -1, true), reference_state(BlockId::WhiteTerracotta)),
+                    reference_gravel_or_stone(),
+                ]),
+            ),
+            reference_if(
+                reference_y(63, -1, true),
+                reference_sequence(vec![
+                    reference_if(
+                        reference_y(63, 0, false),
+                        reference_if(reference_not(reference_y(74, 1, true)), reference_state(BlockId::OrangeTerracotta)),
+                    ),
+                    Box::new(BandlandsRuleEx::new(system.clone())),
+                ]),
+            ),
+            reference_if(reference_under_floor(), reference_if(reference_water(-6, -1, true), reference_state(BlockId::WhiteTerracotta))),
+        ]),
+    );
+
+    let close_to_surface = reference_sequence(vec![
+        wooded_badlands_and_swamps,
+        badlands_rule,
+        reference_if(
+            reference_on_floor(),
+            reference_if(
+                reference_water(-1, 0, false),
+                reference_sequence(vec![
+                    reference_if(
+                        reference_biome(&frozen_ocean),
+                        reference_if(
+                            Box::new(HoleConditionEx),
+                            reference_sequence(vec![
+                                reference_if(reference_water(0, 0, false), reference_state(BlockId::Air)),
+                                reference_if(Box::new(TemperatureConditionEx), reference_state(BlockId::Ice)),
+                                reference_state(BlockId::Water),
+                            ]),
+                        ),
+                    ),
+                    reference_biome_surface_rule(&system),
+                ]),
+            ),
+        ),
+        reference_if(
+            reference_water(-6, -1, true),
+            reference_sequence(vec![
+                reference_if(
+                    reference_on_floor(),
+                    reference_if(reference_biome(&frozen_ocean), reference_if(Box::new(HoleConditionEx), reference_state(BlockId::Water))),
+                ),
+                reference_if(reference_under_floor(), reference_biome_under_surface_rule(&system)),
+                reference_if(
+                    reference_biome(&sand_biomes),
+                    reference_if(reference_stone_depth(0, true, 6, CaveSurface::Floor), reference_state(BlockId::Sandstone)),
+                ),
+                reference_if(
+                    reference_biome(&[Biome::Desert]),
+                    reference_if(reference_stone_depth(0, true, 30, CaveSurface::Floor), reference_state(BlockId::Sandstone)),
+                ),
+            ]),
+        ),
+        reference_if(
+            reference_on_floor(),
+            reference_sequence(vec![
+                reference_if(reference_biome(&[Biome::FrozenPeaks, Biome::JaggedPeaks]), reference_state(BlockId::Stone)),
+                reference_if(
+                    reference_biome(&[Biome::WarmOcean, Biome::LukewarmOcean, Biome::DeepLukewarmOcean]),
+                    reference_sand_or_sandstone(),
+                ),
+                reference_gravel_or_stone(),
+            ]),
+        ),
+    ]);
+
+    reference_sequence(vec![
+        reference_if(
+            Box::new(VerticalGradientConditionEx::new(
+                system.noise_random_seed,
+                "minecraft:bedrock_floor",
+                VerticalAnchor::AboveBottom(0),
+                VerticalAnchor::AboveBottom(5),
+            )),
+            reference_state(BlockId::Bedrock),
+        ),
+        reference_if(Box::new(AbovePreliminarySurfaceConditionEx), close_to_surface),
+        reference_if(reference_biome(&[Biome::SulfurCaves]), sulfur_cave_bands),
+        reference_if(
+            Box::new(VerticalGradientConditionEx::new(
+                system.noise_random_seed,
+                "minecraft:deepslate",
+                VerticalAnchor::Absolute(0),
+                VerticalAnchor::Absolute(8),
+            )),
+            reference_state(BlockId::Deepslate),
+        ),
+    ])
+}
+
 pub fn default_overworld_rules(system: Arc<SurfaceSystemRef>) -> Box<dyn SurfaceRuleEx> {
     let mut rules: Vec<Box<dyn SurfaceRuleEx>> = Vec::new();
 
@@ -1179,7 +2064,6 @@ pub fn default_overworld_rules(system: Arc<SurfaceSystemRef>) -> Box<dyn Surface
         Biome::LukewarmOcean,
         Biome::ColdOcean,
         Biome::FrozenOcean,
-        Biome::DeepWarmOcean,
         Biome::DeepLukewarmOcean,
         Biome::DeepColdOcean,
         Biome::DeepFrozenOcean,
@@ -1243,7 +2127,7 @@ pub fn default_overworld_rules(system: Arc<SurfaceSystemRef>) -> Box<dyn Surface
     // Snowy / frozen peaks
     rules.push(Box::new(TestRuleEx::new(
         Box::new(BiomeConditionEx::new(vec![
-            Biome::SnowyTundra,
+            Biome::SnowyPlains,
             Biome::SnowySlopes,
             Biome::FrozenPeaks,
         ])),
@@ -1359,7 +2243,6 @@ pub fn default_overworld_rules(system: Arc<SurfaceSystemRef>) -> Box<dyn Surface
     // Stony / Mountain peaks
     rules.push(Box::new(TestRuleEx::new(
         Box::new(BiomeConditionEx::new(vec![
-            Biome::Mountains,
             Biome::WindsweptHills,
             Biome::StonyPeaks,
             Biome::JaggedPeaks,
@@ -1491,14 +2374,14 @@ pub fn surface_blocks_for_biome(biome: Biome) -> (BlockId, BlockId, BlockId) {
         Biome::Ocean | Biome::DeepOcean
         | Biome::WarmOcean | Biome::LukewarmOcean
         | Biome::ColdOcean | Biome::FrozenOcean
-        | Biome::DeepWarmOcean | Biome::DeepLukewarmOcean
+        | Biome::DeepLukewarmOcean
         | Biome::DeepColdOcean | Biome::DeepFrozenOcean => {
             (BlockId::Water, BlockId::Sand, BlockId::Stone)
         }
-        Biome::SnowyTundra | Biome::SnowySlopes | Biome::FrozenPeaks => {
+        Biome::SnowyPlains | Biome::SnowySlopes | Biome::FrozenPeaks => {
             (BlockId::SnowBlock, BlockId::Dirt, BlockId::Stone)
         }
-        Biome::Mountains | Biome::WindsweptHills | Biome::StonyPeaks | Biome::JaggedPeaks => {
+        Biome::WindsweptHills | Biome::StonyPeaks | Biome::JaggedPeaks => {
             (BlockId::Stone, BlockId::Stone, BlockId::Stone)
         }
         Biome::WindsweptGravellyHills => (BlockId::Gravel, BlockId::Stone, BlockId::Stone),
@@ -1777,6 +2660,274 @@ mod tests {
 
         assert_eq!(system.get_surface_depth(block_x, block_z), expected);
         assert_eq!(system.get_surface_depth(block_x, block_z), expected);
+    }
+
+    #[test]
+    fn reference_water_condition_matches_java_no_water_and_offset_semantics() {
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, 0x26_02);
+        let mut ctx = SurfaceContext::new_with_height(
+            system,
+            63,
+            -64,
+            384,
+            Box::new(|_, _, _| Biome::Plains),
+            Box::new(|_, _| 64),
+        );
+        ctx.update_xz(0, 0);
+        ctx.surface_depth = 3;
+        ctx.update_y(2, 10, i32::MIN, 60);
+        assert!(WaterConditionEx::new(-1, 0, false).test(&mut ctx));
+
+        ctx.update_y(2, 10, 64, 60);
+        assert!(!WaterConditionEx::new(-1, 0, false).test(&mut ctx));
+        assert!(WaterConditionEx::new(-6, -1, true).test(&mut ctx));
+        assert!(60 + 2 >= 64 - 6 + 3 * -1);
+    }
+
+    #[test]
+    fn reference_steep_uses_world_surface_wg_column_deltas() {
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, 7);
+        let mut ctx = SurfaceContext::new(system, 63, Box::new(|_, _, _| Biome::FrozenPeaks), Box::new(|_, _| 64));
+        let mut heightmap = vec![60; CHUNK_SIZE * CHUNK_SIZE];
+        heightmap[3 * CHUNK_SIZE + 5] = 64;
+        ctx.world_surface_heightmap = Some(heightmap);
+        ctx.update_xz(-13, -12); // local (3, 4), south is local z=5
+        assert!(SteepConditionEx.test(&mut ctx));
+
+        ctx.world_surface_heightmap = Some(vec![60; CHUNK_SIZE * CHUNK_SIZE]);
+        assert!(!SteepConditionEx.test(&mut ctx));
+    }
+
+    #[test]
+    fn reference_preliminary_surface_bilinear_interpolation_is_negative_safe() {
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, 9);
+        let mut ctx = SurfaceContext::new_with_height(
+            system,
+            63,
+            -64,
+            384,
+            Box::new(|_, _, _| Biome::Plains),
+            Box::new(|x, z| 80 + x.div_euclid(16) * 16 + z.div_euclid(16) * 32),
+        );
+        ctx.reference_preliminary_interpolation = true;
+        ctx.update_xz(-1, -1);
+        ctx.surface_depth = 3;
+        assert_eq!(ctx.get_min_surface_level(), 72);
+        ctx.update_y(1, 1, i32::MIN, 71);
+        assert!(!AbovePreliminarySurfaceConditionEx.test(&mut ctx));
+        ctx.update_y(1, 1, i32::MIN, 72);
+        assert!(AbovePreliminarySurfaceConditionEx.test(&mut ctx));
+    }
+
+    #[test]
+    fn reference_vertical_gradient_uses_named_positional_random_factory() {
+        let seed = 0x26_02;
+        let mut ctx = SurfaceContext::new_with_height(
+            SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, seed),
+            63,
+            -64,
+            384,
+            Box::new(|_, _, _| Biome::Plains),
+            Box::new(|_, _| 64),
+        );
+        let bedrock = VerticalGradientConditionEx::new(
+            seed,
+            "minecraft:bedrock_floor",
+            VerticalAnchor::AboveBottom(0),
+            VerticalAnchor::AboveBottom(5),
+        );
+        ctx.update_xz(-37, 91);
+        ctx.update_y(1, 1, i32::MIN, -62);
+
+        let mut root = NoiseSeed::new(seed);
+        let positional = root.fork_positional();
+        let mut named = positional.from_hash_of("minecraft:bedrock_floor");
+        let expected = named.fork_positional().at(-37, -62, 91).next_float() < 0.6;
+        assert_eq!(bedrock.test(&mut ctx), expected);
+
+        let deepslate = VerticalGradientConditionEx::new(
+            seed,
+            "minecraft:deepslate",
+            VerticalAnchor::AboveBottom(0),
+            VerticalAnchor::AboveBottom(5),
+        );
+        assert!((-128..=128).any(|x| {
+            ctx.update_xz(x, -19);
+            ctx.update_y(1, 1, i32::MIN, -62);
+            bedrock.test(&mut ctx) != deepslate.test(&mut ctx)
+        }));
+    }
+
+    #[test]
+    fn reference_surface_noise_above_scales_thresholds_but_clay_bands_do_not() {
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, 0x26_02);
+        let mut ctx = SurfaceContext::new_with_height(
+            system.clone(),
+            63,
+            -64,
+            384,
+            Box::new(|_, _, _| Biome::WindsweptHills),
+            Box::new(|_, _| 64),
+        );
+        let (scaled_x, scaled_z) = (-512..=512)
+            .flat_map(|x| (-512..=512).map(move |z| (x, z)))
+            .find(|&(x, z)| {
+                let value = system.surface_noise.sample(x as f64, 0.0, z as f64);
+                (1.0 / 8.25..1.0).contains(&value)
+            })
+            .unwrap();
+        ctx.update_xz(scaled_x, scaled_z);
+        ctx.update_y(1, 1, i32::MIN, 64);
+        assert!(reference_surface_noise_above(&system, 1.0).test(&mut ctx));
+        assert!(!reference_noise(&system, NoiseKey::Surface, 1.0, f64::MAX).test(&mut ctx));
+
+        let (clay_x, clay_z) = (-512..=512)
+            .flat_map(|x| (-512..=512).map(move |z| (x, z)))
+            .find(|&(x, z)| {
+                let value = system.surface_noise.sample(x as f64, 0.0, z as f64);
+                (-0.1818..=0.1818).contains(&value)
+            })
+            .unwrap();
+        ctx.update_xz(clay_x, clay_z);
+        assert!(reference_noise(&system, NoiseKey::Surface, -0.1818, 0.1818).test(&mut ctx));
+    }
+
+    #[test]
+    fn unsupported_sulfur_bands_do_not_bypass_deepslate_elsewhere() {
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, 0x26_02);
+        let mut root = NoiseSeed::new(system.noise_random_seed);
+        let positional = root.fork_positional();
+        let sulfur = seeded_surface_noise(&positional, NoiseKey::SulfurCaveGradient);
+        let mut samples = (-512..=512).flat_map(|x| (-512..=512).map(move |z| (x, z)));
+        let matching = samples
+            .clone()
+            .find(|&(x, z)| {
+                let value = sulfur.sample(x as f64, -1.0, z as f64);
+                (-0.4..=-0.1).contains(&value) || value >= 0.0
+            })
+            .unwrap();
+        let ordinary = samples
+            .find(|&(x, z)| {
+                let value = sulfur.sample(x as f64, -1.0, z as f64);
+                value < -0.4 || (-0.1..0.0).contains(&value)
+            })
+            .unwrap();
+        let mut ctx = SurfaceContext::new_with_height(
+            system.clone(),
+            63,
+            -64,
+            384,
+            Box::new(|_, _, _| Biome::SulfurCaves),
+            Box::new(|_, _| 64),
+        );
+        let rule = minecraft26_reference_overworld_rules(system);
+
+        ctx.update_xz(matching.0, matching.1);
+        ctx.update_y_with_block(1, 1, i32::MIN, -1, BlockId::Stone);
+        assert_eq!(rule.try_apply(&mut ctx, matching.0, -1, matching.1), Some(BlockId::Stone));
+
+        ctx.update_xz(ordinary.0, ordinary.1);
+        ctx.update_y_with_block(1, 1, i32::MIN, -1, BlockId::Stone);
+        assert_eq!(rule.try_apply(&mut ctx, ordinary.0, -1, ordinary.1), Some(BlockId::Deepslate));
+    }
+
+    #[test]
+    fn frozen_ocean_temperature_modifier_controls_ice_and_iceberg_melting() {
+        assert_eq!(frozen_ocean_temperature(0, 63, 0, 63), 0.2);
+        assert!(frozen_ocean_iceberg_melts_slightly(0, 0, 63));
+        let non_melting = (-512..=512)
+            .flat_map(|x| (-512..=512).map(move |z| (x, z)))
+            .find(|&(x, z)| !frozen_ocean_iceberg_melts_slightly(x, z, 63))
+            .unwrap();
+        assert_eq!(non_melting, (-512, -512));
+        assert_eq!(frozen_ocean_temperature(-512, 63, -512, 63), 0.0);
+
+        let mut ctx = SurfaceContext::new_with_height(
+            SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, 1),
+            63,
+            -64,
+            384,
+            Box::new(|_, _, _| Biome::FrozenOcean),
+            Box::new(|_, _| 63),
+        );
+        ctx.update_xz(0, 0);
+        ctx.update_y(1, 1, i32::MIN, 63);
+        assert!(!TemperatureConditionEx.test(&mut ctx));
+        ctx.update_xz(-512, -512);
+        ctx.update_y(1, 1, i32::MIN, 63);
+        assert!(TemperatureConditionEx.test(&mut ctx));
+
+        let cold = frozen_ocean_extension_bounds(2.0, 10.0, 63, false).unwrap();
+        let melting = frozen_ocean_extension_bounds(2.0, 10.0, 63, true).unwrap();
+        assert_eq!(cold, (67.8, 51.2));
+        assert_eq!(melting, (65.8, 53.2));
+    }
+
+    fn build_reference_fixture(
+        chunk_x: i32,
+        chunk_z: i32,
+        biome: Biome,
+        top_world_y: i32,
+        water_top: Option<i32>,
+        cave_air_y: Option<i32>,
+    ) -> Chunk {
+        let world_min_y = -64;
+        let mut chunk = Chunk::new(chunk_x, chunk_z);
+        let top_local = (top_world_y - world_min_y) as usize;
+        for x in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for y in 0..=top_local {
+                    chunk.set_block(x, y, z, Block::new(BlockId::Stone));
+                }
+                if let Some(water_top) = water_top {
+                    for world_y in top_world_y + 1..=water_top {
+                        chunk.set_block(x, (world_y - world_min_y) as usize, z, Block::new(BlockId::Water));
+                    }
+                }
+            }
+        }
+        if let Some(cave_air_y) = cave_air_y {
+            chunk.set_block(0, (cave_air_y - world_min_y) as usize, 0, Block::new(BlockId::Air));
+        }
+        let system = SurfaceSystem::create_ref_from_seed(BlockId::Stone, 63, 0x5EED);
+        SurfaceSystem::build_reference_overworld_surface(
+            system,
+            &mut chunk,
+            63,
+            world_min_y,
+            move |_, _, _| biome,
+            move |_, _| top_world_y,
+        );
+        chunk
+    }
+
+    #[test]
+    fn reference_representative_plains_desert_badlands_and_mountain_columns() {
+        let plains = build_reference_fixture(-2, 3, Biome::Plains, 64, None, None);
+        let desert = build_reference_fixture(-2, 3, Biome::Desert, 64, None, None);
+        let badlands = build_reference_fixture(-2, 3, Biome::Badlands, 64, None, None);
+        let mountain = build_reference_fixture(-2, 3, Biome::StonyPeaks, 96, None, None);
+        assert_eq!(plains.get_block(0, 128, 0).id, BlockId::GrassBlock);
+        assert_eq!(desert.get_block(0, 128, 0).id, BlockId::Sand);
+        assert_eq!(badlands.get_block(0, 128, 0).id, BlockId::RedSand);
+        assert!(matches!(mountain.get_block(0, 160, 0).id, BlockId::Stone | BlockId::Calcite));
+    }
+
+    #[test]
+    fn reference_representative_frozen_ocean_and_cave_columns() {
+        let frozen = build_reference_fixture(-3, -4, Biome::FrozenOcean, 50, Some(63), None);
+        assert_eq!(frozen.get_block(0, 127, 0).id, BlockId::Water);
+        assert!(matches!(frozen.get_block(0, 114, 0).id, BlockId::Stone | BlockId::Gravel | BlockId::Water));
+
+        let cave = build_reference_fixture(-3, -4, Biome::DripstoneCaves, 64, None, Some(62));
+        assert_eq!(cave.get_block(0, 125, 0).id, BlockId::Stone);
+    }
+
+    #[test]
+    fn reference_world_surface_wg_height_includes_fluids() {
+        let chunk = build_reference_fixture(-1, -1, Biome::FrozenOcean, 50, Some(63), None);
+        let heightmap = build_world_surface_wg_heightmap(&chunk, -64);
+        assert_eq!(heightmap[0], 63);
     }
 
     #[test]

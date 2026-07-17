@@ -787,6 +787,15 @@ impl PerlinNoise {
         PerlinNoise::create_with_init(random, octaves, PerlinInit::New)
     }
 
+    /// Sequential octave initialization used internally by Java's
+    /// `BlendedNoise`, even when its source random is Xoroshiro.
+    pub fn create_legacy_for_blended_noise(
+        random: &mut NoiseSeed,
+        octaves: &[i32],
+    ) -> Self {
+        PerlinNoise::create_with_init(random, octaves, PerlinInit::Legacy)
+    }
+
     /// Create from explicit first-octave and amplitude list.
     ///
     /// Equivalent to `PerlinNoise.create(RandomSource, int, DoubleList)` (new init).

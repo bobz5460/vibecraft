@@ -59,7 +59,7 @@ A parity item is complete only when all applicable conditions hold:
 | Area | Status | What exists | Main gap |
 |---|---|---|---|
 | Engine and terrain renderer | Foundation | wgpu/winit loop, chunk GPU cache, frustum culling, shadows, fog, sky, post-processing | no occlusion culling/LOD or configurable settings |
-| Overworld terrain | Partial | seeded terrain, biomes, caves, ores, decorations, async generation | not data-version-faithful; no natural structures or cave biomes |
+| Overworld terrain | Partial | seeded terrain, biomes, caves, ores, decorations, bounded natural-structure geometry, async generation | not data-version-faithful; no complete Java structure pieces/jigsaw/processors or cave-biome parity |
 | Blocks and lighting | Partial | registry/state and resolved-model foundations, chunk lighting, greedy cube/crossed/slab/stair meshes | metadata does not yet drive all gameplay/rendering; no generic model-element or block-entity system |
 | Player survival | Partial | movement, collision, modes, health/hunger, effects, basic fluids | formulas and interactions are incomplete; no entity combat |
 | Items and inventory | Partial | item registry, stack counts, hotbar/inventory textures, block/item drop billboards | no durability, equipment, crafting, containers, or generic item/entity-model rendering |
@@ -241,6 +241,37 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 - Status: in progress
 - Notes: The supplied tree is Minecraft 26.2 (`world_version` 4903, data pack 107.1) and includes worldgen JSON plus binary structure templates. New worlds now use persisted Java-profile coordinates `-64..319` over unchanged local storage `0..383`; migrated existing saves retain legacy local-Y coordinates. A separate persisted generation profile keeps migrated worlds on pre-corrected interpolation while new local/server worlds use the corrected Minecraft-26 base, preventing old/new streaming seams without claiming Java output parity. Existing uncommitted generator edits are preserved pending golden-vector validation.
 
+### 2026-07-17: Geometry-only Minecraft 26.2 base-terrain corrections
+
+- Owner: OpenCode
+- Scope: Select a separate reference noise router and post-density pipeline only for `minecraft26_geometry`: Java-float CubicSpline Hermite interpolation, endpoint-mapped cave noises and supplied cave coordinate scales, marker-aware per-block final-density evaluation with per-cell interpolator caches, sequential legacy BlendedNoise octave initialization, corrected carver aquifer `(x,y,z)`/null semantics, surface-before-carvers order, Overworld-relative carver anchors and supplied cave/canyon ranges, named positional deepslate transition, and randomized bedrock floor. `legacy_pre_corrected_interpolation`, `minecraft26_base`, and `minecraft26_native_decoration_preview` retain the compatibility router, density refinement thresholds, BlendedNoise initialization, carver graph, stage order, and fixed fingerprints.
+- Status: complete for the listed isolated corrections; the target-projected carver boundary is completed by the follow-up entry below.
+- Validation: `cargo test world::world_gen:: --lib` passes 141 tests with one asset-dependent structure-template test ignored; `cargo build` passes. Fixed tests cover Java Hermite arithmetic, mapped endpoint/scales, exact block coordinates outside markers, explicit-marker-only interpolation, one eight-corner sample per marker per cell, heuristic-threshold independence, sequential BlendedNoise initialization and vectors, carver coordinates/null/config anchors, stage order, named deepslate selection, and all three compatibility-profile fingerprints.
+- Notes: This base-terrain slice originally stopped at owner-chunk carvers. The follow-up carver slice below replaces that Geometry-only approximation without changing the three compatibility profiles.
+
+### 2026-07-17: Geometry-only Minecraft 26.2 target-projected Overworld carvers
+
+- Owner: OpenCode
+- Scope: For `minecraft26_geometry` only, scan the exact 17x17 (`+/-8` inclusive) Java source-chunk neighborhood in `dx`-then-`dz` order and project source-owned `cave`, `cave_extra_underground`, and `canyon` attempts into one target chunk. Placement uses the shared Java legacy 48-bit RNG and `setLargeFeatureSeed(world_seed + carver_index, source_x, source_z)`; the reference-only cave/canyon walks preserve 26.2 float/int/long consumption, tunnel-local seeds, configured anchors/providers/scales, lava floor, natural-block replaceability, target-local mask deduplication, null aquifer barriers, and representable biome top-material repair.
+- Bounds: exactly 289 source chunks and 867 configured-carver seedings per target; ellipsoid writes are clipped to the target's 16x384x16 storage. No loaded neighbor is read or mutated, so output is generation-order independent.
+- Status: complete for the native Geometry-only carver boundary. Exact Java block states absent from the native registry, full Java surface-rule top-material evaluation, Java save/protocol output, and executable Java chunk golden comparisons remain outside this claim.
+- Validation: `cargo test world::world_gen:: --lib` passes 152 tests with one asset-dependent template test ignored; `cargo build`, `cargo build --release`, and the 15-second release startup smoke pass. Fixed tests cover negative source coordinates, 289-source cardinality and order, Java RNG vectors/call consumption, cross-border cave projection without a mask seam, carving-mask deduplication, null aquifer barriers, exact configured ranges, and unchanged compatibility-profile fingerprints.
+
+### 2026-07-17: Geometry-only Minecraft 26.2 reference surface system
+
+- Owner: OpenCode
+- Scope: Select a separate `SurfaceRuleData.overworld()`-oriented rule tree and `SurfaceSystem` entry point only for `minecraft26_geometry`. The reference path uses fluid-inclusive `WORLD_SURFACE_WG` column heights, density-router preliminary surfaces with Java's 16-block bilinear gate, contiguous stone depth above/below, Java water/no-water signs, steep/hole/y/noise/biome conditions, named positional vertical gradients, bedrock/deepslate ordering, representable biome surface branches, eroded-badlands extension, and frozen-ocean packed-ice extension. The compatibility default tree and builder remain selected for `legacy_pre_corrected_interpolation`, `minecraft26_base`, and `minecraft26_native_decoration_preview`.
+- Status: complete for representable `SurfaceRuleData` and `SurfaceSystem` outputs; overall Java surface/feature parity remains partial.
+- Validation: Fixed tests cover fluid height accounting, water no-water/offset semantics, steep slopes, negative-coordinate preliminary interpolation, named positional gradients, representative plains/desert/badlands/frozen-ocean/mountain/cave columns, and the unchanged three-profile compatibility fingerprints. `cargo test world::world_gen:: --lib` passes 148 tests with one asset-dependent template test ignored; `cargo build`, `cargo build --release`, and the 15-second release startup smoke pass without a panic or validation error.
+- Notes: `MINECRAFT26_REFERENCE_SURFACE_UNSUPPORTED` reports sulfur-cave cinnabar/sulfur bands and unavailable normal red sandstone; only matching unsupported bands preserve the density-filled block, while ordinary surface and deepslate rules continue elsewhere in Java order. Blue ice is explicitly reported as placed-feature work rather than invented as a surface branch. Native block data still cannot claim exact Java block-state property parity.
+
+### 2026-07-17: Geometry biome identity/climate and reference-surface corrections
+
+- Owner: OpenCode
+- Scope: Correct only `minecraft26_geometry` biome parameter identity/climate and reference surface behavior: expose the exact 55 registered 26.2 Overworld identities, select old-growth birch at its canonical positive-weirdness slot, put dripstone's `0.8..1.0` span on continentalness, preserve Java sulfur/deepslate ordering when cinnabar and sulfur are unavailable, scale only `surfaceNoiseAbove` thresholds by `1/8.25`, and port the frozen-ocean temperature modifier used by ice and iceberg melting. The three older generation profiles retain their prior parameter labels/axis and surface pipeline.
+- Status: complete for the named corrections. Cinnabar, sulfur, normal red sandstone, blue ice feature placement, and general biome climate/gameplay data remain unsupported as documented by the existing coverage reports.
+- Validation: Exact fixtures cover all 55 identities and the ordered 7,594 parameter-point labels, old-growth birch and dripstone parameters, sulfur matching/non-matching bands, scaled surface thresholds versus literal clay bands, frozen modifier temperatures and two-block iceberg melting, and unchanged legacy/base/native-preview fingerprints. `cargo test world::world_gen:: --lib` passes 165 tests with 2 real-asset template tests ignored; `cargo build` passes with pre-existing warnings.
+
 ### 2026-07-16: Native future-world decoration preview
 
 - Owner: OpenCode
@@ -250,11 +281,57 @@ Use this matrix before editing. A change usually needs every listed layer, not j
 - Validation: `cargo test world::world_gen::generator::tests --lib` (19 passed), targeted persistence/network migration tests, `cargo build`, `cargo build --release`, and a 15-second release startup window completed without a panic or GPU validation error. macOS lacks the `timeout` utility, so the tool process timeout supplied the expected termination.
 - Notes: This is deliberately not Java placed-feature/index compatibility. Trees support only vertical default-data logs and default leaf state; unsupported log axes and leaf-distance/persistence states are not represented. Wells intentionally omit sandstone slabs, suspicious sand, loot, and block-entity behavior.
 
+### 2026-07-17: Bounded Minecraft 26.2 structure-template geometry loader
+
+- Owner: OpenCode
+- Scope: Decode gzip NBT structure geometry from an asset root, retain singular and plural palettes plus state metadata, and lazily project a deterministic selected palette into one native target chunk. Generator placement, block entities, entities, loot, general processors, and structure-start selection remain separate work.
+- Depends on: M1 native `BlockId` representation and the pinned Minecraft 26.2 data set
+- Acceptance: Malformed, truncated, deeply nested, and oversized input fails recoverably; rotations/mirrors and negative origins are deterministic; unsupported Java palette names are reported rather than substituted.
+- Status: complete
+
+### 2026-07-17: Minecraft 26.2 Overworld structure-placement candidates
+
+- Owner: OpenCode
+- Scope: Add the exact Java legacy RNG and candidate-placement data/algorithms for all 17 normal Overworld structure sets, including random spread, all frequency reducers, weighted entry attempt order, exclusion-zone evaluation, and stronghold concentric rings.
+- Depends on: Pinned Minecraft 26.2 source and worldgen structure-set data
+- Acceptance: Independent fixed vectors cover linear and triangular spread, negative chunks, every frequency reducer, weighted selection, exclusion ranges, and stronghold rings; preferred-biome relocation remains an explicit callback at Java's block-position search boundary.
+- Status: complete
+- Validation: `cargo test world::world_gen::structures::tests --lib` passes 8 tests. The candidate module is now consumed only by the separately versioned bounded structure-geometry stage described below.
+- Notes: This layer still selects candidate chunks and weighted structure attempts only. Geometry, biome/terrain gates, template selection, and target-chunk projection remain separate so exact candidate placement is not confused with Java piece parity.
+
+### 2026-07-17: Minecraft 26.2-oriented placed-feature geometry stage
+
+- Owner: OpenCode
+- Scope: Add a persisted `minecraft26_geometry` new-world profile and a bounded owner-chunk-projected geometry stage for native-representable Overworld ores, stone/dirt/gravel blobs, trees, surface/aquatic vegetation, sand/gravel disks, fluids, freeze top layer, cave decoration, geodes, desert wells, and monster rooms. Natural structure starts/templates are implemented by the separate stage below.
+- Depends on: Corrected Minecraft-26 base profile, native `BlockId` coverage, and Java-style decoration/feature seed plumbing.
+- Acceptance: Negative coordinates, cross-border projection, profile isolation, generation-order independence, representative ore/tree/aquatic/cave output, persistence migration, and network profile transport have focused tests; work and target writes have fixed caps.
+- Status: complete for the named geometry-first subset; overall placed-feature parity remains partial.
+- Notes: Existing legacy, `minecraft26_base`, and `minecraft26_native_decoration_preview` worlds retain their exact profile behavior. Unsupported clay, pointed-dripstone states, smooth basalt, plant/tree property states, archaeology, loot, and spawner configuration are reported by `MINECRAFT26_GEOMETRY_COVERAGE` and are not substituted. Placement geometry and major JSON counts/ranges are reference-oriented, but exact Java biome feature indexes, processors, state providers, and all remaining placed features are not implemented.
+
+### 2026-07-17: Geometry-only Minecraft 26.2 biome-root feature closure
+
+- Owner: OpenCode
+- Scope: Replace family-wide Geometry decoration with a checked-in table derived from all 55 supplied Overworld biome feature lists and their placed/configured resources: 168 exact root keys, 11 ordered steps, exact biome membership masks, and per-key implemented/state-limited/blocked coverage. Existing generation profiles and the bounded structure stage remain unchanged.
+- Status: complete for native-representable geometry and explicit exact-key coverage; exact Java feature algorithms, block states, processors, block entities, loot, and unsupported outputs remain partial or blocked.
+- Notes: Geometry now omits invented water lakes, suppresses lakes/springs in deep dark, applies normal/large copper as a dripstone substitution, keeps normal and badlands-extra gold distinct, rejects out-of-world height attempts, and dispatches aquatic/disks/vegetation only from listed roots. Added bounded owner-projected magma, icebergs/blue ice/ice spikes, glow lichen default-state visuals, forest rocks, fallen trees, huge mushrooms, bamboo/podzol, vines, fossils, root systems, and richer available-block cave decoration. Pale-garden-only outputs, sulfur roots, clay roots, pointed dripstone, sculk, infested ore, and unavailable plant/state roots are blocked by exact key without lookalike substitution.
+
+### 2026-07-17: Bounded Minecraft 26.2 structure geometry stage
+
+- Owner: OpenCode
+- Scope: Connect all 17 exact Overworld structure-set candidate categories to a new `structure_geometry.rs` stage for `minecraft26_geometry` worlds only. Every target chunk scans a fixed three-chunk owner radius after base terrain, accepts bounded starts using the existing frequency/exclusion/weighted-order layer and native 26.2 biome/terrain gates, then projects target-local writes before the monolithic placed-feature stage.
+- Template-backed bounded slices: biome-matched legacy-air village town centers, igloo top, legacy-air pillager watchtower, weighted ancient-city centers, ruined portals, weighted plural-palette shipwrecks, underwater-air-preserving ocean ruins, one trail-ruins tower, and weighted trial-chamber corridor ends. Successful bounded NBT decodes are shared safely across worker generators; missing/malformed templates warn and remain retryable. Property-insensitive supported cubes retain geometry, exactly representable native states are registry-mapped and rotated, and unsupported directional/stateful blocks are counted, warned, and skipped.
+- Native bounded geometry: desert pyramids, jungle temples, swamp huts, ocean monuments, woodland mansions, buried treasures, mineshafts, and strongholds. These preserve recognizable footprint, material family, and surface/underground placement, but are explicitly native geometry rather than exact Java piece graphs.
+- Bounds: three owner chunks, 128 accepted starts, 32,768 decoded blocks per template, 64 blocks per template horizontal axis, 1,048,576 block evaluations, and 65,536 projected writes per target chunk. Bedrock is never replaced and no loaded neighbor is read or mutated.
+- Acceptance: Deterministic tests cover plural palette selection, non-destructive legacy/underwater air, safe state flattening/rotation, unsupported-only cavity rejection, exact native 26.2 biome gates, final surface/ocean-floor placement, buried-treasure support search, negative cross-border projection, generation-order independence, old-profile isolation, all 17 coverage rows, missing asset recovery, deterministic relevant stronghold relocation, and ignored real-template asset tests.
+- Status: complete for the named geometry-first stage; overall Java structure parity remains partial.
+- Validation: `cargo test world::world_gen::template::tests --lib` passes 8 tests; `cargo test world::world_gen::structure_geometry::tests --lib` passes 13 tests with two asset tests ignored; both asset tests pass against `/tmp/opencode/minecraft-assets`; `cargo test world::world_gen::structures::tests --lib` passes 9 tests; `cargo test world::world_gen:: --lib` passes 165 tests with two asset tests ignored; and `cargo build` passes with existing warnings.
+- Notes: `MINECRAFT26_STRUCTURE_GEOMETRY_COVERAGE` is the authoritative per-category table. The Geometry profile alone uses exact supplied biome-tag memberships and deterministic final base-column queries; compatibility-profile fingerprints remain unchanged. Jigsaw expansion, complete Java piece graphs, general template processors, terrain adaptation, unsupported state families, loot, archaeology, mobs, entities, block entities, structure references, locate metadata, and Java save/protocol representation remain unsupported and are not claimed.
+
 - [~] Port vanilla noise/density pipeline: ImprovedNoise, PerlinNoise, NormalNoise, DensityFunction framework, NoiseRouter, TerrainProvider splines, cave density functions, and cell-based trilinear interpolation chunk fill. Integrated as VanillaWorldGenerator replacing the old WorldGenerator in ChunkManager; candidate-only until executable Java 26.2 fixture coverage validates seed plumbing and chunk output.
-- [ ] Port or faithfully reproduce target-version biome, density, surface, aquifer, cave, ore, and feature rules using reference seeds for comparison. The active path now uses the 26.2 biome source, aquifer, seeded surface system, and ore-vein material rule; carvers and configured/placed features remain pending.
-- [~] Correct density-cell banding in the active terrain fill: explicit interpolated density markers now use global cell coordinates, and material boundaries receive exact point refinement without post-generation smoothing. The fill loop now matches Java's delayed X-slice swap and aquifers use the named `minecraft:aquifer` random fork; Java runtime fixtures remain required before declaring the path exact.
+- [~] Port or faithfully reproduce target-version biome, density, surface, aquifer, cave, ore, and feature rules using reference seeds for comparison. The active path uses the 26.2 biome source, aquifer, seeded surface system, carvers, ore-vein material rule, and a bounded geometry-first placed-feature subset for new worlds; exact Java feature indexes/processors, unsupported states, and remaining placed features remain pending.
+- [~] Correct density-cell banding in the active terrain fill: `minecraft26_geometry` evaluates final density at every exact block coordinate and only explicit interpolated markers use cached 4x8x4 cell corners; the three compatibility profiles retain whole-density interpolation and heuristic boundary refinement. The compatibility fill loop matches Java's delayed X-slice swap and aquifers use the named `minecraft:aquifer` random fork; executable Java chunk fixtures remain required before declaring the path exact.
 - [ ] Add missing overworld biomes and biome-dependent colors, precipitation, features, and spawn rules.
-- [ ] Add naturally generated structures in dependency order: small features/geodes, villages/outposts, dungeons/mineshafts, temples, monuments, strongholds, ancient cities, trail ruins, and trial chambers.
+- [~] Add naturally generated structures in dependency order: exact 26.2 candidates and bounded geometry now cover all 17 normal Overworld sets for new `minecraft26_geometry` worlds; complete Java pieces, jigsaw expansion, processors, state transforms, loot, mobs, and metadata remain pending.
 - [ ] Implement crop growth, farmland, leaves, fire, snow/ice, weather, lightning, and other random/scheduled block behavior.
 - [ ] Implement weather simulation and visual/audio effects, including biome-dependent rain/snow and thunder behavior.
 - [ ] Add world-generation snapshot tests for stable seed/coordinate fixtures, negative-Y mapping, representative caves/ores/features, and structure-placement checks.

@@ -59,7 +59,7 @@ impl ParameterPoint {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum BiomeId {
     SnowyPlains,
     SnowyTaiga,
@@ -67,6 +67,7 @@ enum BiomeId {
     Plains,
     Forest,
     BirchForest,
+    OldGrowthBirchForest,
     DarkForest,
     OldGrowthSpruceTaiga,
     OldGrowthPineTaiga,
@@ -120,12 +121,13 @@ enum BiomeId {
 impl BiomeId {
     fn supported(self) -> Result<Biome, UnsupportedBiome> {
         match self {
-            Self::SnowyPlains => Ok(Biome::SnowyTundra),
+            Self::SnowyPlains => Ok(Biome::SnowyPlains),
             Self::IceSpikes => Ok(Biome::IceSpikes),
             Self::SnowyTaiga => Ok(Biome::SnowyTaiga),
             Self::Plains => Ok(Biome::Plains),
             Self::Forest => Ok(Biome::Forest),
             Self::BirchForest => Ok(Biome::BirchForest),
+            Self::OldGrowthBirchForest => Ok(Biome::OldGrowthBirchForest),
             Self::PaleGarden => Ok(Biome::PaleGarden),
             Self::DarkForest => Ok(Biome::DarkForest),
             Self::OldGrowthSpruceTaiga => Ok(Biome::OldGrowthSpruceTaiga),
@@ -216,6 +218,15 @@ impl OverworldBiomeSource {
         Self {
             router,
             parameters: build_parameter_points(),
+        }
+    }
+
+    pub(crate) fn from_router_compatibility(router: NoiseRouter) -> Self {
+        // Persisted pre-Geometry profiles keep their original labels and axis
+        // mistake so streaming cannot introduce profile-local biome seams.
+        Self {
+            router,
+            parameters: build_compatibility_parameter_points(),
         }
     }
 
@@ -430,11 +441,26 @@ fn build_parameter_points() -> Vec<ParameterPoint> {
     add_high_slice(&mut output, &temperatures, &humidities, &erosions, 0.7666667, 0.93333334);
     add_mid_slice(&mut output, &temperatures, &humidities, &erosions, 0.93333334, 1.0);
 
-    add_underground(&mut output, full, full, full, ClimateParameter::span(0.8, 1.0), full, 0.0, BiomeId::DripstoneCaves);
+    add_underground(&mut output, full, full, ClimateParameter::span(0.8, 1.0), full, full, 0.0, BiomeId::DripstoneCaves);
     add_underground(&mut output, full, ClimateParameter::span(0.7, 1.0), full, full, full, 0.0, BiomeId::LushCaves);
     add_underground(&mut output, full, full, ClimateParameter::span(-0.19, 0.55), ClimateParameter::span(0.45, 1.0), ClimateParameter::span(-1.1, -0.85), 0.0, BiomeId::SulfurCaves);
     add_bottom(&mut output, full, full, full, ClimateParameter::span(-1.0, -0.375), full, 0.0, BiomeId::DeepDark);
 
+    output
+}
+
+fn build_compatibility_parameter_points() -> Vec<ParameterPoint> {
+    let full = ClimateParameter::span(-1.0, 1.0);
+    let dripstone_erosion = ClimateParameter::span(0.8, 1.0);
+    let mut output = build_parameter_points();
+    for point in &mut output {
+        if point.biome == BiomeId::OldGrowthBirchForest {
+            point.biome = BiomeId::BirchForest;
+        } else if point.biome == BiomeId::DripstoneCaves {
+            point.parameters[2] = full;
+            point.parameters[3] = dripstone_erosion;
+        }
+    }
     output
 }
 
@@ -449,7 +475,7 @@ fn middle_biome(temperature: usize, humidity: usize, positive_weirdness: bool) -
     const VARIANT: [[Option<BiomeId>; 5]; 5] = [
         [Some(BiomeId::IceSpikes), None, Some(BiomeId::SnowyTaiga), None, None],
         [None, None, None, None, Some(BiomeId::OldGrowthPineTaiga)],
-        [Some(BiomeId::SunflowerPlains), None, None, Some(BiomeId::BirchForest), None],
+        [Some(BiomeId::SunflowerPlains), None, None, Some(BiomeId::OldGrowthBirchForest), None],
         [None, None, Some(BiomeId::Plains), Some(BiomeId::SparseJungle), Some(BiomeId::BambooJungle)],
         [None, None, None, None, None],
     ];
@@ -687,6 +713,8 @@ fn closest_biome(parameters: &[ParameterPoint], target: [i64; 7]) -> BiomeId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::world_gen::MINECRAFT26_OVERWORLD_BIOMES;
+    use std::collections::HashSet;
 
     #[test]
     fn parameter_distance_is_zero_inside_and_signed_outside() {
@@ -714,6 +742,64 @@ mod tests {
         assert_eq!(parameters.last().unwrap().biome, BiomeId::DeepDark);
         let target = [0, 0, quantize(-1.125), 0, 0, 0, 0];
         assert_eq!(closest_biome(&parameters, target), BiomeId::MushroomFields);
+    }
+
+    #[test]
+    fn reference_builder_has_exact_55_biome_identities_and_7594_point_labels() {
+        let parameters = build_parameter_points();
+        assert_eq!(parameters.len(), 7594);
+
+        let internal: HashSet<_> = parameters.iter().map(|point| point.biome).collect();
+        assert_eq!(internal.len(), 55);
+        let public: HashSet<_> = MINECRAFT26_OVERWORLD_BIOMES.into_iter().collect();
+        assert_eq!(public.len(), 55);
+        assert_eq!(
+            internal
+                .iter()
+                .copied()
+                .map(|biome| biome.supported().unwrap())
+                .collect::<HashSet<_>>(),
+            public
+        );
+
+        let label_fingerprint = parameters.iter().fold(0xcbf29ce484222325_u64, |hash, point| {
+            format!("{:?}", point.biome)
+                .bytes()
+                .chain(std::iter::once(0xff))
+                .fold(hash, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3))
+        });
+        assert_eq!(label_fingerprint, 11_087_558_769_596_216_506);
+    }
+
+    #[test]
+    fn reference_old_growth_birch_slot_is_not_collapsed_into_birch_forest() {
+        assert_eq!(middle_biome(2, 3, false), BiomeId::BirchForest);
+        assert_eq!(middle_biome(2, 3, true), BiomeId::OldGrowthBirchForest);
+        assert!(build_parameter_points()
+            .iter()
+            .any(|point| point.biome == BiomeId::OldGrowthBirchForest));
+        assert!(!build_compatibility_parameter_points()
+            .iter()
+            .any(|point| point.biome == BiomeId::OldGrowthBirchForest));
+    }
+
+    #[test]
+    fn reference_dripstone_uses_continentalness_axis_only() {
+        let full = ClimateParameter::span(-1.0, 1.0);
+        let high = ClimateParameter::span(0.8, 1.0);
+        let reference = build_parameter_points()
+            .into_iter()
+            .find(|point| point.biome == BiomeId::DripstoneCaves)
+            .unwrap();
+        assert_eq!(reference.parameters[2], high);
+        assert_eq!(reference.parameters[3], full);
+
+        let compatibility = build_compatibility_parameter_points()
+            .into_iter()
+            .find(|point| point.biome == BiomeId::DripstoneCaves)
+            .unwrap();
+        assert_eq!(compatibility.parameters[2], full);
+        assert_eq!(compatibility.parameters[3], high);
     }
 
     #[test]

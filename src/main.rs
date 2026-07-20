@@ -574,6 +574,16 @@ mod local_load_plan_tests {
             LocalLoadStage::Uploaded,
         );
     }
+
+    #[test]
+    fn dropped_item_pickup_removes_fully_collected_stacks() {
+        assert!(!keep_dropped_item_after_pickup(&inventory::EMPTY_STACK));
+    }
+
+    #[test]
+    fn dropped_item_pickup_keeps_partial_remainders() {
+        assert!(keep_dropped_item_after_pickup(&inventory::ItemStack::new(1, 1)));
+    }
 }
 
 fn inventory_block_sprites(reader: &vibecraft::assets::reader::AssetReader) -> HashMap<BlockId, String> {
@@ -935,6 +945,10 @@ fn spawn_dropped_stack(
         dropped.vy = 2.0 + rand::random::<f32>() * 2.0;
         dropped_items.push(dropped);
     }
+}
+
+fn keep_dropped_item_after_pickup(remainder: &inventory::ItemStack) -> bool {
+    !remainder.is_empty()
 }
 
 fn click_crafting(
@@ -3371,7 +3385,7 @@ async fn run(config: AppConfig) {
                     let dist = (dx * dx + dy * dy + dz * dz).sqrt();
                     if dist < 2.0 && item.pickup_delay <= 0.0 {
                         item.stack = inventory.add_stack(item.stack.clone(), &item_registry);
-                        item.stack.is_empty()
+                        keep_dropped_item_after_pickup(&item.stack)
                     } else {
                         true
                     }

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use crate::assets::reader::AssetReader;
 
 pub struct AudioEngine {
-    stream_keep: Option<OutputStream>,
+    _stream_keep: Option<OutputStream>,
     stream_handle: Option<OutputStreamHandle>,
     sounds: Mutex<HashMap<String, Arc<Vec<u8>>>>,
     reader: AssetReader,
@@ -20,7 +20,7 @@ impl AudioEngine {
             });
 
         AudioEngine {
-            stream_keep: stream,
+            _stream_keep: stream,
             stream_handle,
             sounds: Mutex::new(HashMap::new()),
             reader,

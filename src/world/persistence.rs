@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1171,9 +1171,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), StorageError> {
+    #[cfg(not(unix))]
+    let _ = path;
+
     #[cfg(unix)]
     {
-        File::open(path)
+        std::fs::File::open(path)
             .and_then(|directory| directory.sync_all())
             .map_err(|source| StorageError::Io {
                 path: path.to_path_buf(),

@@ -4,7 +4,7 @@ use crate::world::coordinates::WorldCoordinateProfile;
 use crate::world::block_registry::{registry, CollisionShape};
 use crate::assets::BlockMeshAssets;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 type FaceTexMap = HashMap<(BlockId, BlockFace), u32>;
 type CrossedTexMap = HashMap<BlockId, u32>;
@@ -60,13 +60,26 @@ fn get_texture_index(block: Block, face: BlockFace) -> u32 {
 }
 
 pub fn get_face_tile(block_id: BlockId, face: BlockFace) -> u32 {
+    // Air intentionally has no atlas entry. Presentation code may still ask
+    // for a harmless placeholder tile for an empty slot.
+    if block_id == BlockId::Air {
+        return 0;
+    }
     let tex = FACE_TEX
         .get()
         .and_then(|m| m.get(&(block_id, face)))
         .copied()
         .unwrap_or(u32::MAX);
     if tex == u32::MAX {
-        log::warn!("Missing face texture for block {:?} face {:?}", block_id, face);
+        static WARNED: OnceLock<Mutex<std::collections::HashSet<(BlockId, BlockFace)>>> = OnceLock::new();
+        let warned = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        if warned
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert((block_id, face))
+        {
+            log::warn!("Missing face texture for block {:?} face {:?}", block_id, face);
+        }
     }
     tex
 }
@@ -78,9 +91,16 @@ fn material_flags(block_id: BlockId) -> u32 {
     const LEAVES: u32 = 1 << 30;
     const TRANSLUCENT: u32 = 1 << 29;
     const CUTOUT: u32 = 1 << 28;
+    const ANIM_WATER: u32 = 1 << 24;
+    const ANIM_LAVA: u32 = 2 << 24;
+    const ANIM_KELP: u32 = 3 << 24;
+    const ANIM_KELP_PLANT: u32 = 4 << 24;
 
     match block_id {
-        BlockId::Water => WATER,
+        BlockId::Water => WATER | ANIM_WATER,
+        BlockId::Lava => ANIM_LAVA,
+        BlockId::Kelp => CUTOUT | ANIM_KELP,
+        BlockId::KelpPlant => CUTOUT | ANIM_KELP_PLANT,
         BlockId::OakLeaves
         | BlockId::OakLeaves2
         | BlockId::SpruceLeaves
@@ -292,6 +312,17 @@ fn fluid_height(block: Block) -> f32 {
     if block.data == 0 || block.data >= 8 { 1.0 } else { (8 - block.data) as f32 / 8.0 }
 }
 
+fn is_waterlogged_plant(id: BlockId) -> bool {
+    matches!(
+        id,
+        BlockId::Seagrass | BlockId::TallSeagrass | BlockId::Kelp | BlockId::KelpPlant
+    )
+}
+
+fn as_water_volume(block: Block) -> Block {
+    if is_waterlogged_plant(block.id) { Block::new(BlockId::Water) } else { block }
+}
+
 fn emit_fluid<'a>(
     chunk: &'a Chunk,
     get_neighbor: &impl Fn(i32, i32) -> Option<&'a Chunk>,
@@ -317,8 +348,11 @@ fn emit_fluid<'a>(
     }
     for (dx, dz, face) in [(0, -1, BlockFace::Back), (1, 0, BlockFace::Right), (0, 1, BlockFace::Front), (-1, 0, BlockFace::Left)] {
         let neighbor = get_block(x + dx, y, z + dz);
-        let neighbor_height = if neighbor.id == block.id { fluid_height(neighbor) } else { 0.0 };
-        if neighbor.id != block.id || neighbor_height < height {
+        // Minecraft 26.2 FluidRenderer::shouldRenderFace suppresses a face
+        // whenever the adjacent fluid is the same type. Different flowing
+        // levels shape the top surface; they do not expose an internal wall.
+        if neighbor.id != block.id {
+            let neighbor_height = 0.0;
             let (fx, fz, width) = match face {
                 BlockFace::Back => (world_x, world_z, 1.0),
                 BlockFace::Right => (world_x + 1.0, world_z, 1.0),
@@ -391,6 +425,33 @@ mod model_tests {
         assert!(!mesh.transparent_vertices.iter().any(|vertex| {
             vertex.normal == [1.0, 0.0, 0.0] && vertex.pos[0] == 16.0
         }));
+    }
+
+    #[test]
+    fn differing_water_levels_at_a_chunk_border_do_not_emit_an_internal_wall() {
+        let mut chunk = Chunk::new(0, 0);
+        let mut east = Chunk::new(1, 0);
+        chunk.set_block(15, 64, 8, Block::with_legacy_data(BlockId::Water, 0));
+        east.set_block(0, 64, 8, Block::with_legacy_data(BlockId::Water, 4));
+
+        let mesh = build_chunk_mesh(
+            &chunk,
+            &|cx, cz| ((cx, cz) == (1, 0)).then_some(&east),
+            WorldCoordinateProfile::LegacyLocal,
+        );
+
+        assert!(!mesh.transparent_vertices.iter().any(|vertex| {
+            vertex.normal == [1.0, 0.0, 0.0] && vertex.pos[0] == 16.0
+        }));
+    }
+
+    #[test]
+    fn aquatic_plants_are_crossed_waterlogged_volumes() {
+        for id in [BlockId::Seagrass, BlockId::TallSeagrass, BlockId::Kelp, BlockId::KelpPlant] {
+            assert!(id.is_crossed(), "{id:?} must use plant geometry");
+            assert!(is_waterlogged_plant(id), "{id:?} must retain its water volume");
+            assert_eq!(as_water_volume(Block::new(id)).id, BlockId::Water);
+        }
     }
 }
 
@@ -993,7 +1054,21 @@ pub fn build_chunk_mesh<'a>(
         for z in 0..CHUNK_SIZE {
             for y in 0..CHUNK_HEIGHT {
                 let block = chunk.get_block(x, y, z);
-                if emit_fluid(
+                let emitted_fluid = if block.id == BlockId::Water || is_waterlogged_plant(block.id) {
+                    let water_volume = |x, y, z| {
+                        as_water_volume(get_block_fn(x, y, z))
+                    };
+                    emit_fluid(
+                        chunk,
+                        get_neighbor,
+                        &water_volume,
+                        Block::new(BlockId::Water),
+                        (x as i32, y as i32, z as i32),
+                        &mut transparent_vertices,
+                        &mut transparent_indices,
+                    )
+                } else {
+                    emit_fluid(
                     chunk,
                     get_neighbor,
                     &get_block_fn,
@@ -1001,7 +1076,9 @@ pub fn build_chunk_mesh<'a>(
                     (x as i32, y as i32, z as i32),
                     &mut transparent_vertices,
                     &mut transparent_indices,
-                ) {
+                    )
+                };
+                if emitted_fluid && !is_waterlogged_plant(block.id) {
                     continue;
                 } else if emit_resolved_models(
                     chunk,
@@ -1679,6 +1756,9 @@ pub fn build_item_cube_mesh(items: &[(f32, f32, f32, BlockId)]) -> ChunkMesh {
     let mut indices = Vec::with_capacity(items.len() * 36);
 
     for &(x, y, z, block_id) in items {
+        if block_id == BlockId::Air {
+            continue;
+        }
         let h = 0.2;
         let block = Block::new(block_id);
 

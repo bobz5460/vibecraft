@@ -4,19 +4,19 @@
   "kind": "level",
   "data": {
     "name": "New World",
-    "created_at": 1784319357496,
-    "last_played": 1784319369842,
+    "created_at": 1784494485168,
+    "last_played": 1784508425120,
     "coordinate_profile": "java_overworld",
     "generation_profile": "legacy_pre_corrected_interpolation",
     "seed": 1783972558954253730,
-    "tick": 31365,
-    "game_time": 16365,
+    "tick": 31798,
+    "game_time": 16798,
     "spawn": [
       0,
       75,
       0
     ],
-    "gamemode": "survival",
+    "gamemode": "creative",
     "difficulty": "normal",
     "hardcore": false,
     "do_daylight_cycle": true,
@@ -24,7 +24,7 @@
     "experience": 0,
     "scheduled_ticks": [
       {
-        "due_tick": 31368,
+        "due_tick": 31803,
         "chunk": [
           -1,
           0
@@ -32,7 +32,7 @@
         "kind": "Water"
       },
       {
-        "due_tick": 31372,
+        "due_tick": 31804,
         "chunk": [
           -1,
           0
@@ -46,39 +46,39 @@
         "y": 64.0,
         "z": 10.16746,
         "vx": 3e-45,
-        "vy": 0.5,
+        "vy": 0.0,
         "vz": 3e-45,
         "block_id": 8,
         "item_id": 8,
         "count": 2,
         "damage": 0,
-        "lifetime": 254.16063
+        "lifetime": 232.50931
       },
       {
         "x": -4.0911374,
         "y": 65.0,
         "z": 5.1224947,
         "vx": 3e-45,
-        "vy": 0.0,
+        "vy": 0.5,
         "vz": -3e-45,
         "block_id": 8,
         "item_id": 8,
         "count": 1,
         "damage": 0,
-        "lifetime": 258.46014
+        "lifetime": 236.80957
       },
       {
         "x": -4.281351,
         "y": 66.0,
         "z": 3.5874286,
         "vx": 3e-45,
-        "vy": 0.0,
+        "vy": 0.5,
         "vz": -3e-45,
         "block_id": 8,
         "item_id": 8,
         "count": 1,
         "damage": 0,
-        "lifetime": 259.25995
+        "lifetime": 237.60962
       }
     ],
     "xp_orbs": [],

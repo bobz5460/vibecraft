@@ -16,15 +16,17 @@ resource-pack, or data-pack compatible.
 - Minecraft assets in a directory containing `assets/minecraft`
 - An audio device is recommended; audio initialization is best-effort
 
-The default asset directory is `/tmp/opencode/minecraft-assets`. Set
-`VIBECRAFT_ASSETS` when using another checkout:
+Vibecraft first looks for the supplied sibling checkout
+`../minecraft-26.2-assets` (relative to this repository), then for the legacy
+`/tmp/opencode/minecraft-assets` checkout. Set `VIBECRAFT_ASSETS` when using
+another location:
 
 ```sh
 export VIBECRAFT_ASSETS=/path/to/minecraft-assets
 ```
 
-Do not point `VIBECRAFT_ASSETS` directly at `assets/minecraft`; it must point at
-the directory containing the `assets` folder.
+`VIBECRAFT_ASSETS` may point either at the checkout root containing
+`assets/minecraft` or directly at `assets/minecraft`.
 
 ## Build And Run
 

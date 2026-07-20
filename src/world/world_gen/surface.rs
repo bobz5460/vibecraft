@@ -617,6 +617,14 @@ fn biome_temperature_noises() -> &'static BiomeTemperatureNoises {
     })
 }
 
+/// Minecraft's process-wide `Biome.BIOME_INFO_NOISE`, used by vegetation
+/// placement count modifiers as well as temperature edge variation.
+pub(crate) fn biome_info_noise(block_x: i32, block_z: i32) -> f64 {
+    biome_temperature_noises()
+        .biome_info
+        .sample(block_x as f64 / 200.0, block_z as f64 / 200.0)
+}
+
 fn frozen_ocean_temperature(block_x: i32, block_y: i32, block_z: i32, sea_level: i32) -> f32 {
     let noises = biome_temperature_noises();
     let x = block_x as f64;

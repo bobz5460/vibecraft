@@ -31,6 +31,7 @@ use world::chunk::BlockEntity;
 use world::chunk_manager::ChunkManager;
 use world::coordinates::WorldCoordinateProfile;
 use world::generation::WorldGenerationProfile;
+use world::world_gen::generator::VanillaWorldGenerator;
 use world::dropped_item::{xp_orbs_to_mesh, DroppedItem, XpOrb};
 use world::entity::{EntityKind, EntityStore, Transform};
 use world::mesh::{build_item_cube_mesh, build_player_mesh, PlayerMeshInstance};
@@ -49,6 +50,68 @@ fn unix_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Resolve either an asset checkout root (`.../minecraft-26.2-assets`) or the
+/// `assets/minecraft` directory within one. The reader always receives the
+/// Minecraft namespace root.
+fn minecraft_asset_directory(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let namespace_root = root.join("assets/minecraft");
+    if namespace_root.is_dir() {
+        return Some(namespace_root);
+    }
+
+    if root.join("textures").is_dir() && root.join("models").is_dir() {
+        return Some(root.to_path_buf());
+    }
+
+    None
+}
+
+fn resolve_minecraft_asset_directory() -> Result<std::path::PathBuf, String> {
+    if let Some(root) = std::env::var_os("VIBECRAFT_ASSETS") {
+        let root = std::path::PathBuf::from(root);
+        return minecraft_asset_directory(&root).ok_or_else(|| {
+            format!(
+                "asset root {} contains neither assets/minecraft nor a Minecraft asset namespace; set VIBECRAFT_ASSETS to a valid asset checkout",
+                root.display()
+            )
+        });
+    }
+
+    // The supplied 26.2 assets normally live next to this repository. Keep
+    // the historical CI/developer checkout as a fallback for existing setups.
+    let candidates = [
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../minecraft-26.2-assets"),
+        std::path::PathBuf::from("/tmp/opencode/minecraft-assets"),
+    ];
+    candidates
+        .iter()
+        .find_map(|root| minecraft_asset_directory(root))
+        .ok_or_else(|| {
+            format!(
+                "no Minecraft assets found; set VIBECRAFT_ASSETS to an asset checkout (searched {})",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+fn prepare_new_player_spawn(
+    seed: u64,
+    generation_profile: WorldGenerationProfile,
+    world_spawn: &mut [i32; 3],
+    player: &mut Player,
+) {
+    let (spawn_x, spawn_z) =
+        VanillaWorldGenerator::from_seed(seed, generation_profile).suggested_spawn_position();
+    world_spawn[0] = spawn_x;
+    world_spawn[2] = spawn_z;
+    *player = Player::new(spawn_x as f32, world_spawn[1] as f32, spawn_z as f32);
+    log::info!("using climate-selected spawn search center at ({spawn_x}, {spawn_z})");
 }
 
 fn unique_world_directory(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
@@ -89,7 +152,11 @@ fn screen_pos_to_inventory_slot(
 
 const MIN_LOCAL_LOAD_DISPLAY: std::time::Duration = std::time::Duration::from_millis(500);
 const LOCAL_LOAD_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const SAFE_SPAWN_SEARCH_RADIUS: i32 = 64;
+// Vanilla verifies an 11x11 chunk area around its climate-selected spawn
+// suggestion. Keep a comparable block-radius search after this port's
+// asynchronous chunk admission step.
+const SAFE_SPAWN_SEARCH_RADIUS_CHUNKS: i32 = 5;
+const RESPAWN_SEARCH_RADIUS_BLOCKS: i32 = 10;
 const SPAWN_SEARCH_CHUNK_LOOKAHEAD: usize = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,18 +175,26 @@ struct SpawnSearch {
 }
 
 impl SpawnSearch {
-    fn new(center_x: i32, center_z: i32, radius: i32) -> Self {
-        let radius = radius.max(0);
+    fn new(center_x: i32, center_z: i32, radius_chunks: i32) -> Self {
+        let radius = radius_chunks.max(0);
+        let center_cx = center_x.div_euclid(CHUNK_SIZE as i32);
+        let center_cz = center_z.div_euclid(CHUNK_SIZE as i32);
         let mut candidates = Vec::new();
-        for distance in 0..=radius {
-            for dx in -distance..=distance {
-                for dz in -distance..=distance {
-                    if distance != 0 && dx.abs() != distance && dz.abs() != distance {
-                        continue;
-                    }
-                    candidates.push((center_x + dx, center_z + dz));
-                }
+        let mut dx = 0;
+        let mut dz = 0;
+        let mut step_x = 0;
+        let mut step_z = -1;
+        for _ in 0..(radius * 2 + 1).pow(2) {
+            if (-radius..=radius).contains(&dx) && (-radius..=radius).contains(&dz) {
+                candidates.push((center_cx + dx, center_cz + dz));
             }
+            if dx == dz || (dx < 0 && dx == -dz) || (dx > 0 && dx == 1 - dz) {
+                let old_step_x = step_x;
+                step_x = -step_z;
+                step_z = old_step_x;
+            }
+            dx += step_x;
+            dz += step_z;
         }
         Self {
             candidates,
@@ -139,16 +214,10 @@ impl SpawnSearch {
         if !matches!(self.state, SpawnSearchState::Searching) {
             return chunks;
         }
-        for &(x, z) in &self.candidates[self.next_candidate..] {
-            let chunk = (
-                x.div_euclid(CHUNK_SIZE as i32),
-                z.div_euclid(CHUNK_SIZE as i32),
-            );
-            if !chunks.contains(&chunk) {
-                chunks.push(chunk);
-                if chunks.len() == SPAWN_SEARCH_CHUNK_LOOKAHEAD {
-                    break;
-                }
+        for &chunk in &self.candidates[self.next_candidate..] {
+            chunks.push(chunk);
+            if chunks.len() == SPAWN_SEARCH_CHUNK_LOOKAHEAD {
+                break;
             }
         }
         chunks
@@ -242,25 +311,21 @@ impl LocalLoadPlan {
         fresh_player: bool,
         started: std::time::Instant,
     ) -> Self {
-        let (center_x, center_z, radius) = if fresh_player {
+        let (center_x, center_z) = if fresh_player {
             (
                 world_spawn[0].div_euclid(CHUNK_SIZE as i32),
                 world_spawn[2].div_euclid(CHUNK_SIZE as i32),
-                2,
             )
         } else {
             (
                 (player.x.floor() as i32).div_euclid(CHUNK_SIZE as i32),
                 (player.z.floor() as i32).div_euclid(CHUNK_SIZE as i32),
-                1,
             )
         };
-        let mut targets = Vec::new();
-        for cx in center_x - radius..=center_x + radius {
-            for cz in center_z - radius..=center_z + radius {
-                targets.push((cx, cz));
-            }
-        }
+        // 26.2 closes the client loading screen when the player's render
+        // section is compiled and visible, not after every nearby chunk has a
+        // GPU mesh. Neighbor columns remain streaming dependencies below.
+        let targets = vec![(center_x, center_z)];
         let stages = targets
             .iter()
             .copied()
@@ -310,6 +375,14 @@ impl LocalLoadPlan {
         }
         if progressed {
             self.last_progress = now;
+            let mut stage_counts = [0usize; 6];
+            for stage in self.stages.values() {
+                stage_counts[*stage as usize] += 1;
+            }
+            log::debug!(
+                "local terrain load progress: missing/requested/generated/lit/cpu/uploaded={stage_counts:?}; chunk manager={:?}",
+                chunk_manager.stats()
+            );
         }
     }
 
@@ -360,23 +433,19 @@ mod local_load_plan_tests {
     use super::*;
 
     #[test]
-    fn existing_player_load_targets_a_three_by_three_centered_on_player() {
+    fn existing_player_load_accepts_the_player_chunk() {
         let player = Player::new(-17.0, 70.0, 33.0);
         let plan = LocalLoadPlan::new(&player, [0, 75, 0], false, std::time::Instant::now());
 
-        assert_eq!(plan.targets.len(), 9);
-        let targets: HashSet<_> = plan.targets.iter().copied().collect();
-        assert_eq!(targets, HashSet::from_iter((-3..=-1).flat_map(|cx| (1..=3).map(move |cz| (cx, cz)))));
+        assert_eq!(plan.targets, vec![(-2, 2)]);
     }
 
     #[test]
-    fn fresh_player_load_targets_a_five_by_five_around_world_spawn() {
+    fn fresh_player_load_accepts_the_suggested_spawn_chunk() {
         let player = Player::new(500.0, 70.0, 500.0);
         let plan = LocalLoadPlan::new(&player, [-17, 75, 33], true, std::time::Instant::now());
 
-        assert_eq!(plan.targets.len(), 25);
-        let targets: HashSet<_> = plan.targets.iter().copied().collect();
-        assert_eq!(targets, HashSet::from_iter((-4..=0).flat_map(|cx| (0..=4).map(move |cz| (cx, cz)))));
+        assert_eq!(plan.targets, vec![(-2, 2)]);
     }
 
     #[test]
@@ -386,9 +455,7 @@ mod local_load_plan_tests {
         plan.stages.insert((0, 0), LocalLoadStage::Uploaded);
         plan.reset_for_fresh_spawn(&player, [80, 90, -48], std::time::Instant::now());
 
-        assert_eq!(plan.targets.len(), 25);
-        assert!(plan.targets.contains(&(5, -3)));
-        assert!(plan.targets.contains(&(3, -5)));
+        assert_eq!(plan.targets, vec![(5, -3)]);
         assert!(plan.stages.values().all(|stage| *stage == LocalLoadStage::Missing));
         assert_eq!(plan.last_progress, plan.started);
     }
@@ -399,7 +466,7 @@ mod local_load_plan_tests {
         assert_eq!(search.current(), Some((0, 0)));
         assert_eq!(search.required_chunks()[0], (0, 0));
         search.reject_current();
-        assert_eq!(search.current(), Some((-1, -1)));
+        assert_eq!(search.current(), Some((1, 0)));
         search.select([-1, 80, -1]);
         assert_eq!(search.current(), None);
         assert_eq!(search.state, SpawnSearchState::Selected([-1, 80, -1]));
@@ -525,7 +592,10 @@ fn ui_slot(
     block_sprites: &HashMap<BlockId, String>,
     selected: bool,
 ) -> UiSlot {
-    let block = items.block_from_item(stack.id);
+    let block = (!stack.is_empty())
+        .then(|| items.block_from_item(stack.id))
+        .flatten()
+        .filter(|block| *block != BlockId::Air);
     let display_name = if stack.is_empty() {
         String::new()
     } else if let Some(block) = block {
@@ -544,7 +614,7 @@ fn ui_slot(
             .map(|stem| format!("item/{stem}"))
             .unwrap_or_else(|| "_missing".to_string())
     };
-    let block_tiles = items.block_from_item(stack.id).map(|block| {
+    let block_tiles = block.map(|block| {
         use world::block::BlockFace;
         [
             world::mesh::get_face_tile(block, BlockFace::Top),
@@ -1069,6 +1139,16 @@ async fn run(config: AppConfig) {
         log::error!("failed to create world directory {}: {error}", config.world_dir.display());
         return;
     }
+    let asset_directory = match resolve_minecraft_asset_directory() {
+        Ok(path) => path,
+        Err(error) => {
+            log::error!("{error}");
+            return;
+        }
+    };
+    log::info!("using Minecraft assets from {}", asset_directory.display());
+    let asset_reader = vibecraft::assets::reader::AssetReader::new(asset_directory);
+
     let mut render_distance = config.render_distance;
     let event_loop = match EventLoop::new() {
         Ok(event_loop) => event_loop,
@@ -1089,19 +1169,6 @@ async fn run(config: AppConfig) {
 
     let window = window_state.window.clone();
 
-    let asset_reader = if let Ok(path) = std::env::var("VIBECRAFT_ASSETS") {
-        let minecraft_assets = std::path::Path::new(&path).join("assets/minecraft");
-        if !minecraft_assets.is_dir() {
-            log::error!(
-                "asset root {} does not contain assets/minecraft; set VIBECRAFT_ASSETS to a valid 1.21.1 asset checkout",
-                path
-            );
-            return;
-        }
-        vibecraft::assets::reader::AssetReader::new(minecraft_assets)
-    } else {
-        vibecraft::assets::reader::AssetReader::new(std::path::PathBuf::from("/tmp/opencode/minecraft-assets").join("assets/minecraft"))
-    };
     let inventory_block_sprite_map = inventory_block_sprites(&asset_reader);
     let mut renderer = match Renderer::new(window.clone(), &asset_reader).await {
         Ok(renderer) => renderer,
@@ -1185,6 +1252,9 @@ async fn run(config: AppConfig) {
             log::error!("failed to load player save: {error}");
             return;
         }
+    }
+    if new_player {
+        prepare_new_player_spawn(seed, level.generation_profile, &mut world_spawn, &mut player);
     }
     let mut camera = Camera::new(
         player.eye_position(),
@@ -1301,7 +1371,7 @@ async fn run(config: AppConfig) {
         std::time::Instant::now(),
     );
     let mut spawn_search = new_player.then(|| {
-        SpawnSearch::new(world_spawn[0], world_spawn[2], SAFE_SPAWN_SEARCH_RADIUS)
+        SpawnSearch::new(world_spawn[0], world_spawn[2], SAFE_SPAWN_SEARCH_RADIUS_CHUNKS)
     });
     let mut simulation_clock = world::simulation::FixedStepClock::new();
     let mut right_was_pressed = false;
@@ -1375,7 +1445,7 @@ async fn run(config: AppConfig) {
                                 &storage, seed, &mut chunk_manager, &player, &inventory,
                                 game_mode, difficulty, hardcore, game_time, simulation_tick,
                                 world_spawn, do_daylight_cycle, keep_inventory, experience,
-                                &tick_scheduler, &dropped_items, &xp_orbs, !new_player,
+                                &tick_scheduler, &dropped_items, &xp_orbs, !new_player, true,
                             );
                         }
                         if let Some(transport) = client_transport.as_mut() {
@@ -1410,7 +1480,7 @@ async fn run(config: AppConfig) {
                                                             &storage, seed, &mut chunk_manager, &player, &inventory,
                                                             game_mode, difficulty, hardcore, game_time, simulation_tick,
                                                             world_spawn, do_daylight_cycle, keep_inventory, experience, &tick_scheduler,
-                                                             &dropped_items, &xp_orbs, !new_player,
+                                                             &dropped_items, &xp_orbs, !new_player, true,
                                                         );
                                                         last_save = std::time::Instant::now();
                                                         save_requested = false;
@@ -1620,7 +1690,7 @@ async fn run(config: AppConfig) {
                                                      &storage, seed, &mut chunk_manager, &player, &inventory,
                                                      game_mode, difficulty, hardcore, game_time, simulation_tick,
                                                      world_spawn, do_daylight_cycle, keep_inventory, experience,
-                                                      &tick_scheduler, &dropped_items, &xp_orbs, !new_player,
+                                                      &tick_scheduler, &dropped_items, &xp_orbs, !new_player, true,
                                                  );
                                              }
                                              if let Some(transport) = client_transport.as_mut() {
@@ -1664,7 +1734,7 @@ async fn run(config: AppConfig) {
                                              if action == UiAction::RetryLoading {
                                                  chunk_manager.retry_failed_chunks();
                                                  spawn_search = new_player.then(|| SpawnSearch::new(
-                                                     world_spawn[0], world_spawn[2], SAFE_SPAWN_SEARCH_RADIUS,
+                                                     world_spawn[0], world_spawn[2], SAFE_SPAWN_SEARCH_RADIUS_CHUNKS,
                                                  ));
                                                  local_load_plan.retry(std::time::Instant::now());
                                                 ui_state.loading_error = None;
@@ -1747,7 +1817,7 @@ async fn run(config: AppConfig) {
                                                        &storage, seed, &mut chunk_manager, &player, &inventory,
                                                        game_mode, difficulty, hardcore, game_time, simulation_tick,
                                                        world_spawn, do_daylight_cycle, keep_inventory, experience,
-                                                        &tick_scheduler, &dropped_items, &xp_orbs, !new_player,
+                                                        &tick_scheduler, &dropped_items, &xp_orbs, !new_player, true,
                                                    );
                                                }
                                                if let Some(transport) = client_transport.as_mut() {
@@ -1766,7 +1836,7 @@ async fn run(config: AppConfig) {
                                                        &storage, seed, &mut chunk_manager, &player, &inventory,
                                                        game_mode, difficulty, hardcore, game_time, simulation_tick,
                                                        world_spawn, do_daylight_cycle, keep_inventory, experience,
-                                                        &tick_scheduler, &dropped_items, &xp_orbs, !new_player,
+                                                        &tick_scheduler, &dropped_items, &xp_orbs, !new_player, true,
                                                    );
                                                }
                                                if let Some(transport) = client_transport.as_mut() {
@@ -1929,7 +1999,7 @@ async fn run(config: AppConfig) {
                                    if action == UiAction::RetryLoading {
                                        chunk_manager.retry_failed_chunks();
                                       spawn_search = new_player.then(|| SpawnSearch::new(
-                                          world_spawn[0], world_spawn[2], SAFE_SPAWN_SEARCH_RADIUS,
+                                          world_spawn[0], world_spawn[2], SAFE_SPAWN_SEARCH_RADIUS_CHUNKS,
                                       ));
                                       local_load_plan.retry(std::time::Instant::now());
                                       ui_state.loading_error = None;
@@ -2006,7 +2076,7 @@ async fn run(config: AppConfig) {
                                             &storage, seed, &mut chunk_manager, &player, &inventory,
                                             game_mode, difficulty, hardcore, game_time, simulation_tick,
                                             world_spawn, do_daylight_cycle, keep_inventory, experience,
-                                             &tick_scheduler, &dropped_items, &xp_orbs, !new_player,
+                                             &tick_scheduler, &dropped_items, &xp_orbs, !new_player, true,
                                         );
                                     }
                                     if let Some(transport) = client_transport.as_mut() {
@@ -2020,7 +2090,7 @@ async fn run(config: AppConfig) {
                                             &storage, seed, &mut chunk_manager, &player, &inventory,
                                             game_mode, difficulty, hardcore, game_time, simulation_tick,
                                             world_spawn, do_daylight_cycle, keep_inventory, experience,
-                                             &tick_scheduler, &dropped_items, &xp_orbs, !new_player,
+                                             &tick_scheduler, &dropped_items, &xp_orbs, !new_player, true,
                                         );
                                     }
                                     if let Some(transport) = client_transport.as_mut() {
@@ -2194,7 +2264,7 @@ async fn run(config: AppConfig) {
                         &storage, seed, &mut chunk_manager, &player, &inventory,
                         game_mode, difficulty, hardcore, game_time, simulation_tick,
                         world_spawn, do_daylight_cycle, keep_inventory, experience,
-                        &tick_scheduler, &dropped_items, &xp_orbs, !new_player,
+                        &tick_scheduler, &dropped_items, &xp_orbs, !new_player, true,
                     ) {
                         command_feedback = "World save failed; current world remains loaded.".to_string();
                         command_feedback_timer = 5.0;
@@ -2248,7 +2318,7 @@ async fn run(config: AppConfig) {
                                     command_feedback_timer = 5.0;
                                     return;
                                 }
-                                let (next_player, next_inventory, is_new_player) = match next_storage.load_player() {
+                                let (mut next_player, next_inventory, is_new_player) = match next_storage.load_player() {
                                     Ok(data) => match data.into_runtime() {
                                         Ok((player, inventory)) => (player, inventory, false),
                                         Err(error) => {
@@ -2290,6 +2360,14 @@ async fn run(config: AppConfig) {
                                 do_daylight_cycle = next_level.do_daylight_cycle;
                                 keep_inventory = next_level.keep_inventory;
                                 world_spawn = next_level.spawn;
+                                if is_new_player {
+                                    prepare_new_player_spawn(
+                                        seed,
+                                        next_level.generation_profile,
+                                        &mut world_spawn,
+                                        &mut next_player,
+                                    );
+                                }
                                 flying = game_mode.can_fly();
                                 player = next_player;
                                 inventory = next_inventory;
@@ -2344,7 +2422,7 @@ async fn run(config: AppConfig) {
                                     now,
                                 );
                                 spawn_search = is_new_player.then(|| {
-                                    SpawnSearch::new(world_spawn[0], world_spawn[2], SAFE_SPAWN_SEARCH_RADIUS)
+                                    SpawnSearch::new(world_spawn[0], world_spawn[2], SAFE_SPAWN_SEARCH_RADIUS_CHUNKS)
                                 });
                                 last_save = now;
                                 ui_state.screen = ui::UiScreen::Loading;
@@ -2383,7 +2461,7 @@ async fn run(config: AppConfig) {
                                         &storage, seed, &mut chunk_manager, &player, &inventory,
                                         game_mode, difficulty, hardcore, game_time, simulation_tick,
                                         world_spawn, do_daylight_cycle, keep_inventory, experience,
-                                        &tick_scheduler, &dropped_items, &xp_orbs, !new_player,
+                                        &tick_scheduler, &dropped_items, &xp_orbs, !new_player, true,
                                     );
                                 }
                                 if let Some(previous) = client_transport.as_mut() {
@@ -2726,25 +2804,31 @@ async fn run(config: AppConfig) {
                 if ui_state.screen == ui::UiScreen::Loading && !network_mode {
                     let pcx = (camera.position.x.floor() as i32).div_euclid(CHUNK_SIZE as i32);
                     let pcz = (camera.position.z.floor() as i32).div_euclid(CHUNK_SIZE as i32);
-                    let required_chunks = spawn_search
+                    let mut required_chunks = local_load_plan.targets.clone();
+                    required_chunks.extend(spawn_search
                         .as_ref()
-                        .map_or_else(Vec::new, SpawnSearch::required_chunks);
-                    chunk_manager.update_chunks_async_for_centers_and_required_chunks(
-                        &[(pcx, pcz)],
-                        &required_chunks,
-                    );
+                        .map_or_else(Vec::new, SpawnSearch::required_chunks));
+                    required_chunks.sort_unstable();
+                    required_chunks.dedup();
+                    let mut loading_chunks = required_chunks.clone();
+                    for &(cx, cz) in &required_chunks {
+                        for dx in -1..=1 {
+                            for dz in -1..=1 {
+                                loading_chunks.push((cx + dx, cz + dz));
+                            }
+                        }
+                    }
+                    loading_chunks.sort_unstable();
+                    loading_chunks.dedup();
+                    chunk_manager.update_required_chunks_async((pcx, pcz), &loading_chunks);
                     chunk_manager.process_loaded_chunks();
                     if new_player {
                         let mut selected_spawn = None;
                         let mut failed_chunk = None;
                         let search = spawn_search.get_or_insert_with(|| {
-                            SpawnSearch::new(world_spawn[0], world_spawn[2], SAFE_SPAWN_SEARCH_RADIUS)
+                            SpawnSearch::new(world_spawn[0], world_spawn[2], SAFE_SPAWN_SEARCH_RADIUS_CHUNKS)
                         });
-                        while let Some((x, z)) = search.current() {
-                            let (cx, cz) = (
-                                x.div_euclid(CHUNK_SIZE as i32),
-                                z.div_euclid(CHUNK_SIZE as i32),
-                            );
+                        while let Some((cx, cz)) = search.current() {
                             if chunk_manager.is_chunk_failed(cx, cz) {
                                 failed_chunk = Some((cx, cz));
                                 break;
@@ -2752,12 +2836,25 @@ async fn run(config: AppConfig) {
                             if chunk_manager.get_chunk(cx, cz).is_none() {
                                 break;
                             }
-                            if let Some(spawn) = chunk_manager.find_safe_spawn(x, z, 0) {
+                            if let Some(spawn) = chunk_manager.find_safe_spawn_in_chunk(cx, cz) {
                                 search.select(spawn);
                                 selected_spawn = Some(spawn);
                                 break;
                             }
                             search.reject_current();
+                        }
+
+                        if selected_spawn.is_none()
+                            && search.state == SpawnSearchState::Exhausted
+                        {
+                            selected_spawn = chunk_manager
+                                .find_spawn_fallback(world_spawn[0], world_spawn[2]);
+                            if let Some(spawn) = selected_spawn {
+                                search.select(spawn);
+                                log::warn!(
+                                    "no safe column in the 26.2 11x11 initial-spawn search; using the preliminary surface spawn"
+                                );
+                            }
                         }
 
                         if let Some(spawn) = selected_spawn {
@@ -2766,7 +2863,7 @@ async fn run(config: AppConfig) {
                                 &storage, seed, &mut chunk_manager, &selected_player, &inventory,
                                 game_mode, difficulty, hardcore, game_time, simulation_tick,
                                 spawn, do_daylight_cycle, keep_inventory, experience,
-                                &tick_scheduler, &dropped_items, &xp_orbs, true,
+                                &tick_scheduler, &dropped_items, &xp_orbs, true, false,
                             ) {
                                 world_spawn = spawn;
                                 player = selected_player;
@@ -2788,7 +2885,7 @@ async fn run(config: AppConfig) {
                             ui_state.loading_error = Some(format!("Chunk ({cx}, {cz}) could not be loaded."));
                             ui_state.screen = ui::UiScreen::LoadFailed;
                         } else if spawn_search.as_ref().is_some_and(|search| search.state == SpawnSearchState::Exhausted) {
-                            ui_state.loading_error = Some("No dry, unobstructed surface was found in the search area.".to_string());
+                            ui_state.loading_error = Some("The preliminary spawn chunk has no usable surface.".to_string());
                             ui_state.screen = ui::UiScreen::LoadFailed;
                         }
                     }
@@ -2811,6 +2908,16 @@ async fn run(config: AppConfig) {
                             now,
                             LOCAL_LOAD_STALL_TIMEOUT,
                         ) {
+                            let mut stage_counts = [0usize; 6];
+                            for stage in local_load_plan.stages.values() {
+                                stage_counts[*stage as usize] += 1;
+                            }
+                            log::warn!(
+                                "local terrain load failed: {failure:?}; stage counts \
+                                 missing/requested/generated/lit/cpu/uploaded={stage_counts:?}; \
+                                 chunk manager={:?}",
+                                chunk_manager.stats()
+                            );
                             ui_state.loading_error = Some(match failure {
                                 LocalLoadFailure::Chunk((cx, cz)) => {
                                     format!("Chunk ({cx}, {cz}) could not finish loading.")
@@ -2829,6 +2936,11 @@ async fn run(config: AppConfig) {
                         && now.duration_since(local_load_plan.started) >= MIN_LOCAL_LOAD_DISPLAY
                         && !new_player
                     {
+                        log::info!(
+                            "local terrain load complete: {} target chunks in {:.2}s",
+                            local_load_plan.targets.len(),
+                            now.duration_since(local_load_plan.started).as_secs_f32()
+                        );
                         break_target = None;
                         break_progress = 0.0;
                         right_was_pressed = false;
@@ -2924,7 +3036,7 @@ async fn run(config: AppConfig) {
                         } else if let Some(spawn) = chunk_manager.find_safe_spawn(
                             world_spawn[0],
                             world_spawn[2],
-                            SAFE_SPAWN_SEARCH_RADIUS,
+                            RESPAWN_SEARCH_RADIUS_BLOCKS,
                         ) {
                             if !keep_inventory {
                                 for stack in inventory.slots.clone() {
@@ -3711,16 +3823,23 @@ async fn run(config: AppConfig) {
                     border_needs_rebuild = false;
                 }
 
-                // Daylight cycle: game_time 0-1200 = 20 min day/night
-                let night_factor = if game_time < 300.0 {
-                    1.0 - game_time / 300.0
-                } else if game_time < 600.0 {
-                    0.0
-                } else if game_time < 900.0 {
-                    (game_time - 600.0) / 300.0
-                } else {
+                // Minecraft 26.2 Overworld SKY_LIGHT_FACTOR timeline. The
+                // stored clock is seconds, while the reference keyframes are
+                // ticks in a 24,000-tick day.
+                let day_tick = (game_time * 20.0).rem_euclid(24_000.0);
+                let sky_light_factor = if day_tick < 730.0 {
+                    let t = (day_tick + 1_140.0) / 1_870.0;
+                    0.24 + 0.76 * t
+                } else if day_tick <= 11_270.0 {
                     1.0
+                } else if day_tick < 13_140.0 {
+                    1.0 - 0.76 * ((day_tick - 11_270.0) / 1_870.0)
+                } else if day_tick <= 22_860.0 {
+                    0.24
+                } else {
+                    0.24 + 0.76 * ((day_tick - 22_860.0) / 1_870.0)
                 };
+                let night_factor = sky_light_factor;
 
                 // Dynamic light direction: sun arcs east→overhead→west during the day
                 // game_time 300 = dawn, 450 = noon, 600 = dusk
@@ -3746,8 +3865,9 @@ async fn run(config: AppConfig) {
                 ).id;
                 let underwater = eye_block == BlockId::Water;
                 let fog_params = if underwater {
-                    // Underwater: dense blue fog, very short range
-                    [1.0, 8.0, display_brightness, 1.0]
+                    // 26.2 defaults to -8..96 and ramps water vision over time.
+                    // Use half range until that player-side timer is modeled.
+                    [-8.0, 48.0, display_brightness, 1.0]
                 } else {
                     [view_distance * 0.72, view_distance, display_brightness, 0.0]
                 };
@@ -3962,6 +4082,7 @@ async fn run(config: AppConfig) {
                         &dropped_items,
                         &xp_orbs,
                         !new_player,
+                        false,
                     );
                     last_save = std::time::Instant::now();
                 }
@@ -3992,8 +4113,14 @@ fn save_world(
     dropped_items: &[DroppedItem],
     xp_orbs: &[XpOrb],
     persist_player: bool,
+    wait_for_chunks: bool,
 ) -> bool {
-    let chunks_saved = chunk_manager.flush_saved_chunks();
+    let chunks_saved = if wait_for_chunks {
+        chunk_manager.flush_saved_chunks()
+    } else {
+        chunk_manager.queue_saved_chunks();
+        true
+    };
     let prior_level = storage.load_level().ok();
     let level_saved = storage.save_level(&LevelData {
         name: prior_level

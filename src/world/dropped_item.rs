@@ -55,7 +55,14 @@ impl DroppedItem {
     }
 
     pub fn from_stack(x: f32, y: f32, z: f32, stack: ItemStack, items: &ItemRegistry) -> Option<Self> {
-        if stack.is_empty() {
+        if stack.is_empty() || !items.is_valid(stack.id) {
+            return None;
+        }
+        let definition = items.def(stack.id);
+        if stack.count > definition.max_stack as u16
+            || (definition.max_damage == 0 && stack.damage != 0)
+            || (definition.max_damage > 0 && stack.damage >= definition.max_damage)
+        {
             return None;
         }
         let block_id = items.block_from_item(stack.id).unwrap_or(BlockId::Stone);
@@ -320,6 +327,28 @@ mod tests {
         let stack = ItemStack::new(registry.item_id_from_block(BlockId::Stone), 1);
         let dropped = DroppedItem::from_stack(0.0, 64.0, 0.0, stack, &registry).unwrap();
         assert_eq!(dropped.block_id, BlockId::Stone);
+    }
+
+    #[test]
+    fn dropped_items_reject_noncanonical_runtime_stacks() {
+        let registry = ItemRegistry::new();
+        let stone = registry.item_id_from_block(BlockId::Stone);
+        assert!(DroppedItem::from_stack(
+            0.0,
+            64.0,
+            0.0,
+            ItemStack::new(stone, registry.def(stone).max_stack as u16 + 1),
+            &registry,
+        )
+        .is_none());
+        assert!(DroppedItem::from_stack(
+            0.0,
+            64.0,
+            0.0,
+            ItemStack::with_damage(stone, 1, 1),
+            &registry,
+        )
+        .is_none());
     }
 
     #[test]

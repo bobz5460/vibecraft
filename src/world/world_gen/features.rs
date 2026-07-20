@@ -142,7 +142,8 @@ fn root_coverage_disposition(key: &str) -> RootCoverageDisposition {
         "patch_bush" | "patch_sunflower" | "patch_dry_grass_desert" | "patch_dry_grass_badlands"
         | "patch_firefly_bush_near_water" | "patch_firefly_bush_swamp"
         | "patch_firefly_bush_near_water_swamp" | "patch_leaf_litter"
-        | "wildflowers_birch_forest" | "wildflowers_meadow" => {
+        | "wildflowers_birch_forest" | "wildflowers_meadow" | "flower_cherry"
+        | "flower_forest_flowers" | "forest_flowers" => {
             Blocked("the configured output block or required state is unavailable")
         }
         "glow_lichen" => Approx(
@@ -211,6 +212,8 @@ impl WorldPos {
 enum Replacement {
     Air,
     Water,
+    LakeAir,
+    LakeFluid,
     BaseStone,
     Ore {
         stone: BlockId,
@@ -219,8 +222,10 @@ enum Replacement {
     },
     Disk,
     UnderwaterDisk,
-    UnderwaterFloor,
+    UnderwaterMagma,
     PlantOnGrass,
+    PlantOnDirt,
+    Mushroom,
     Cactus,
     SugarCane,
     Spring { frozen: bool },
@@ -247,6 +252,7 @@ struct FeatureStage<'a> {
     writes: Vec<ProjectedWrite>,
     next_order: u32,
     surface_cache: HashMap<(i32, i32), i32>,
+    target_ocean_floor: [i32; CHUNK_SIZE * CHUNK_SIZE],
 }
 
 impl<'a> FeatureStage<'a> {
@@ -257,6 +263,18 @@ impl<'a> FeatureStage<'a> {
         height: i32,
         chunk: &Chunk,
     ) -> Self {
+        let mut target_ocean_floor = [min_y; CHUNK_SIZE * CHUNK_SIZE];
+        for local_x in 0..CHUNK_SIZE {
+            for local_z in 0..CHUNK_SIZE {
+                if let Some(local_y) = (0..crate::world::chunk::CHUNK_HEIGHT).rev().find(|&local_y| {
+                    let block = chunk.get_block(local_x, local_y, local_z);
+                    !block.is_air() && !matches!(block.id, BlockId::Water | BlockId::Lava)
+                }) {
+                    target_ocean_floor[local_x * CHUNK_SIZE + local_z] =
+                        min_y + local_y as i32;
+                }
+            }
+        }
         Self {
             generator,
             world_seed,
@@ -267,6 +285,7 @@ impl<'a> FeatureStage<'a> {
             writes: Vec::new(),
             next_order: 0,
             surface_cache: HashMap::new(),
+            target_ocean_floor,
         }
     }
 
@@ -308,6 +327,13 @@ impl<'a> FeatureStage<'a> {
     }
 
     fn surface_y(&mut self, x: i32, z: i32) -> i32 {
+        if x.div_euclid(CHUNK_SIZE as i32) == self.target_x
+            && z.div_euclid(CHUNK_SIZE as i32) == self.target_z
+        {
+            let local_x = x.rem_euclid(CHUNK_SIZE as i32) as usize;
+            let local_z = z.rem_euclid(CHUNK_SIZE as i32) as usize;
+            return self.target_ocean_floor[local_x * CHUNK_SIZE + local_z];
+        }
         if let Some(height) = self.surface_cache.get(&(x, z)) {
             return *height;
         }
@@ -881,7 +907,7 @@ fn plan_lake(
                     stage.push(
                         WorldPos::new(x + dx, y + dy, z + dz),
                         if dy <= 0 { BlockId::Lava } else { BlockId::Air },
-                        Replacement::Natural,
+                        if dy <= 0 { Replacement::LakeFluid } else { Replacement::LakeAir },
                     );
                 }
             }
@@ -1130,15 +1156,28 @@ fn plan_underwater_magma(
         if !claim_candidate(candidates) { return; }
         let x = owner_x * CHUNK_SIZE as i32 + random.next_int(CHUNK_SIZE as i32);
         let z = owner_z * CHUNK_SIZE as i32 + random.next_int(CHUNK_SIZE as i32);
+        // 26.2 placement order is in_square followed by a uniform height from
+        // the world bottom through absolute Y=256. Only attempts whose scan
+        // origin lies within five blocks below the ocean floor can succeed.
+        let attempt_y = stage.min_y + random.next_int(256 - stage.min_y + 1);
         if !stage.intersects_target(x, z, 1) { continue; }
         let floor = stage.surface_y(x, z);
-        let pos = WorldPos::new(x, floor, z);
-        if !root_applies_at(stage, root, pos) || floor > 61 { continue; }
-        for dx in -1..=1 { for dz in -1..=1 {
+        let pos = WorldPos::new(x, attempt_y, z);
+        if !root_applies_at(stage, root, pos)
+            || attempt_y > floor - 2
+            || attempt_y < floor - 5
+        {
+            continue;
+        }
+        for dx in -1..=1 { for dy in -1..=1 { for dz in -1..=1 {
             if random.next_float() < 0.5 {
-                stage.push(WorldPos::new(x + dx, floor, z + dz), BlockId::MagmaBlock, Replacement::UnderwaterFloor);
+                stage.push(
+                    WorldPos::new(x + dx, floor + dy, z + dz),
+                    BlockId::MagmaBlock,
+                    Replacement::UnderwaterMagma,
+                );
             }
-        }}
+        }}}
     }
 }
 
@@ -1267,15 +1306,24 @@ fn plan_tree_root(
 ) {
     let mut random = stage.feature_rng(owner_x, owner_z, root.step as i32, index);
     let (count, primary) = match root.key {
-        "trees_birch" | "birch_tall" => (10, TreeKind::Birch),
-        "trees_snowy" | "trees_taiga" | "trees_grove" | "trees_old_growth_pine_taiga" | "trees_old_growth_spruce_taiga" => (10, TreeKind::Spruce),
-        "trees_jungle" => (50, TreeKind::Jungle),
-        "trees_sparse_jungle" => (2, TreeKind::Jungle),
-        "trees_savanna" | "trees_windswept_savanna" => (2, TreeKind::Acacia),
-        "trees_cherry" => (10, TreeKind::Cherry),
+        "trees_birch" | "birch_tall" => (count_extra(&mut random, 10), TreeKind::Birch),
+        "trees_taiga" | "trees_grove" | "trees_old_growth_pine_taiga"
+        | "trees_old_growth_spruce_taiga" => (count_extra(&mut random, 10), TreeKind::Spruce),
+        "trees_snowy" => (count_extra(&mut random, 0), TreeKind::Spruce),
+        "trees_jungle" => (count_extra(&mut random, 50), TreeKind::Jungle),
+        "trees_sparse_jungle" => (count_extra(&mut random, 2), TreeKind::Jungle),
+        "trees_savanna" => (count_extra(&mut random, 1), TreeKind::Acacia),
+        "trees_windswept_savanna" => (count_extra(&mut random, 2), TreeKind::Acacia),
+        "trees_cherry" => (count_extra(&mut random, 10), TreeKind::Cherry),
         "trees_mangrove" => (25, TreeKind::Mangrove),
-        "trees_badlands" => (5, TreeKind::Oak),
-        "trees_flower_forest" | "trees_birch_and_oak_leaf_litter" | "trees_windswept_forest" => (10, TreeKind::Birch),
+        "trees_badlands" => (count_extra(&mut random, 5), TreeKind::Oak),
+        "trees_flower_forest" => (count_extra(&mut random, 6), TreeKind::Birch),
+        "trees_birch_and_oak_leaf_litter" => (count_extra(&mut random, 10), TreeKind::Oak),
+        "trees_windswept_forest" => (count_extra(&mut random, 3), TreeKind::Birch),
+        "trees_windswept_hills" | "trees_water" => (count_extra(&mut random, 0), TreeKind::Oak),
+        "trees_plains" => ((random.next_int(20) == 0) as i32, TreeKind::Oak),
+        "trees_meadow" => ((random.next_int(100) == 0) as i32, TreeKind::Birch),
+        "trees_swamp" => (count_extra(&mut random, 2), TreeKind::Oak),
         _ => (1, TreeKind::Oak),
     };
     for _ in 0..count {
@@ -1286,15 +1334,33 @@ fn plan_tree_root(
         let y = stage.surface_y(x, z);
         let origin = WorldPos::new(x, y, z);
         if !root_applies_at(stage, root, origin) { continue; }
-        let kind = if root.key == "trees_plains" && random.next_int(3) != 0 { TreeKind::Oak }
-            else if root.key == "trees_birch_and_oak_leaf_litter" && random.next_boolean() { TreeKind::Oak }
-            else { primary };
-        if random.next_int(80) == 0 && matches!(kind, TreeKind::Oak | TreeKind::Birch | TreeKind::Spruce | TreeKind::Jungle) {
+        let (kind, fallen) = if root.key == "trees_birch_and_oak_leaf_litter" {
+            // Configured random_selector order is significant: each failed
+            // entry consumes its own float before the default oak is chosen.
+            if random.next_float() < 0.0025 {
+                (TreeKind::Birch, true)
+            } else if random.next_float() < 0.2 {
+                (TreeKind::Birch, false)
+            } else if random.next_float() < 0.1 {
+                (TreeKind::Oak, false)
+            } else if random.next_float() < 0.0125 {
+                (TreeKind::Oak, true)
+            } else {
+                (TreeKind::Oak, false)
+            }
+        } else {
+            (primary, false)
+        };
+        if fallen {
             emit_fallen_tree(stage, origin, kind, &mut random);
         } else {
             emit_tree(stage, origin, kind, &mut random);
         }
     }
+}
+
+fn count_extra(random: &mut NoiseSeed, base: i32) -> i32 {
+    base + (random.next_int(10) == 0) as i32
 }
 
 fn emit_fallen_tree(stage: &mut FeatureStage<'_>, origin: WorldPos, kind: TreeKind, random: &mut NoiseSeed) {
@@ -1400,6 +1466,14 @@ fn plan_patch(
     index: i32, candidates: &mut usize,
 ) {
     let mut random = stage.feature_rng(owner_x, owner_z, root.step as i32, index);
+    if root.key.starts_with("flower_") || root.key == "forest_flowers" {
+        plan_flower_patch(stage, owner_x, owner_z, root, &mut random, candidates);
+        return;
+    }
+    if is_clustered_ground_patch(root.key) {
+        plan_clustered_ground_patch(stage, owner_x, owner_z, root, &mut random, candidates);
+        return;
+    }
     let (chance, count, block) = match root.key {
         "patch_pumpkin" => (300, 96, BlockId::Pumpkin),
         "patch_melon" => (6, 64, BlockId::Melon),
@@ -1415,7 +1489,6 @@ fn plan_patch(
         "patch_berry_common" | "patch_berry_rare" => (if root.key.ends_with("rare") { 24 } else { 12 }, 64, BlockId::SweetBerryBush),
         key if key.starts_with("brown_mushroom_") => (8, 64, BlockId::BrownMushroom),
         key if key.starts_with("red_mushroom_") => (8, 64, BlockId::RedMushroom),
-        key if key.starts_with("flower_") || key == "forest_flowers" => (1, 32, BlockId::Dandelion),
         key if key.starts_with("patch_dead_bush") => (1, 32, BlockId::DeadBush),
         "bamboo" => (1, 80, BlockId::Bamboo),
         "bamboo_light" => (4, 32, BlockId::Bamboo),
@@ -1458,6 +1531,218 @@ fn plan_patch(
     }
 }
 
+fn is_clustered_ground_patch(key: &str) -> bool {
+    matches!(
+        key,
+        "patch_grass_plain"
+            | "patch_grass_meadow"
+            | "patch_grass_forest"
+            | "patch_grass_badlands"
+            | "patch_grass_savanna"
+            | "patch_grass_normal"
+            | "patch_grass_taiga_2"
+            | "patch_grass_taiga"
+            | "patch_grass_jungle"
+            | "patch_tall_grass_2"
+            | "patch_tall_grass"
+            | "patch_large_fern"
+            | "brown_mushroom_normal"
+            | "red_mushroom_normal"
+            | "brown_mushroom_taiga"
+            | "red_mushroom_taiga"
+            | "brown_mushroom_old_growth"
+            | "red_mushroom_old_growth"
+            | "brown_mushroom_swamp"
+            | "red_mushroom_swamp"
+    )
+}
+
+fn noise_threshold_count(owner_x: i32, owner_z: i32, below: i32, above: i32) -> i32 {
+    let x = owner_x.wrapping_mul(CHUNK_SIZE as i32);
+    let z = owner_z.wrapping_mul(CHUNK_SIZE as i32);
+    if crate::world::world_gen::surface::biome_info_noise(x, z) < -0.8 {
+        below
+    } else {
+        above
+    }
+}
+
+fn plan_clustered_ground_patch(
+    stage: &mut FeatureStage<'_>,
+    owner_x: i32,
+    owner_z: i32,
+    root: RootDefinition,
+    random: &mut NoiseSeed,
+    candidates: &mut usize,
+) {
+    // Keep Java's modifier pipeline intact: the first count/rarity modifiers
+    // choose patch origins, then the configured patch makes clustered
+    // triangular offsets around each origin. Sampling a fresh surface height
+    // for every inner attempt turns almost every try into a success and was
+    // the source of Vibecraft's uniformly carpeted terrain.
+    let (outer_count, rarity, tries, block, replacement) = match root.key {
+        "patch_grass_plain" => (
+            noise_threshold_count(owner_x, owner_z, 5, 10), 1, 32,
+            BlockId::Grass, Replacement::PlantOnDirt,
+        ),
+        "patch_grass_meadow" => (
+            noise_threshold_count(owner_x, owner_z, 5, 10), 1, 16,
+            BlockId::Grass, Replacement::PlantOnDirt,
+        ),
+        "patch_grass_forest" => (2, 1, 32, BlockId::Grass, Replacement::PlantOnDirt),
+        "patch_grass_badlands" | "patch_grass_taiga_2" => {
+            (1, 1, 32, BlockId::Grass, Replacement::PlantOnDirt)
+        }
+        "patch_grass_savanna" => (20, 1, 32, BlockId::Grass, Replacement::PlantOnDirt),
+        "patch_grass_normal" => (5, 1, 32, BlockId::Grass, Replacement::PlantOnDirt),
+        "patch_grass_taiga" => (7, 1, 32, BlockId::Fern, Replacement::PlantOnDirt),
+        "patch_grass_jungle" => (25, 1, 32, BlockId::Grass, Replacement::PlantOnDirt),
+        "patch_tall_grass_2" => (
+            noise_threshold_count(owner_x, owner_z, 0, 7), 32, 96,
+            BlockId::Grass, Replacement::PlantOnDirt,
+        ),
+        "patch_tall_grass" => (1, 5, 96, BlockId::Grass, Replacement::PlantOnDirt),
+        "patch_large_fern" => (1, 5, 96, BlockId::Fern, Replacement::PlantOnDirt),
+        "brown_mushroom_normal" => (1, 256, 96, BlockId::BrownMushroom, Replacement::Mushroom),
+        "red_mushroom_normal" => (1, 512, 96, BlockId::RedMushroom, Replacement::Mushroom),
+        "brown_mushroom_taiga" => (1, 4, 96, BlockId::BrownMushroom, Replacement::Mushroom),
+        "red_mushroom_taiga" => (1, 256, 96, BlockId::RedMushroom, Replacement::Mushroom),
+        "brown_mushroom_old_growth" => (3, 4, 96, BlockId::BrownMushroom, Replacement::Mushroom),
+        "red_mushroom_old_growth" => (1, 171, 96, BlockId::RedMushroom, Replacement::Mushroom),
+        "brown_mushroom_swamp" => (2, 1, 96, BlockId::BrownMushroom, Replacement::Mushroom),
+        "red_mushroom_swamp" => (1, 64, 96, BlockId::RedMushroom, Replacement::Mushroom),
+        _ => return,
+    };
+
+    for _ in 0..outer_count {
+        // RarityFilter follows the initial CountPlacement in these 26.2
+        // registrations, so each prospective origin receives its own roll.
+        if rarity > 1 && random.next_int(rarity) != 0 {
+            continue;
+        }
+        let origin_x = owner_x * CHUNK_SIZE as i32 + random.next_int(CHUNK_SIZE as i32);
+        let origin_z = owner_z * CHUNK_SIZE as i32 + random.next_int(CHUNK_SIZE as i32);
+        let origin_y = stage.surface_y(origin_x, origin_z) + 1;
+        if !root_applies_at(stage, root, WorldPos::new(origin_x, origin_y, origin_z)) {
+            continue;
+        }
+        for _ in 0..tries {
+            if !claim_candidate(candidates) {
+                return;
+            }
+            let x = origin_x + trapezoid_offset(random, 7);
+            let y = origin_y + trapezoid_offset(random, 3);
+            let z = origin_z + trapezoid_offset(random, 7);
+            if stage.intersects_target(x, z, 0) {
+                stage.push(WorldPos::new(x, y, z), block, replacement);
+            }
+        }
+    }
+}
+
+fn plan_flower_patch(
+    stage: &mut FeatureStage<'_>,
+    owner_x: i32,
+    owner_z: i32,
+    root: RootDefinition,
+    random: &mut NoiseSeed,
+    candidates: &mut usize,
+) {
+    // These are the outer placed-feature modifiers followed by the configured
+    // random-patch attempt count. Keeping the two levels separate matters:
+    // ordinary flowers are rare clustered patches, not dozens of independent
+    // guaranteed plants spread uniformly through every chunk.
+    let (outer_count, rarity, tries, xz_spread, y_spread) = match root.key {
+        "flower_default" | "flower_swamp" => (1, 32, 64, 7, 3),
+        "flower_warm" => (1, 16, 64, 7, 3),
+        "flower_plains" => (
+            noise_threshold_count(owner_x, owner_z, 15, 4), 32, 64, 6, 2,
+        ),
+        "flower_flower_forest" => (3, 2, 96, 6, 2),
+        "flower_meadow" | "flower_cherry" => (1, 1, 96, 6, 2),
+        _ => (1, 32, 64, 7, 3),
+    };
+    for _ in 0..outer_count {
+        if rarity > 1 && random.next_int(rarity) != 0 {
+            continue;
+        }
+        let origin_x = owner_x * CHUNK_SIZE as i32 + random.next_int(CHUNK_SIZE as i32);
+        let origin_z = owner_z * CHUNK_SIZE as i32 + random.next_int(CHUNK_SIZE as i32);
+        let origin_y = stage.surface_y(origin_x, origin_z) + 1;
+        if !root_applies_at(stage, root, WorldPos::new(origin_x, origin_y, origin_z)) {
+            continue;
+        }
+        for _ in 0..tries {
+            if !claim_candidate(candidates) {
+                return;
+            }
+            let x = origin_x + trapezoid_offset(random, xz_spread);
+            let y = origin_y + trapezoid_offset(random, y_spread);
+            let z = origin_z + trapezoid_offset(random, xz_spread);
+            if !stage.intersects_target(x, z, 0) {
+                continue;
+            }
+            let pos = WorldPos::new(x, y, z);
+            if root_applies_at(stage, root, pos) {
+                stage.push(pos, flower_block(root.key, random), Replacement::PlantOnDirt);
+            }
+        }
+    }
+}
+
+fn trapezoid_offset(random: &mut NoiseSeed, spread: i32) -> i32 {
+    if spread == 0 {
+        0
+    } else {
+        random.next_int(spread + 1) + random.next_int(spread + 1) - spread
+    }
+}
+
+fn flower_block(key: &str, random: &mut NoiseSeed) -> BlockId {
+    // configured_feature/flower_default uses weights poppy=2, dandelion=1.
+    const DEFAULT: [BlockId; 3] = [
+        BlockId::Poppy,
+        BlockId::Poppy,
+        BlockId::Dandelion,
+    ];
+    const FOREST: [BlockId; 11] = [
+        BlockId::Dandelion,
+        BlockId::Poppy,
+        BlockId::Allium,
+        BlockId::AzureBluet,
+        BlockId::RedTulip,
+        BlockId::OrangeTulip,
+        BlockId::WhiteTulip,
+        BlockId::PinkTulip,
+        BlockId::OxeyeDaisy,
+        BlockId::Cornflower,
+        BlockId::LilyOfTheValley,
+    ];
+    const SWAMP: [BlockId; 1] = [BlockId::BlueOrchid];
+    // DualNoiseProvider changes spatial grouping, but its 26.2 state list is
+    // exact and contains two grass entries plus these six flowers.
+    const MEADOW: [BlockId; 8] = [
+        BlockId::Grass,
+        BlockId::Allium,
+        BlockId::Poppy,
+        BlockId::AzureBluet,
+        BlockId::Dandelion,
+        BlockId::Cornflower,
+        BlockId::OxeyeDaisy,
+        BlockId::Grass,
+    ];
+    let choices: &[BlockId] = if key == "flower_swamp" {
+        &SWAMP
+    } else if key == "flower_meadow" {
+        &MEADOW
+    } else if matches!(key, "flower_flower_forest" | "flower_forest_flowers" | "forest_flowers") {
+        &FOREST
+    } else {
+        &DEFAULT
+    };
+    choices[random.next_int(choices.len() as i32) as usize]
+}
+
 fn plan_freeze_root(stage: &mut FeatureStage<'_>, owner_x: i32, owner_z: i32, root: RootDefinition) {
     if (owner_x, owner_z) != (stage.target_x, stage.target_z) { return; }
     let base_x = owner_x * CHUNK_SIZE as i32;
@@ -1485,6 +1770,16 @@ fn replacement_matches(
     match replacement {
         Replacement::Air => current == BlockId::Air,
         Replacement::Water => current == BlockId::Water,
+        // Java LakeFeature rejects a candidate when the upper cavity boundary
+        // intersects liquid and requires a solid lower boundary. Preserve
+        // those safety properties even though this geometry path uses a
+        // simpler ellipsoid than Java's full boolean mask.
+        Replacement::LakeAir => current == BlockId::Air,
+        Replacement::LakeFluid => {
+            is_solid_natural(current)
+                && (y + 1..=(y + 5).min(CHUNK_HEIGHT - 1))
+                    .all(|above| chunk.get_block(x, above, z).id != BlockId::Water)
+        }
         Replacement::BaseStone => is_base_stone(current),
         Replacement::Ore { discard_if_exposed, .. } => {
             is_ore_replaceable(current)
@@ -1499,15 +1794,43 @@ fn replacement_matches(
                 && y + 1 < CHUNK_HEIGHT
                 && chunk.get_block(x, y + 1, z).id == BlockId::Water
         }
-        Replacement::UnderwaterFloor => {
+        Replacement::UnderwaterMagma => {
+            if x == 0 || x + 1 == CHUNK_SIZE || y == 0 || z == 0 || z + 1 == CHUNK_SIZE {
+                return false;
+            }
             is_solid_natural(current)
-                && y + 1 < CHUNK_HEIGHT
-                && chunk.get_block(x, y + 1, z).id == BlockId::Water
+                && is_solid_natural(chunk.get_block(x, y - 1, z).id)
+                // UnderwaterMagmaFeature first requires its scan origin to be
+                // water and finds the floor of that water column. The emitted
+                // cube reaches only one block below that floor, so every valid
+                // result has water one or two blocks above it.
+                && (chunk.get_block(x, y + 1, z).id == BlockId::Water
+                    || (y + 2 < CHUNK_HEIGHT
+                        && chunk.get_block(x, y + 2, z).id == BlockId::Water))
+                && [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)]
+                    .into_iter()
+                    .all(|(x, z)| is_solid_natural(chunk.get_block(x, y, z).id))
         }
         Replacement::PlantOnGrass => {
             current == BlockId::Air
                 && y > 0
                 && chunk.get_block(x, y - 1, z).id == BlockId::GrassBlock
+        }
+        Replacement::PlantOnDirt => {
+            current == BlockId::Air
+                && y > 0
+                && matches!(
+                    chunk.get_block(x, y - 1, z).id,
+                    BlockId::GrassBlock | BlockId::Dirt | BlockId::CoarseDirt | BlockId::Podzol
+                )
+        }
+        Replacement::Mushroom => {
+            current == BlockId::Air
+                && y > 0
+                && chunk.get_block(x, y - 1, z).id.is_solid()
+                && (chunk.get_block(x, y - 1, z).id == BlockId::Podzol
+                    || (y + 1..CHUNK_HEIGHT)
+                        .any(|above| chunk.get_block(x, above, z).id.is_solid()))
         }
         Replacement::Cactus => {
             current == BlockId::Air
@@ -1701,6 +2024,107 @@ mod tests {
     }
 
     #[test]
+    fn feature_surface_uses_completed_target_column_not_preliminary_height() {
+        let generator = generator(1);
+        let mut chunk = Chunk::new(8, 11);
+        let local_y = (70 - (-64)) as usize;
+        chunk.set_block(3, local_y, 4, Block::new(BlockId::GrassBlock));
+        let mut stage = FeatureStage::new(&generator, 1, -64, 384, &chunk);
+        assert_eq!(stage.surface_y(8 * 16 + 3, 11 * 16 + 4), 70);
+    }
+
+    #[test]
+    fn default_and_swamp_flower_providers_use_reference_native_states() {
+        let mut random = NoiseSeed::new(0x26_02);
+        let mut saw_poppy = false;
+        let mut saw_dandelion = false;
+        for _ in 0..128 {
+            match flower_block("flower_default", &mut random) {
+                BlockId::Poppy => saw_poppy = true,
+                BlockId::Dandelion => saw_dandelion = true,
+                other => panic!("unexpected default flower {other:?}"),
+            }
+            assert_eq!(flower_block("flower_swamp", &mut random), BlockId::BlueOrchid);
+        }
+        assert!(saw_poppy && saw_dandelion);
+        let meadow = (0..128)
+            .map(|_| flower_block("flower_meadow", &mut random))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(meadow.contains(&BlockId::Grass));
+        assert!(meadow.contains(&BlockId::Allium));
+        assert!(meadow.contains(&BlockId::Dandelion));
+    }
+
+    #[test]
+    fn flower_survival_accepts_native_dirt_family_but_not_sand() {
+        let mut chunk = Chunk::new(0, 0);
+        let y = 70usize;
+        for (x, support) in [
+            (1, BlockId::GrassBlock),
+            (2, BlockId::Dirt),
+            (3, BlockId::CoarseDirt),
+            (4, BlockId::Podzol),
+            (5, BlockId::Sand),
+        ] {
+            chunk.set_block(x, y - 1, 1, Block::new(support));
+        }
+        for x in 1..=4 {
+            assert!(replacement_matches(Replacement::PlantOnDirt, BlockId::Air, &chunk, x, y, 1));
+        }
+        assert!(!replacement_matches(Replacement::PlantOnDirt, BlockId::Air, &chunk, 5, y, 1));
+    }
+
+    #[test]
+    fn seed_one_forest_chunk_places_canopy_above_completed_surface() {
+        let generator = generator(1);
+        // This coordinate is Forest under Minecraft 26.2's production
+        // Climate.RTree tie ordering (the former brute-force selector used a
+        // different equal-distance label at the old fixture coordinate).
+        let mut chunk = Chunk::new(4, 9);
+        generator.generate_chunk(&mut chunk);
+        let canopy_blocks = chunk.blocks.iter().filter(|block| {
+            matches!(block.id, BlockId::OakLeaves | BlockId::BirchLeaves)
+        }).count();
+        let flower_blocks = chunk.blocks.iter().filter(|block| matches!(
+            block.id,
+            BlockId::Dandelion | BlockId::Poppy | BlockId::BlueOrchid | BlockId::Allium
+                | BlockId::AzureBluet | BlockId::RedTulip | BlockId::OrangeTulip
+                | BlockId::WhiteTulip | BlockId::PinkTulip | BlockId::OxeyeDaisy
+                | BlockId::Cornflower | BlockId::LilyOfTheValley
+        )).count();
+        assert!(canopy_blocks >= 100, "seed-one forest canopy was still missing: {canopy_blocks} leaf blocks");
+        assert!(flower_blocks <= 16, "seed-one forest vegetation regressed to {flower_blocks} flowers in one chunk");
+    }
+
+    #[test]
+    fn seed_one_near_inland_boundary_generates_forest_not_saved_beach() {
+        let generator = generator(1);
+        assert_eq!(generator.get_biome_at(158, 88, 165), Biome::Forest);
+        let mut chunk = Chunk::new(9, 10);
+        generator.generate_chunk(&mut chunk);
+        let tree_blocks = chunk.blocks.iter().filter(|block| {
+            matches!(
+                block.id,
+                BlockId::OakLog | BlockId::OakLeaves | BlockId::BirchLog | BlockId::BirchLeaves
+            )
+        }).count();
+        let sand = chunk.blocks.iter().filter(|block| block.id == BlockId::Sand).count();
+        let local_x = 158usize % CHUNK_SIZE;
+        let local_z = 165usize % CHUNK_SIZE;
+        let top = (0..CHUNK_HEIGHT).rev().find_map(|y| {
+            let block = chunk.get_block(local_x, y, local_z).id;
+            (!matches!(block, BlockId::Air | BlockId::Water)).then_some((y, block))
+        });
+        println!("tree_blocks={tree_blocks} sand={sand} top={top:?}");
+        for world_y in 84..=100 {
+            let local_y = (world_y - (-64)) as usize;
+            println!("y={world_y} block={:?} biome={:?}", chunk.get_block(local_x, local_y, local_z).id, generator.get_biome_at(158, world_y, 165));
+        }
+        assert!(tree_blocks > 0, "seed-one chunk 9/10 lost its reference forest");
+        assert!(matches!(top, Some((_, BlockId::GrassBlock | BlockId::Dirt))));
+    }
+
+    #[test]
     fn ore_replacement_selects_native_stone_variants() {
         let replacement = Replacement::Ore {
             stone: BlockId::IronOre,
@@ -1792,6 +2216,101 @@ mod tests {
                     | BlockId::HornCoralFan
             )
         }));
+    }
+
+    #[test]
+    fn lake_fluid_does_not_replace_an_ocean_floor_below_water() {
+        let mut chunk = Chunk::new(0, 0);
+        let floor = (50 - (-64)) as usize;
+        chunk.set_block(8, floor, 8, Block::new(BlockId::Sand));
+        for y in floor + 1..=floor + 5 {
+            chunk.set_block(8, y, 8, Block::new(BlockId::Water));
+        }
+        assert!(!replacement_matches(
+            Replacement::LakeFluid,
+            BlockId::Sand,
+            &chunk,
+            8,
+            floor,
+            8,
+        ));
+        assert!(!replacement_matches(
+            Replacement::LakeAir,
+            BlockId::Water,
+            &chunk,
+            8,
+            floor + 1,
+            8,
+        ));
+    }
+
+    #[test]
+    fn underwater_magma_keeps_the_random_height_filter() {
+        let generator = generator(1);
+        let mut chunk = Chunk::new(0, 0);
+        let floor = (50 - (-64)) as usize;
+        for x in 0..CHUNK_SIZE { for z in 0..CHUNK_SIZE {
+            chunk.set_block(x, floor, z, Block::new(BlockId::Sand));
+            for y in floor + 1..=(63 - (-64)) as usize {
+                chunk.set_block(x, y, z, Block::new(BlockId::Water));
+            }
+        }}
+        let root = MINECRAFT26_FEATURE_ROOTS.iter().copied()
+            .find(|root| root.key == "underwater_magma").unwrap();
+        let mut stage = FeatureStage::new(&generator, 1, -64, 384, &chunk);
+        let mut candidates = 0;
+        plan_underwater_magma(&mut stage, 0, 0, root, 0, &mut candidates);
+        assert!(stage.writes.len() <= 27, "random-height filtering was bypassed");
+    }
+
+    #[test]
+    fn underwater_magma_requires_the_reference_water_column() {
+        let floor = (50 - (-64)) as usize;
+        let mut dry_shore = Chunk::new(0, 0);
+        for x in 6..=10 { for z in 6..=10 {
+            for y in 0..=floor {
+                dry_shore.set_block(x, y, z, Block::new(BlockId::Stone));
+            }
+        }}
+        assert!(!replacement_matches(
+            Replacement::UnderwaterMagma,
+            BlockId::Stone,
+            &dry_shore,
+            8,
+            floor,
+            8,
+        ));
+
+        dry_shore.set_block(8, floor + 1, 8, Block::new(BlockId::Water));
+        assert!(replacement_matches(
+            Replacement::UnderwaterMagma,
+            BlockId::Stone,
+            &dry_shore,
+            8,
+            floor,
+            8,
+        ));
+    }
+
+    #[test]
+    fn mushrooms_require_podzol_or_sky_occlusion() {
+        let y = 70usize;
+        let mut chunk = Chunk::new(0, 0);
+        chunk.set_block(8, y - 1, 8, Block::new(BlockId::GrassBlock));
+        assert!(!replacement_matches(
+            Replacement::Mushroom, BlockId::Air, &chunk, 8, y, 8,
+        ));
+
+        chunk.set_block(8, y + 4, 8, Block::new(BlockId::Stone));
+        assert!(replacement_matches(
+            Replacement::Mushroom, BlockId::Air, &chunk, 8, y, 8,
+        ));
+
+        chunk.set_block(8, y + 4, 8, Block::new(BlockId::Air));
+        chunk.set_block(8, y - 1, 8, Block::new(BlockId::Podzol));
+        assert!(replacement_matches(
+            Replacement::Mushroom, BlockId::Air, &chunk, 8, y, 8,
+        ));
     }
 
     #[test]
@@ -1947,6 +2466,7 @@ mod tests {
             "flower_pale_garden", "rooted_sulfur_spring", "sulfur_pool",
             "sulfur_spike_cluster", "sulfur_spike", "pointed_dripstone", "disk_clay",
             "ore_clay", "lush_caves_clay", "sculk_vein", "sculk_patch_deep_dark",
+            "flower_cherry", "flower_forest_flowers", "forest_flowers",
         ] {
             assert!(matches!(root_coverage_disposition(key), RootCoverageDisposition::Blocked(reason) if !reason.is_empty()), "{key}");
         }

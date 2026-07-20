@@ -13,6 +13,14 @@ pub trait FunctionContext {
     fn sample_interpolated(&self, _marker_identity: usize, _function: &DenseFn) -> Option<f64> {
         None
     }
+    fn sample_cached(
+        &self,
+        _marker_identity: usize,
+        _marker_type: MarkerType,
+        _function: &DenseFn,
+    ) -> Option<f64> {
+        None
+    }
 }
 
 impl FunctionContext for Box<dyn FunctionContext + '_> {
@@ -21,6 +29,9 @@ impl FunctionContext for Box<dyn FunctionContext + '_> {
     fn block_z(&self) -> i32 { (**self).block_z() }
     fn sample_interpolated(&self, marker_identity: usize, function: &DenseFn) -> Option<f64> {
         (**self).sample_interpolated(marker_identity, function)
+    }
+    fn sample_cached(&self, marker_identity: usize, marker_type: MarkerType, function: &DenseFn) -> Option<f64> {
+        (**self).sample_cached(marker_identity, marker_type, function)
     }
 }
 
@@ -43,6 +54,9 @@ impl<'a> FunctionContext for &'a dyn FunctionContext {
     fn block_z(&self) -> i32 { (**self).block_z() }
     fn sample_interpolated(&self, marker_identity: usize, function: &DenseFn) -> Option<f64> {
         (**self).sample_interpolated(marker_identity, function)
+    }
+    fn sample_cached(&self, marker_identity: usize, marker_type: MarkerType, function: &DenseFn) -> Option<f64> {
+        (**self).sample_cached(marker_identity, marker_type, function)
     }
 }
 
@@ -160,6 +174,8 @@ pub struct ReferenceCellContext {
     cell_width: i32,
     cell_height: i32,
     interpolated: RefCell<HashMap<usize, InterpolationCorners>>,
+    cached_2d: RefCell<HashMap<(usize, i32, i32), f64>>,
+    cached_once: RefCell<HashMap<(usize, i32, i32, i32), f64>>,
 }
 
 impl ReferenceCellContext {
@@ -180,6 +196,8 @@ impl ReferenceCellContext {
             cell_width,
             cell_height,
             interpolated: RefCell::new(HashMap::new()),
+            cached_2d: RefCell::new(HashMap::new()),
+            cached_once: RefCell::new(HashMap::new()),
         }
     }
 
@@ -218,6 +236,35 @@ impl FunctionContext for ReferenceCellContext {
         let factor_y = (self.block_y.get() - self.cell_min_y) as f64 / self.cell_height as f64;
         let factor_z = (self.block_z.get() - self.cell_min_z) as f64 / self.cell_width as f64;
         Some(corners.trilerp(factor_x, factor_y, factor_z))
+    }
+
+    fn sample_cached(&self, marker_identity: usize, marker_type: MarkerType, function: &DenseFn) -> Option<f64> {
+        match marker_type {
+            MarkerType::Cache2D => {
+                let key = (marker_identity, self.block_x.get(), self.block_z.get());
+                if let Some(value) = self.cached_2d.borrow().get(&key).copied() {
+                    return Some(value);
+                }
+                let value = function.compute(self);
+                self.cached_2d.borrow_mut().insert(key, value);
+                Some(value)
+            }
+            MarkerType::CacheOnce | MarkerType::CacheAllInCell => {
+                let key = (
+                    marker_identity,
+                    self.block_x.get(),
+                    self.block_y.get(),
+                    self.block_z.get(),
+                );
+                if let Some(value) = self.cached_once.borrow().get(&key).copied() {
+                    return Some(value);
+                }
+                let value = function.compute(self);
+                self.cached_once.borrow_mut().insert(key, value);
+                Some(value)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -951,11 +998,13 @@ impl Clone for Marker {
 }
 impl DensityFunction for Marker {
     fn compute(&self, ctx: &dyn FunctionContext) -> f64 {
+        let identity = self as *const Marker as usize;
         if self.0 == MarkerType::Interpolated {
-            let identity = self as *const Marker as usize;
             if let Some(value) = ctx.sample_interpolated(identity, &self.1) {
                 return value;
             }
+        } else if let Some(value) = ctx.sample_cached(identity, self.0, &self.1) {
+            return value;
         }
         self.1.compute(ctx)
     }

@@ -682,6 +682,13 @@ impl VanillaWorldGenerator {
             })
     }
 
+    /// Return the Java 26.2 climate-selected Overworld spawn suggestion.
+    /// Terrain is still checked asynchronously before this becomes the saved
+    /// player spawn.
+    pub fn suggested_spawn_position(&self) -> (i32, i32) {
+        self.biome_source.find_spawn_position()
+    }
+
     // ------------------------------------------------------------------
     // Main chunk generation
     // ------------------------------------------------------------------
@@ -1797,6 +1804,32 @@ mod tests {
     }
 
     #[test]
+    fn climate_selected_seed_one_chunk_has_dry_spawn_columns() {
+        let generator = VanillaWorldGenerator::from_seed(1, WorldGenerationProfile::Minecraft26Geometry);
+        let (x, z) = generator.suggested_spawn_position();
+        let mut chunk = Chunk::new(x.div_euclid(16), z.div_euclid(16));
+        generator.generate_chunk(&mut chunk);
+        let mut dry = 0usize;
+        for local_x in 0..CHUNK_SIZE {
+            for local_z in 0..CHUNK_SIZE {
+                let top = (0..CHUNK_HEIGHT)
+                    .rev()
+                    .find(|&y| !chunk.get_block(local_x, y, local_z).is_air())
+                    .unwrap();
+                if chunk.get_block(local_x, top, local_z).id.is_solid()
+                    && top + 2 < CHUNK_HEIGHT
+                    && chunk.get_block(local_x, top + 1, local_z).is_air()
+                    && chunk.get_block(local_x, top + 2, local_z).is_air()
+                {
+                    dry += 1;
+                }
+            }
+        }
+        assert!(dry > 0, "climate-selected spawn chunk ({x}, {z}) had no dry columns");
+    }
+
+
+    #[test]
     fn public_generation_matches_the_undecorated_base_pass() {
         let generator = VanillaWorldGenerator::from_seed(0x5EED, WorldGenerationProfile::Minecraft26Base);
         let mut base = Chunk::new(3, -2);
@@ -2109,6 +2142,27 @@ mod tests {
             if let Some((sy, sd)) = found_surface {
                 println!("col ({:>3},{:>3}): highest solid at y={:>4} density={:+.4}", x, z, sy, sd);
             }
+        }
+    }
+
+    #[test]
+    fn seed_one_reference_router_tracks_java_26_2_oracle_points() {
+        let router = NoiseRouterData::create_overworld_router_reference(1, false, false);
+        let samples = [
+            ((0, -64, 0), 0x3fa3_30e5_6041_8937, 24.0),
+            ((160, 63, 160), 0x3fcb_44a7_ae2b_e264, 56.0),
+            ((-160, 0, -160), 0x3fb5_cc89_1e77_e34b, 24.0),
+            ((176, 96, 160), 0xbfd3_0abe_d947_dbb4, 56.0),
+        ];
+        for ((x, y, z), density_bits, preliminary) in samples {
+            let ctx = SinglePointContext { block_x: x, block_y: y, block_z: z };
+            let expected_density = f64::from_bits(density_bits);
+            let density = router.final_density.compute(&ctx);
+            assert!(
+                (density - expected_density).abs() <= 1.0e-3,
+                "density at ({x}, {y}, {z}) was {density}, Java was {expected_density}"
+            );
+            assert_eq!(router.preliminary_surface_level.compute(&ctx), preliminary);
         }
     }
 

@@ -32,9 +32,7 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let night = uniforms.night_factor.x;
-    let day = 1.0 - night;
-
+    let night = clamp((1.0 - uniforms.night_factor.x) / 0.76, 0.0, 1.0);
     // Reconstruct world-space direction from screen UV
     let ndc = vec2<f32>(input.uv.x * 2.0 - 1.0, 1.0 - input.uv.y * 2.0);
     let clip_near = uniforms.inv_vp_matrix * vec4<f32>(ndc, 0.0, 1.0);
@@ -43,41 +41,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let far_world = clip_far.xyz / clip_far.w;
     let view_dir = normalize(far_world - near_world);
 
-    // Sky gradient: darker at zenith, brighter near horizon
-    let horizon_factor = 1.0 - abs(view_dir.y);
-    let zenith_color = mix(
+    // 26.2 renders its upper sky disc with one environment-provided color.
+    // A previous screen-space horizon gradient and panoramic orange band were
+    // camera-locked approximations and produced a visible moving halo.
+    let sky_color = mix(
         vec3<f32>(0.03, 0.10, 0.70),
         vec3<f32>(0.01, 0.01, 0.08),
         night,
     );
-    let horizon_color = mix(
-        vec3<f32>(0.65, 0.80, 0.98),
-        vec3<f32>(0.06, 0.06, 0.20),
-        night,
-    );
-    var sky_color = mix(zenith_color, horizon_color, horizon_factor);
-
-    // Sun glow
-    let sun_dir = normalize(uniforms.light_direction.xyz);
-    let sun_angle = max(dot(view_dir, sun_dir), 0.0);
-    let sun_glow = pow(sun_angle, 64.0) * day * 0.8;
-    let sun_halo = pow(sun_angle, 4.0) * day * 0.25;
-
-    let sun_col = mix(
-        vec3<f32>(1.0, 0.75, 0.45),
-        vec3<f32>(1.0, 1.0, 1.0),
-        smoothstep(0.0, 0.5, day),
-    );
-    sky_color += sun_glow * sun_col + sun_halo * sun_col * 0.25;
-
-    // Dusk horizon glow
-    let dusk_glow = pow(horizon_factor, 2.0) * max(0.0, sun_dir.y + 0.2) * 0.3;
-    let dusk_color = vec3<f32>(1.0, 0.5, 0.2);
-    sky_color += dusk_glow * dusk_color * (1.0 - night * 0.5);
 
     // Underwater: fade sky to deep blue based on view direction
     let underwater = uniforms.fog_params.w;
-    let underwater_sky = vec3<f32>(0.02, 0.10, 0.20);
+    let underwater_sky = vec3<f32>(0.016, 0.086, 0.20);
     // Sky fades to underwater color more near the horizon (through water)
     let underwater_blend = smoothstep(-0.5, 0.5, view_dir.y);
     let blended_sky = mix(sky_color, underwater_sky, underwater * (0.5 + 0.5 * underwater_blend));

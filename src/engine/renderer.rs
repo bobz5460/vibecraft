@@ -32,6 +32,12 @@ pub enum RendererInitError {
         width: u32,
         height: u32,
     },
+    #[error("failed to load celestial texture {path}: {source}")]
+    CelestialTexture {
+        path: String,
+        #[source]
+        source: image::ImageError,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +165,104 @@ fn load_destroy_texture(
     Ok((texture, view, sampler))
 }
 
+fn load_celestial_texture(
+    device: &Device,
+    queue: &Queue,
+    reader: &AssetReader,
+) -> Result<(Texture, TextureView, Sampler), RendererInitError> {
+    let paths = [
+        "textures/environment/celestial/sun.png",
+        "textures/environment/celestial/moon/full_moon.png",
+    ];
+    let mut pixels = vec![0u8; 64 * 32 * 4];
+    for (index, path) in paths.into_iter().enumerate() {
+        let data = reader.read(path).ok_or_else(|| RendererInitError::CelestialTexture {
+            path: path.to_string(),
+            source: image::ImageError::Decoding(image::error::DecodingError::new(
+                image::error::ImageFormatHint::Unknown,
+                std::io::Error::new(std::io::ErrorKind::NotFound, "asset not found"),
+            )),
+        })?;
+        let image = image::load_from_memory(&data)
+            .map_err(|source| RendererInitError::CelestialTexture { path: path.to_string(), source })?
+            .resize_exact(32, 32, image::imageops::FilterType::Nearest)
+            .into_rgba8();
+        for row in 0..32usize {
+            let src = row * 32 * 4;
+            let dst = (row * 64 + index * 32) * 4;
+            pixels[dst..dst + 32 * 4].copy_from_slice(&image.as_raw()[src..src + 32 * 4]);
+        }
+    }
+    let size = Extent3d { width: 64, height: 32, depth_or_array_layers: 1 };
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("celestial_texture"), size, mip_level_count: 1, sample_count: 1,
+        dimension: TextureDimension::D2, format: TextureFormat::Rgba8UnormSrgb,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST, view_formats: &[],
+    });
+    queue.write_texture(
+        TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+        &pixels,
+        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(64 * 4), rows_per_image: Some(32) },
+        size,
+    );
+    let view = texture.create_view(&TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&SamplerDescriptor {
+        label: Some("celestial_sampler"),
+        address_mode_u: AddressMode::ClampToEdge, address_mode_v: AddressMode::ClampToEdge,
+        mag_filter: FilterMode::Nearest, min_filter: FilterMode::Nearest,
+        ..Default::default()
+    });
+    Ok((texture, view, sampler))
+}
+
+struct CloudTextureData {
+    cells: Vec<bool>,
+    width: usize,
+    height: usize,
+}
+
+fn load_cloud_texture(
+    device: &Device,
+    queue: &Queue,
+    reader: &AssetReader,
+) -> Result<(Texture, TextureView, Sampler, CloudTextureData), RendererInitError> {
+    let path = "textures/environment/clouds.png";
+    let data = reader.read(path).ok_or_else(|| RendererInitError::CelestialTexture {
+        path: path.to_string(),
+        source: image::ImageError::Decoding(image::error::DecodingError::new(
+            image::error::ImageFormatHint::Unknown,
+            std::io::Error::new(std::io::ErrorKind::NotFound, "asset not found"),
+        )),
+    })?;
+    let image = image::load_from_memory(&data)
+        .map_err(|source| RendererInitError::CelestialTexture { path: path.to_string(), source })?
+        .into_rgba8();
+    let cloud_data = CloudTextureData {
+        cells: image.pixels().map(|pixel| pixel.0[3] >= 10).collect(),
+        width: image.width() as usize,
+        height: image.height() as usize,
+    };
+    let size = Extent3d { width: image.width(), height: image.height(), depth_or_array_layers: 1 };
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("cloud_texture"), size, mip_level_count: 1, sample_count: 1,
+        dimension: TextureDimension::D2, format: TextureFormat::Rgba8UnormSrgb,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST, view_formats: &[],
+    });
+    queue.write_texture(
+        TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+        image.as_raw(),
+        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(image.width() * 4), rows_per_image: Some(image.height()) },
+        size,
+    );
+    let view = texture.create_view(&TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&SamplerDescriptor {
+        label: Some("cloud_sampler"), address_mode_u: AddressMode::Repeat,
+        address_mode_v: AddressMode::Repeat, mag_filter: FilterMode::Nearest,
+        min_filter: FilterMode::Nearest, ..Default::default()
+    });
+    Ok((texture, view, sampler, cloud_data))
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
@@ -246,6 +350,88 @@ pub struct BreakOverlay {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MoonVertex { pub pos: [f32; 3], pub uv: [f32; 2] }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct CloudVertex {
+    pos: [f32; 3],
+    shade: f32,
+}
+
+fn cloud_cell(data: &CloudTextureData, x: i32, z: i32) -> bool {
+    let x = x.rem_euclid(data.width as i32) as usize;
+    let z = z.rem_euclid(data.height as i32) as usize;
+    data.cells[x + z * data.width]
+}
+
+fn push_cloud_quad(vertices: &mut Vec<CloudVertex>, corners: [[f32; 3]; 4], shade: f32) {
+    for index in [0usize, 1, 2, 0, 2, 3] {
+        vertices.push(CloudVertex { pos: corners[index], shade });
+    }
+}
+
+fn build_cloud_vertices(
+    data: &CloudTextureData,
+    camera: &Camera,
+    game_time: f32,
+    view_distance: f32,
+) -> Vec<CloudVertex> {
+    const CELL: f32 = 12.0;
+    const BOTTOM: f32 = 192.0;
+    const TOP: f32 = 196.0;
+    let drift = game_time * 0.60;
+    let center_x = ((camera.position.x + drift) / CELL).floor() as i32;
+    let center_z = ((camera.position.z + 3.96) / CELL).floor() as i32;
+    let radius = (view_distance / CELL).ceil().clamp(2.0, 44.0) as i32;
+    let camera_below = camera.position.y < BOTTOM;
+    let camera_above = camera.position.y > TOP;
+    let mut vertices = Vec::new();
+
+    for dz in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dz * dz > radius * radius {
+                continue;
+            }
+            let cell_x = center_x + dx;
+            let cell_z = center_z + dz;
+            if !cloud_cell(data, cell_x, cell_z) {
+                continue;
+            }
+            let x0 = cell_x as f32 * CELL;
+            let x1 = x0 + CELL;
+            let z0 = cell_z as f32 * CELL - 3.96;
+            let z1 = z0 + CELL;
+
+            if !camera_below {
+                push_cloud_quad(&mut vertices, [[x0, TOP, z0], [x0, TOP, z1], [x1, TOP, z1], [x1, TOP, z0]], 1.0);
+            }
+            if !camera_above {
+                push_cloud_quad(&mut vertices, [[x0, BOTTOM, z1], [x0, BOTTOM, z0], [x1, BOTTOM, z0], [x1, BOTTOM, z1]], 0.70);
+            }
+            if !cloud_cell(data, cell_x, cell_z - 1) {
+                push_cloud_quad(&mut vertices, [[x1, BOTTOM, z0], [x0, BOTTOM, z0], [x0, TOP, z0], [x1, TOP, z0]], 0.80);
+            }
+            if !cloud_cell(data, cell_x, cell_z + 1) {
+                push_cloud_quad(&mut vertices, [[x0, BOTTOM, z1], [x1, BOTTOM, z1], [x1, TOP, z1], [x0, TOP, z1]], 0.80);
+            }
+            if !cloud_cell(data, cell_x - 1, cell_z) {
+                push_cloud_quad(&mut vertices, [[x0, BOTTOM, z0], [x0, BOTTOM, z1], [x0, TOP, z1], [x0, TOP, z0]], 0.90);
+            }
+            if !cloud_cell(data, cell_x + 1, cell_z) {
+                push_cloud_quad(&mut vertices, [[x1, BOTTOM, z1], [x1, BOTTOM, z0], [x1, TOP, z0], [x1, TOP, z1]], 0.90);
+            }
+        }
+    }
+    vertices
+}
+
+fn cloud_mesh_key(camera: &Camera, game_time: f32, view_distance: f32) -> (i32, i32, i32, i8) {
+    let center_x = ((camera.position.x + game_time * 0.60) / 12.0).floor() as i32;
+    let center_z = ((camera.position.z + 3.96) / 12.0).floor() as i32;
+    let radius = (view_distance / 12.0).ceil().clamp(2.0, 44.0) as i32;
+    let relative_y = if camera.position.y < 192.0 { -1 } else if camera.position.y > 196.0 { 1 } else { 0 };
+    (center_x, center_z, radius, relative_y)
+}
+
 pub struct HotbarItem {
     pub name: String,
     pub count: u16,
@@ -324,6 +510,7 @@ pub struct Renderer {
     pub star_pipeline: RenderPipeline,
     pub sky_gradient_pipeline: RenderPipeline,
     pub moon_pipeline: RenderPipeline,
+    cloud_pipeline: RenderPipeline,
     pub highlight_pipeline: RenderPipeline,
     pub break_pipeline: RenderPipeline,
     pub highlight_bind_group: BindGroup,
@@ -365,6 +552,15 @@ pub struct Renderer {
     star_count: u32,
     moon_vertex_buffer: Buffer,
     moon_index_buffer: Buffer,
+    sun_vertex_buffer: Buffer,
+    sun_index_buffer: Buffer,
+    celestial_texture: Texture,
+    cloud_texture: Texture,
+    cloud_data: CloudTextureData,
+    cloud_vertex_buffer: Buffer,
+    cloud_vertex_capacity: usize,
+    cloud_vertex_count: u32,
+    cloud_mesh_key: Option<(i32, i32, i32, i8)>,
     depth_texture: Texture,
     depth_view: TextureView,
     shadow_texture: Texture,
@@ -445,6 +641,10 @@ impl Renderer {
         let tex_manager = LoadedTextureManager::new(&device, &queue, reader);
         let (destroy_texture, destroy_view, destroy_sampler) =
             load_destroy_texture(&device, &queue, reader)?;
+        let (celestial_texture, celestial_view, celestial_sampler) =
+            load_celestial_texture(&device, &queue, reader)?;
+        let (cloud_texture, cloud_view, cloud_sampler, cloud_data) =
+            load_cloud_texture(&device, &queue, reader)?;
 
         let face_map = tex_manager.face_map().clone();
         let crossed_map = tex_manager.crossed_map().clone();
@@ -526,6 +726,38 @@ impl Renderer {
                     ty: BindingType::Sampler(SamplerBindingType::Comparison),
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -535,7 +767,7 @@ impl Renderer {
             entries: &[
                 BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: ShaderStages::VERTEX,
+                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -604,6 +836,22 @@ impl Renderer {
                 BindGroupEntry {
                     binding: 4,
                     resource: BindingResource::Sampler(&shadow_sampler),
+                },
+                BindGroupEntry {
+                    binding: 5,
+                    resource: BindingResource::TextureView(&celestial_view),
+                },
+                BindGroupEntry {
+                    binding: 6,
+                    resource: BindingResource::Sampler(&celestial_sampler),
+                },
+                BindGroupEntry {
+                    binding: 7,
+                    resource: BindingResource::TextureView(&cloud_view),
+                },
+                BindGroupEntry {
+                    binding: 8,
+                    resource: BindingResource::Sampler(&cloud_sampler),
                 },
             ],
         });
@@ -777,7 +1025,21 @@ impl Renderer {
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some(ColorTargetState {
                     format: config.format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    // Minecraft's OVERLAY blend: src * src_alpha + dst.
+                    // Celestial sprites intentionally contain opaque black glow
+                    // pixels, which contribute nothing under this blend.
+                    blend: Some(BlendState {
+                        color: BlendComponent {
+                            src_factor: BlendFactor::SrcAlpha,
+                            dst_factor: BlendFactor::One,
+                            operation: BlendOperation::Add,
+                        },
+                        alpha: BlendComponent {
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::Zero,
+                            operation: BlendOperation::Add,
+                        },
+                    }),
                     write_mask: ColorWrites::ALL,
                 })],
             }),
@@ -794,6 +1056,53 @@ impl Renderer {
                 format: TextureFormat::Depth32Float,
                 depth_write_enabled: false,
                 depth_compare: CompareFunction::Always,
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let cloud_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("cloud_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &sky_shader,
+                entry_point: Some("vs_cloud_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: std::mem::size_of::<CloudVertex>() as u64,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute { format: VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                        VertexAttribute { format: VertexFormat::Float32, offset: 12, shader_location: 1 },
+                    ],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &sky_shader,
+                entry_point: Some("fs_cloud"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: config.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: CompareFunction::LessEqual,
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
@@ -824,7 +1133,18 @@ impl Renderer {
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some(ColorTargetState {
                     format: config.format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    blend: Some(BlendState {
+                        color: BlendComponent {
+                            src_factor: BlendFactor::SrcAlpha,
+                            dst_factor: BlendFactor::One,
+                            operation: BlendOperation::Add,
+                        },
+                        alpha: BlendComponent {
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::Zero,
+                            operation: BlendOperation::Add,
+                        },
+                    }),
                     write_mask: ColorWrites::ALL,
                 })],
             }),
@@ -918,10 +1238,10 @@ impl Renderer {
 
         // Moon geometry: a 4×4 quad facing upward
         let moon_verts: [MoonVertex; 4] = [
-            MoonVertex { pos: [-2.0, 128.0, -2.0], uv: [0.0, 0.0] },
+            MoonVertex { pos: [-2.0, 128.0, -2.0], uv: [0.5, 0.0] },
             MoonVertex { pos: [ 2.0, 128.0, -2.0], uv: [1.0, 0.0] },
             MoonVertex { pos: [ 2.0, 128.0,  2.0], uv: [1.0, 1.0] },
-            MoonVertex { pos: [-2.0, 128.0,  2.0], uv: [0.0, 1.0] },
+            MoonVertex { pos: [-2.0, 128.0,  2.0], uv: [0.5, 1.0] },
         ];
         let moon_indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
         let moon_vertex_buffer = device.create_buffer(&BufferDescriptor {
@@ -938,6 +1258,28 @@ impl Renderer {
             mapped_at_creation: false,
         });
         queue.write_buffer(&moon_index_buffer, 0, bytemuck::cast_slice(&moon_indices));
+        let sun_verts: [MoonVertex; 4] = [
+            MoonVertex { pos: [-2.0, 128.0, -2.0], uv: [0.0, 0.0] },
+            MoonVertex { pos: [ 2.0, 128.0, -2.0], uv: [0.5, 0.0] },
+            MoonVertex { pos: [ 2.0, 128.0,  2.0], uv: [0.5, 1.0] },
+            MoonVertex { pos: [-2.0, 128.0,  2.0], uv: [0.0, 1.0] },
+        ];
+        let sun_vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("sun_vb"), size: std::mem::size_of::<[MoonVertex; 4]>() as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
+        queue.write_buffer(&sun_vertex_buffer, 0, bytemuck::cast_slice(&sun_verts));
+        let sun_index_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("sun_ib"), size: std::mem::size_of::<[u32; 6]>() as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
+        queue.write_buffer(&sun_index_buffer, 0, bytemuck::cast_slice(&moon_indices));
+        let cloud_vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("cloud_vb"),
+            size: std::mem::size_of::<CloudVertex>() as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let highlight_shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("highlight_shader"),
@@ -1773,6 +2115,7 @@ impl Renderer {
             star_pipeline,
             sky_gradient_pipeline,
             moon_pipeline,
+            cloud_pipeline,
             highlight_pipeline,
             break_pipeline,
             highlight_bind_group,
@@ -1783,6 +2126,15 @@ impl Renderer {
             star_count: 300,
             moon_vertex_buffer,
             moon_index_buffer,
+            sun_vertex_buffer,
+            sun_index_buffer,
+            celestial_texture,
+            cloud_texture,
+            cloud_data,
+            cloud_vertex_buffer,
+            cloud_vertex_capacity: 1,
+            cloud_vertex_count: 0,
+            cloud_mesh_key: None,
             font,
             text_pipeline,
             crosshair_invert_pipeline,
@@ -2009,7 +2361,7 @@ impl Renderer {
     pub fn update_uniforms(
         &mut self,
         camera: &Camera,
-        night_factor: f32,
+        sky_light_factor: f32,
         shadow_vp: &[[f32; 4]; 4],
         light_dir: &nalgebra::Vector3<f32>,
         fog_params: [f32; 4],
@@ -2022,7 +2374,14 @@ impl Renderer {
             vp_matrix: vp,
             camera_pos: [camera.position.x, camera.position.y, camera.position.z, 0.0],
             light_direction: [light_dir.x, light_dir.y, light_dir.z, 0.0],
-            night_factor: [night_factor, 0.0, 0.0, 0.0],
+            // 26.2 Overworld timeline: sky light is white by day and
+            // (0.48, 0.48, 1.0) at night. The factor follows the same track.
+            night_factor: [
+                sky_light_factor,
+                0.48 + 0.52 * ((sky_light_factor - 0.24) / 0.76).clamp(0.0, 1.0),
+                0.48 + 0.52 * ((sky_light_factor - 0.24) / 0.76).clamp(0.0, 1.0),
+                1.0,
+            ],
             shadow_vp_matrix: *shadow_vp,
             inv_vp_matrix: inv_vp.into(),
             fog_params,
@@ -2036,33 +2395,22 @@ impl Renderer {
     }
 
     pub fn create_chunk_data(&self, mesh: &ChunkMesh) -> ChunkRenderData {
-        let vertex_size = std::mem::size_of::<Vertex>() as u64;
+        // MeshVertex and the terrain pipeline's Vertex deliberately share the
+        // same repr(C) layout. Upload worker output directly instead of
+        // allocating and copying two full vertex arrays on the render thread.
+        const _: () = assert!(std::mem::size_of::<crate::world::mesh::MeshVertex>() == std::mem::size_of::<Vertex>());
+        const _: () = assert!(std::mem::align_of::<crate::world::mesh::MeshVertex>() == std::mem::align_of::<Vertex>());
+        let vertex_size = std::mem::size_of::<crate::world::mesh::MeshVertex>() as u64;
         let index_size = std::mem::size_of::<u32>() as u64;
-
-        let vertices: Vec<Vertex> = mesh.vertices.iter().map(|v| Vertex {
-            pos: v.pos,
-            uv: v.uv,
-            normal: v.normal,
-            tex_index: v.tex_index,
-            light_data: v.light_data,
-        }).collect();
-
-        let transparent_vertices: Vec<Vertex> = mesh.transparent_vertices.iter().map(|v| Vertex {
-            pos: v.pos,
-            uv: v.uv,
-            normal: v.normal,
-            tex_index: v.tex_index,
-            light_data: v.light_data,
-        }).collect();
 
         let vertex_buffer = self.device.create_buffer(&BufferDescriptor {
             label: Some("chunk_vb"),
-            size: ((vertices.len() as u64) * vertex_size).max(vertex_size),
+            size: ((mesh.vertices.len() as u64) * vertex_size).max(vertex_size),
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        if !vertices.is_empty() {
-            self.queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        if !mesh.vertices.is_empty() {
+            self.queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&mesh.vertices));
         }
 
         let index_buffer = self.device.create_buffer(&BufferDescriptor {
@@ -2077,12 +2425,12 @@ impl Renderer {
 
         let transparent_vertex_buffer = self.device.create_buffer(&BufferDescriptor {
             label: Some("chunk_tvb"),
-            size: ((transparent_vertices.len() as u64) * vertex_size).max(vertex_size),
+            size: ((mesh.transparent_vertices.len() as u64) * vertex_size).max(vertex_size),
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        if !transparent_vertices.is_empty() {
-            self.queue.write_buffer(&transparent_vertex_buffer, 0, bytemuck::cast_slice(&transparent_vertices));
+        if !mesh.transparent_vertices.is_empty() {
+            self.queue.write_buffer(&transparent_vertex_buffer, 0, bytemuck::cast_slice(&mesh.transparent_vertices));
         }
 
         let transparent_index_buffer = self.device.create_buffer(&BufferDescriptor {
@@ -2834,19 +3182,49 @@ impl Renderer {
             bytemuck::cast_slice(&[break_uniforms]),
         );
 
-        // Update moon position: opposite the sun, centered on camera
+        // Java rotates a fixed XZ celestial quad with the sky clock. Keep its
+        // axes independent of camera yaw/pitch; only sky translation follows
+        // the camera so walking cannot produce parallax.
         let moon_dir = -*ctx.light_dir;
-        let moon_center = ctx.camera.position.coords + moon_dir * 300.0;
-        let mh = 3.0;
-        let right = ctx.camera.right() * mh;
-        let up = right.cross(&ctx.camera.forward()).normalize() * mh;
+        let moon_center = ctx.camera.position.coords + moon_dir * 100.0;
+        let moon_x = nalgebra::Vector3::new(-moon_dir.y, moon_dir.x, 0.0) * 20.0;
+        let moon_z = nalgebra::Vector3::new(0.0, 0.0, 20.0);
         let moon_verts: [MoonVertex; 4] = [
-            MoonVertex { pos: (moon_center - right + up).into(), uv: [0.0, 0.0] },
-            MoonVertex { pos: (moon_center + right + up).into(), uv: [1.0, 0.0] },
-            MoonVertex { pos: (moon_center + right - up).into(), uv: [1.0, 1.0] },
-            MoonVertex { pos: (moon_center - right - up).into(), uv: [0.0, 1.0] },
+            MoonVertex { pos: (moon_center - moon_x - moon_z).into(), uv: [1.0, 1.0] },
+            MoonVertex { pos: (moon_center + moon_x - moon_z).into(), uv: [0.5, 1.0] },
+            MoonVertex { pos: (moon_center + moon_x + moon_z).into(), uv: [0.5, 0.0] },
+            MoonVertex { pos: (moon_center - moon_x + moon_z).into(), uv: [1.0, 0.0] },
         ];
         self.queue.write_buffer(&self.moon_vertex_buffer, 0, bytemuck::cast_slice(&moon_verts));
+        let sun_center = ctx.camera.position.coords + *ctx.light_dir * 100.0;
+        let sun_x = nalgebra::Vector3::new(-ctx.light_dir.y, ctx.light_dir.x, 0.0) * 30.0;
+        let sun_z = nalgebra::Vector3::new(0.0, 0.0, 30.0);
+        let sun_verts: [MoonVertex; 4] = [
+            MoonVertex { pos: (sun_center - sun_x - sun_z).into(), uv: [0.0, 0.0] },
+            MoonVertex { pos: (sun_center + sun_x - sun_z).into(), uv: [0.5, 0.0] },
+            MoonVertex { pos: (sun_center + sun_x + sun_z).into(), uv: [0.5, 1.0] },
+            MoonVertex { pos: (sun_center - sun_x + sun_z).into(), uv: [0.0, 1.0] },
+        ];
+        self.queue.write_buffer(&self.sun_vertex_buffer, 0, bytemuck::cast_slice(&sun_verts));
+
+        let next_cloud_key = cloud_mesh_key(ctx.camera, ctx.game_time, ctx.fog_params[1]);
+        if self.cloud_mesh_key != Some(next_cloud_key) {
+            let cloud_vertices = build_cloud_vertices(&self.cloud_data, ctx.camera, ctx.game_time, ctx.fog_params[1]);
+            if cloud_vertices.len() > self.cloud_vertex_capacity {
+                self.cloud_vertex_capacity = cloud_vertices.len().next_power_of_two();
+                self.cloud_vertex_buffer = self.device.create_buffer(&BufferDescriptor {
+                    label: Some("cloud_vb"),
+                    size: (self.cloud_vertex_capacity * std::mem::size_of::<CloudVertex>()) as u64,
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            if !cloud_vertices.is_empty() {
+                self.queue.write_buffer(&self.cloud_vertex_buffer, 0, bytemuck::cast_slice(&cloud_vertices));
+            }
+            self.cloud_vertex_count = cloud_vertices.len() as u32;
+            self.cloud_mesh_key = Some(next_cloud_key);
+        }
 
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&TextureViewDescriptor::default());
@@ -2942,9 +3320,12 @@ impl Renderer {
             rpass.set_vertex_buffer(0, self.star_vertex_buffer.slice(..));
             rpass.draw(0..self.star_count, 0..1);
 
-            // Render moon
+            // Render asset-backed sun and moon.
             rpass.set_pipeline(&self.moon_pipeline);
             rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.sun_vertex_buffer.slice(..));
+            rpass.set_index_buffer(self.sun_index_buffer.slice(..), IndexFormat::Uint32);
+            rpass.draw_indexed(0..6, 0, 0..1);
             rpass.set_vertex_buffer(0, self.moon_vertex_buffer.slice(..));
             rpass.set_index_buffer(self.moon_index_buffer.slice(..), IndexFormat::Uint32);
             rpass.draw_indexed(0..6, 0, 0..1);
@@ -2983,6 +3364,12 @@ impl Renderer {
                     rpass.set_index_buffer(data.transparent_index_buffer.slice(..), IndexFormat::Uint32);
                     rpass.draw_indexed(0..data.transparent_num_indices, 0, 0..1);
                 }
+            }
+            if self.cloud_vertex_count > 0 {
+                rpass.set_pipeline(&self.cloud_pipeline);
+                rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                rpass.set_vertex_buffer(0, self.cloud_vertex_buffer.slice(..));
+                rpass.draw(0..self.cloud_vertex_count, 0..1);
             }
             if !item_billboard_indices.is_empty() {
                 rpass.set_pipeline(&self.item_billboard_pipeline);
@@ -3077,5 +3464,24 @@ mod tests {
         assert_eq!(batches[0].kind, UiBatchKind::Text);
         assert_eq!(batches[1].kind, UiBatchKind::Sprite);
         assert_eq!(batches[2].kind, UiBatchKind::Text);
+    }
+
+    #[test]
+    fn cloud_mask_builds_extruded_world_anchored_cells() {
+        let mut cells = vec![false; 256 * 256];
+        cells[128 + 128 * 256] = true;
+        let data = CloudTextureData { cells, width: 256, height: 256 };
+        let camera = Camera::new(nalgebra::Point3::new(128.25 * 12.0, 80.0, 128.25 * 12.0 - 3.96), 1.0);
+
+        let vertices = build_cloud_vertices(&data, &camera, 0.0, 24.0);
+
+        // Below the layer Java emits the bottom plus four exposed sides.
+        assert_eq!(vertices.len(), 5 * 6);
+        assert!(vertices.iter().all(|vertex| vertex.pos[1] == 192.0 || vertex.pos[1] == 196.0));
+
+        let mut moved_camera = Camera::new(camera.position + nalgebra::Vector3::new(2.0, 0.0, 2.0), 1.0);
+        moved_camera.yaw = 1.5;
+        moved_camera.pitch = -0.7;
+        assert_eq!(vertices, build_cloud_vertices(&data, &moved_camera, 0.0, 24.0));
     }
 }

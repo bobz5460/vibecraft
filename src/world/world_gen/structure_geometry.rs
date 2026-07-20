@@ -961,7 +961,15 @@ fn plan_loaded_template(
 fn structure_asset_root() -> PathBuf {
     std::env::var_os("VIBECRAFT_ASSETS")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/opencode/minecraft-assets"))
+        .unwrap_or_else(|| {
+            let sibling = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../minecraft-26.2-assets");
+            if sibling.join("data/minecraft").is_dir() {
+                sibling
+            } else {
+                PathBuf::from("/tmp/opencode/minecraft-assets")
+            }
+        })
 }
 
 type TemplateCache = HashMap<PathBuf, Arc<StructureTemplate>>;

@@ -13,9 +13,17 @@ use std::sync::Arc;
 use std::thread;
 
 pub const DEFAULT_RENDER_DISTANCE: i32 = 6;
-const MAX_LOADED_CHUNKS_PER_FRAME: usize = 32;
+// Result admission mutates topology and completed meshes become GPU uploads on
+// the render thread. Keep both budgets deliberately small so a burst of worker
+// completions cannot turn into a long frame.
+const MAX_LOADED_CHUNKS_PER_FRAME: usize = 4;
+// Keep GPU publication bounded, but do not impose a two-column-per-frame
+// floor on large render-distance changes. Direct MeshVertex uploads make this
+// budget practical without the former render-thread staging copies.
+const MAX_MESH_RESULTS_PER_FRAME: usize = 8;
 const MAX_MESHES_IN_FLIGHT: usize = 8;
-const MAX_LIGHT_KEYS_PER_FRAME: usize = 16;
+const MAX_LIGHT_KEYS_PER_FRAME: usize = 4;
+const MAX_FLUID_TICKS_PER_STEP: usize = 4096;
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -30,7 +38,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 struct ChunkGenTask {
     cx: i32,
     cz: i32,
-    saved_chunk: Option<Chunk>,
+    storage: Option<WorldStorage>,
 }
 
 struct ChunkGenResult {
@@ -70,10 +78,24 @@ struct LightResult {
     error: Option<String>,
 }
 
+struct ChunkSaveTask {
+    storage: WorldStorage,
+    key: (i32, i32),
+    revision: u64,
+    chunk: Arc<Chunk>,
+}
+
+struct ChunkSaveResult {
+    key: (i32, i32),
+    revision: u64,
+    chunk: Arc<Chunk>,
+    error: Option<String>,
+}
+
 pub struct ChunkManager {
     pub chunks: HashMap<(i32, i32), Arc<Chunk>>,
     pub meshes: HashMap<(i32, i32), ChunkMesh>,
-    generator: VanillaWorldGenerator,
+    generator: Arc<VanillaWorldGenerator>,
     coordinate_profile: WorldCoordinateProfile,
     generation_profile: WorldGenerationProfile,
     task_tx: Sender<ChunkGenTask>,
@@ -82,6 +104,9 @@ pub struct ChunkManager {
     mesh_result_rx: Receiver<MeshResult>,
     light_task_tx: Sender<LightTask>,
     light_result_rx: Receiver<LightResult>,
+    save_task_tx: Sender<ChunkSaveTask>,
+    save_result_rx: Receiver<ChunkSaveResult>,
+    saves_in_flight: HashMap<(i32, i32), u64>,
     meshing: HashMap<(i32, i32), u64>,
     pending: HashSet<(i32, i32)>,
     max_generation_tasks: usize,
@@ -96,8 +121,15 @@ pub struct ChunkManager {
     light_dirty_keys: HashSet<(i32, i32)>,
     light_in_flight: Option<HashSet<(i32, i32)>>,
     chunk_revisions: HashMap<(i32, i32), u64>,
+    /// Revisions for derived worker inputs. Unlike authoritative block
+    /// revisions, these also change when neighbor topology changes.
+    work_revisions: HashMap<(i32, i32), u64>,
     next_task_id: u64,
     work_epoch: u64,
+    // Minecraft schedules fluid work at affected block positions. Keeping
+    // stable oceans out of the tick path is essential at large view distance.
+    active_water: HashSet<(i32, i32, i32)>,
+    active_lava: HashSet<(i32, i32, i32)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -122,20 +154,31 @@ impl ChunkManager {
         let (mesh_result_tx, mesh_result_rx) = channel::<MeshResult>();
         let (light_task_tx, light_task_rx) = channel::<LightTask>();
         let (light_result_tx, light_result_rx) = channel::<LightResult>();
+        let (save_task_tx, save_task_rx) = channel::<ChunkSaveTask>();
+        let (save_result_tx, save_result_rx) = channel::<ChunkSaveResult>();
         let task_rx = std::sync::Arc::new(std::sync::Mutex::new(task_rx));
         let available_workers = thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let mesh_workers = (available_workers / 3).max(1);
-        let generation_workers = available_workers
+        // Minecraft raises its client thread to maximum priority and leaves a
+        // processor out of the shared background executor. Standard Rust
+        // threads have no portable priority control, so leave two logical CPUs
+        // for the render/event threads and the OS/GPU driver instead.
+        let background_workers = available_workers.saturating_sub(2).max(2);
+        let mesh_workers = (background_workers / 3).max(1);
+        let generation_workers = background_workers
             .saturating_sub(mesh_workers + 1)
             .max(1);
+        // Minecraft's RandomState/noise router is immutable shared world
+        // state. Constructing the full router and climate index independently
+        // in every worker delays the first chunks and multiplies memory use.
+        let generator = Arc::new(VanillaWorldGenerator::from_seed(seed, generation_profile));
 
         for _ in 0..generation_workers {
             let rx = std::sync::Arc::clone(&task_rx);
             let tx = result_tx.clone();
+            let generator = Arc::clone(&generator);
             thread::spawn(move || {
-                let generator = VanillaWorldGenerator::from_seed(seed, generation_profile);
                 loop {
                 let task = {
                     let lock = rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -145,15 +188,21 @@ impl ChunkManager {
                     Ok(task) => {
                         let key = (task.cx, task.cz);
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if let Some(chunk) = task.saved_chunk {
-                                chunk
-                            } else {
-                                let mut chunk = Chunk::new(task.cx, task.cz);
-                                generator.generate_chunk(&mut chunk);
-                                chunk
+                            if let Some(storage) = task.storage {
+                                match storage.load_chunk_if_present(task.cx, task.cz) {
+                                    Ok(Some(data)) => {
+                                        return data.into_chunk().map_err(|error| error.to_string())
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => return Err(error.to_string()),
+                                }
                             }
+                            let mut chunk = Chunk::new(task.cx, task.cz);
+                            generator.generate_chunk(&mut chunk);
+                            Ok(chunk)
                         }))
-                        .map_err(panic_message);
+                        .map_err(panic_message)
+                        .and_then(|result| result);
                         if tx.send(ChunkGenResult { key, result }).is_err() {
                             break;
                         }
@@ -228,10 +277,31 @@ impl ChunkManager {
             }
         });
 
+        // Chunk JSON encoding and atomic fsync are intentionally isolated from
+        // the render thread. The single writer also preserves deterministic
+        // per-process write ordering without allowing unbounded I/O parallelism.
+        thread::spawn(move || {
+            while let Ok(task) = save_task_rx.recv() {
+                let data = ChunkData::from_chunk(&task.chunk);
+                let error = task.storage.save_chunk(&data).err().map(|error| error.to_string());
+                if save_result_tx
+                    .send(ChunkSaveResult {
+                        key: task.key,
+                        revision: task.revision,
+                        chunk: task.chunk,
+                        error,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         ChunkManager {
             chunks: HashMap::new(),
             meshes: HashMap::new(),
-            generator: VanillaWorldGenerator::from_seed(seed, generation_profile),
+            generator,
             coordinate_profile,
             generation_profile,
             task_tx,
@@ -240,9 +310,17 @@ impl ChunkManager {
             mesh_result_rx,
             light_task_tx,
             light_result_rx,
+            save_task_tx,
+            save_result_rx,
+            saves_in_flight: HashMap::new(),
             meshing: HashMap::new(),
             pending: HashSet::new(),
-            max_generation_tasks: (generation_workers * 2).max(4),
+            // Do not build a FIFO backlog behind the workers. Minecraft's
+            // dispatcher can remove and reprioritize queued chunk tasks when
+            // player tickets move; std::mpsc cannot. Limiting this queue to
+            // roughly one task per worker means obsolete work is bounded and
+            // the new player-center request is dispatched on the next update.
+            max_generation_tasks: generation_workers.max(2),
             render_distance,
             cached_range: Vec::new(),
             cached_range_center: (0, 0),
@@ -254,8 +332,11 @@ impl ChunkManager {
             light_dirty_keys: HashSet::new(),
             light_in_flight: None,
             chunk_revisions: HashMap::new(),
+            work_revisions: HashMap::new(),
             next_task_id: 0,
             work_epoch: 0,
+            active_water: HashSet::new(),
+            active_lava: HashSet::new(),
         }
     }
 
@@ -280,6 +361,13 @@ impl ChunkManager {
     /// Saves every changed loaded chunk. Returns false when a write failed;
     /// callers should keep the process alive rather than discard that state.
     pub fn flush_saved_chunks(&mut self) -> bool {
+        self.queue_saved_chunks();
+        while !self.saves_in_flight.is_empty() {
+            match self.save_result_rx.recv() {
+                Ok(result) => self.apply_save_result(result),
+                Err(_) => return false,
+            }
+        }
         let keys: Vec<_> = self.save_dirty_keys.iter().copied().collect();
         let mut saved_all = true;
         for key in keys {
@@ -289,6 +377,56 @@ impl ChunkManager {
             }
         }
         saved_all
+    }
+
+    /// Queues dirty chunk snapshots for the persistence worker and returns
+    /// immediately. Autosaves and streaming eviction use this path so JSON
+    /// encoding and fsync never consume a render frame.
+    pub fn queue_saved_chunks(&mut self) {
+        self.process_save_results();
+        let keys: Vec<_> = self.save_dirty_keys.iter().copied().collect();
+        for key in keys {
+            self.queue_chunk_save(key);
+        }
+    }
+
+    fn queue_chunk_save(&mut self, key: (i32, i32)) {
+        if self.saves_in_flight.contains_key(&key) {
+            return;
+        }
+        let (Some(storage), Some(chunk)) = (self.storage.clone(), self.chunks.get(&key).cloned()) else {
+            return;
+        };
+        let revision = self.chunk_revisions.get(&key).copied().unwrap_or(0);
+        if self.save_task_tx.send(ChunkSaveTask { storage, key, revision, chunk }).is_ok() {
+            self.saves_in_flight.insert(key, revision);
+        }
+    }
+
+    fn process_save_results(&mut self) {
+        while let Ok(result) = self.save_result_rx.try_recv() {
+            self.apply_save_result(result);
+        }
+    }
+
+    fn apply_save_result(&mut self, result: ChunkSaveResult) {
+        if self.saves_in_flight.get(&result.key) != Some(&result.revision) {
+            return;
+        }
+        self.saves_in_flight.remove(&result.key);
+        if let Some(error) = result.error {
+            log::error!("failed to save chunk {:?}: {error}", result.key);
+            self.save_failed_keys.insert(result.key);
+            // Failed evictions remain recoverable and will be retried by an
+            // explicit save instead of silently discarding the only snapshot.
+            self.chunks.entry(result.key).or_insert(result.chunk);
+            self.save_dirty_keys.insert(result.key);
+        } else if self.chunk_revisions.get(&result.key).copied() == Some(result.revision)
+            || !self.chunks.contains_key(&result.key)
+        {
+            self.save_dirty_keys.remove(&result.key);
+            self.save_failed_keys.remove(&result.key);
+        }
     }
 
     fn save_chunk(&mut self, key: (i32, i32)) -> bool {
@@ -325,20 +463,26 @@ impl ChunkManager {
     fn bump_chunk_revision(&mut self, key: (i32, i32)) {
         let revision = self.chunk_revisions.entry(key).or_insert(0);
         *revision = revision.wrapping_add(1);
+        self.bump_work_revision(key);
+    }
+
+    fn bump_work_revision(&mut self, key: (i32, i32)) {
+        let revision = self.work_revisions.entry(key).or_insert(0);
+        *revision = revision.wrapping_add(1);
     }
 
     fn snapshot_revisions(
         &self,
         keys: impl Iterator<Item = (i32, i32)>,
     ) -> HashMap<(i32, i32), u64> {
-        keys.filter_map(|key| self.chunk_revisions.get(&key).map(|&revision| (key, revision)))
+        keys.filter_map(|key| self.work_revisions.get(&key).map(|&revision| (key, revision)))
             .collect()
     }
 
     fn revisions_are_current(&self, dependencies: &HashMap<(i32, i32), u64>) -> bool {
         dependencies
             .iter()
-            .all(|(key, revision)| self.chunk_revisions.get(key) == Some(revision))
+            .all(|(key, revision)| self.work_revisions.get(key) == Some(revision))
     }
 
     fn allocate_task_id(&mut self) -> u64 {
@@ -350,9 +494,21 @@ impl ChunkManager {
     fn mesh_neighborhood_ready(&self, key: (i32, i32)) -> bool {
         (-1..=1).all(|dx| {
             (-1..=1).all(|dz| {
-                self.chunks
-                    .get(&(key.0 + dx, key.1 + dz))
-                    .map_or(true, |chunk| !chunk.light_dirty)
+                let neighbor = (key.0 + dx, key.1 + dz);
+                // Geometry/AO needs requested neighbors to exist, but it does
+                // not require every neighbor to be simultaneously light-clean.
+                // A later neighbor light result marks this chunk dirty and
+                // replaces the provisional mesh without hiding it meanwhile.
+                !self.cached_range.contains(&neighbor) || self.chunks.contains_key(&neighbor)
+            })
+        })
+    }
+
+    fn generation_neighborhood_ready(&self, key: (i32, i32)) -> bool {
+        (-1..=1).all(|dx| {
+            (-1..=1).all(|dz| {
+                let neighbor = (key.0 + dx, key.1 + dz);
+                !self.cached_range.contains(&neighbor) || self.chunks.contains_key(&neighbor)
             })
         })
     }
@@ -361,7 +517,6 @@ impl ChunkManager {
     /// AO for the whole 3x3 mesh neighborhood. Cardinal columns also need a
     /// relight because skylight and block light cross their shared boundary.
     fn invalidate_chunk_topology(&mut self, key: (i32, i32)) {
-        let mut invalidated_lighting = false;
         for dx in -1..=1 {
             for dz in -1..=1 {
                 let neighbor = (key.0 + dx, key.1 + dz);
@@ -370,6 +525,10 @@ impl ChunkManager {
                 }
 
                 self.dirty_keys.insert(neighbor);
+                // Worker dependencies must observe neighbor arrival/removal,
+                // but this is derived state and must not alter the server's
+                // authoritative block revision.
+                self.bump_work_revision(neighbor);
                 // A task made before this topology change does not include a
                 // newly available neighbor in its revision dependencies.
                 self.meshing.remove(&neighbor);
@@ -379,15 +538,41 @@ impl ChunkManager {
                         chunk.light_dirty = true;
                     }
                     self.light_dirty_keys.insert(neighbor);
-                    invalidated_lighting = true;
                 }
             }
         }
+    }
 
-        // Let an in-flight light task complete, but discard its pre-topology
-        // snapshot before it can clear the newly dirtied columns.
-        if invalidated_lighting && self.light_in_flight.is_some() {
-            self.work_epoch = self.work_epoch.wrapping_add(1);
+    /// A newly admitted chunk cannot invalidate an unlit/unmeshed neighbor:
+    /// that neighbor was already blocked on this requested dependency. Only
+    /// accepted or active derived work needs replacement. This avoids turning
+    /// initial streaming into repeated 3x3 column relights and remeshes.
+    fn invalidate_chunk_arrival(&mut self, key: (i32, i32)) {
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let neighbor = (key.0 + dx, key.1 + dz);
+                let Some(chunk) = self.chunks.get(&neighbor) else {
+                    continue;
+                };
+                let center = dx == 0 && dz == 0;
+                let light_was_clean = !chunk.light_dirty;
+                let has_derived_work = chunk.has_mesh
+                    || light_was_clean
+                    || self.meshing.contains_key(&neighbor);
+                if !center && !has_derived_work {
+                    continue;
+                }
+
+                self.dirty_keys.insert(neighbor);
+                self.bump_work_revision(neighbor);
+                self.meshing.remove(&neighbor);
+                if center || ((dx == 0 || dz == 0) && light_was_clean) {
+                    if let Some(chunk) = self.chunks.get_mut(&neighbor).map(clone_arc) {
+                        chunk.light_dirty = true;
+                    }
+                    self.light_dirty_keys.insert(neighbor);
+                }
+            }
         }
     }
 
@@ -421,12 +606,16 @@ impl ChunkManager {
     }
 
     fn retain_chunks_for_keys(&mut self, retained: &HashSet<(i32, i32)>) {
+        self.process_save_results();
         let keep = |key| retained.contains(&key);
         let unload: Vec<_> = self.chunks.keys().copied().filter(|&key| !keep(key)).collect();
         for key in unload {
-            if self.save_dirty_keys.contains(&key) && !self.save_chunk(key) {
-                self.save_failed_keys.insert(key);
-                continue;
+            if self.save_dirty_keys.contains(&key) {
+                self.queue_chunk_save(key);
+                if !self.saves_in_flight.contains_key(&key) {
+                    self.save_failed_keys.insert(key);
+                    continue;
+                }
             }
             self.chunks.remove(&key);
             self.meshes.remove(&key);
@@ -434,8 +623,11 @@ impl ChunkManager {
             self.dirty_keys.remove(&key);
             self.light_dirty_keys.remove(&key);
             self.chunk_revisions.remove(&key);
+            self.work_revisions.remove(&key);
             self.save_dirty_keys.remove(&key);
             self.save_failed_keys.remove(&key);
+            self.active_water.retain(|&(x, _, z)| chunk_key(x, z) != key);
+            self.active_lava.retain(|&(x, _, z)| chunk_key(x, z) != key);
             self.invalidate_chunk_topology(key);
         }
         self.meshes.retain(|&key, _| keep(key));
@@ -464,22 +656,48 @@ impl ChunkManager {
         centers: &[(i32, i32)],
         required_chunks: &[(i32, i32)],
     ) {
+        self.update_chunk_stream(centers, required_chunks, true);
+    }
+
+    /// Streams only the explicitly required columns. Loading screens use this
+    /// to settle their small acceptance set before normal render-distance
+    /// streaming begins.
+    pub fn update_required_chunks_async(
+        &mut self,
+        center: (i32, i32),
+        required_chunks: &[(i32, i32)],
+    ) {
+        self.update_chunk_stream(&[center], required_chunks, false);
+    }
+
+    fn update_chunk_stream(
+        &mut self,
+        centers: &[(i32, i32)],
+        required_chunks: &[(i32, i32)],
+        include_render_distance: bool,
+    ) {
         if centers.is_empty() && required_chunks.is_empty() {
             return;
         }
         self.cached_range.clear();
         let mut desired = HashSet::new();
-        for &(center_x, center_z) in centers {
-            for cx in center_x - self.render_distance..=center_x + self.render_distance {
-                for cz in center_z - self.render_distance..=center_z + self.render_distance {
-                    desired.insert((cx, cz));
+        if include_render_distance {
+            for &(center_x, center_z) in centers {
+                for cx in center_x - self.render_distance..=center_x + self.render_distance {
+                    for cz in center_z - self.render_distance..=center_z + self.render_distance {
+                        desired.insert((cx, cz));
+                    }
                 }
             }
         }
         desired.extend(required_chunks.iter().copied());
         self.cached_range.extend(desired.iter().copied());
         self.cached_range_center = centers.first().copied().unwrap_or_default();
-        self.pending.retain(|key| desired.contains(key));
+        // `pending` tracks physically submitted work, not current tickets.
+        // A running std thread cannot be cancelled; retaining it prevents a
+        // duplicate request if the player leaves and re-enters before its
+        // result arrives. With no FIFO backlog, obsolete work is bounded to
+        // one task per generation worker.
         let mut range = self.cached_range.clone();
         range.sort_by_key(|&(cx, cz)| {
             (
@@ -502,34 +720,21 @@ impl ChunkManager {
                 && !self.save_failed_keys.contains(&(cx, cz))
                 && !self.generation_failed_keys.contains(&(cx, cz))
             {
-                let saved_chunk = match self.storage.as_ref() {
-                    Some(storage) => match storage.load_chunk_if_present(cx, cz) {
-                        Ok(Some(data)) => match data.into_chunk() {
-                            Ok(chunk) => Some(chunk),
-                            Err(error) => {
-                                log::error!("failed to decode saved chunk ({cx}, {cz}): {error}");
-                                self.save_failed_keys.insert((cx, cz));
-                                continue;
-                            }
-                        },
-                        Ok(None) => None,
-                        Err(error) => {
-                            log::error!("failed to load saved chunk ({cx}, {cz}): {error}");
-                            self.save_failed_keys.insert((cx, cz));
-                            continue;
-                        }
-                    },
-                    None => None,
-                };
                 self.pending.insert((cx, cz));
-                let _ = self.task_tx.send(ChunkGenTask { cx, cz, saved_chunk });
+                let _ = self.task_tx.send(ChunkGenTask {
+                    cx,
+                    cz,
+                    storage: self.storage.clone(),
+                });
             }
         }
         let mut retained = desired;
-        for &(center_x, center_z) in centers {
-            for cx in center_x - self.render_distance - 1..=center_x + self.render_distance + 1 {
-                for cz in center_z - self.render_distance - 1..=center_z + self.render_distance + 1 {
-                    retained.insert((cx, cz));
+        if include_render_distance {
+            for &(center_x, center_z) in centers {
+                for cx in center_x - self.render_distance - 1..=center_x + self.render_distance + 1 {
+                    for cz in center_z - self.render_distance - 1..=center_z + self.render_distance + 1 {
+                        retained.insert((cx, cz));
+                    }
                 }
             }
         }
@@ -543,6 +748,9 @@ impl ChunkManager {
             };
             let key = result.key;
             self.pending.remove(&key);
+            if !self.cached_range.contains(&key) {
+                continue;
+            }
             let chunk = match result.result {
                 Ok(chunk) => chunk,
                 Err(error) => {
@@ -551,15 +759,17 @@ impl ChunkManager {
                     continue;
                 }
             };
-            if !self.cached_range.contains(&key) {
-                continue;
-            }
             if !self.chunks.contains_key(&key) {
                 self.chunks.insert(key, Arc::new(chunk));
+                self.activate_flowing_fluids_in_chunk(key);
+                // Persist newly generated chunks just like Java does. Besides
+                // making saves self-contained, this freezes their block output
+                // against later changes within the same generation profile.
+                self.save_dirty_keys.insert(key);
                 self.bump_chunk_revision(key);
                 // Do not publish a bootstrap mesh: it would contain fabricated full
                 // skylight. The relight result below schedules the first valid mesh.
-                self.invalidate_chunk_topology(key);
+                self.invalidate_chunk_arrival(key);
             }
         }
         self.chunks.len()
@@ -623,6 +833,9 @@ impl ChunkManager {
         self.generation_failed_keys.clear();
         self.light_dirty_keys.clear();
         self.chunk_revisions.clear();
+        self.work_revisions.clear();
+        self.active_water.clear();
+        self.active_lava.clear();
         self.cached_range.clear();
         self.light_in_flight = None;
         self.work_epoch = self.work_epoch.wrapping_add(1);
@@ -649,8 +862,10 @@ impl ChunkManager {
         self.meshing.remove(&key);
         self.meshes.remove(&key);
         self.chunks.insert(key, Arc::new(chunk));
+        self.activate_flowing_fluids_in_chunk(key);
         self.chunk_revisions.insert(key, revision);
-        self.invalidate_chunk_topology(key);
+        self.bump_work_revision(key);
+        self.invalidate_chunk_arrival(key);
         Ok(true)
     }
 
@@ -665,6 +880,7 @@ impl ChunkManager {
         self.dirty_keys.remove(&key);
         self.light_dirty_keys.remove(&key);
         self.chunk_revisions.remove(&key);
+        self.work_revisions.remove(&key);
         self.save_dirty_keys.remove(&key);
         self.save_failed_keys.remove(&key);
         if existed {
@@ -694,6 +910,7 @@ impl ChunkManager {
         }
         self.set_block(x, y, z, block);
         self.chunk_revisions.insert(key, revision);
+        self.bump_work_revision(key);
         true
     }
 
@@ -704,7 +921,7 @@ impl ChunkManager {
             self.generator.generate_chunk(&mut chunk);
             self.chunks.insert((cx, cz), Arc::new(chunk));
             self.bump_chunk_revision((cx, cz));
-            self.invalidate_chunk_topology((cx, cz));
+            self.invalidate_chunk_arrival((cx, cz));
         }
         clone_arc(self.chunks.get_mut(&(cx, cz)).unwrap())
     }
@@ -851,6 +1068,38 @@ impl ChunkManager {
         None
     }
 
+    /// Minecraft 26.2's initial-spawn search tests every column in one chunk
+    /// before advancing its fixed 11x11 chunk spiral. Keep that ownership here
+    /// so streaming requests are chunk-granular rather than scheduling tens of
+    /// thousands of individual block candidates.
+    pub fn find_safe_spawn_in_chunk(&self, cx: i32, cz: i32) -> Option<[i32; 3]> {
+        self.chunks.get(&(cx, cz))?;
+        let min_x = cx * CHUNK_SIZE as i32;
+        let min_z = cz * CHUNK_SIZE as i32;
+        for x in min_x..min_x + CHUNK_SIZE as i32 {
+            for z in min_z..min_z + CHUNK_SIZE as i32 {
+                if let Some(spawn) = self.find_safe_spawn(x, z, 0) {
+                    return Some(spawn);
+                }
+            }
+        }
+        None
+    }
+
+    /// Java retains its preliminary spawn suggestion when the bounded 11x11
+    /// safe-column search finds nothing. Resolve that suggestion onto the
+    /// loaded surface rather than making world creation terminally fail.
+    pub fn find_spawn_fallback(&self, x: i32, z: i32) -> Option<[i32; 3]> {
+        let cx = x.div_euclid(CHUNK_SIZE as i32);
+        let cz = z.div_euclid(CHUNK_SIZE as i32);
+        self.chunks.get(&(cx, cz))?;
+        let surface_y = (0..CHUNK_HEIGHT as i32)
+            .rev()
+            .find(|&y| !self.get_block_local(x, y, z).is_air())?;
+        let local_y = (surface_y + 1).min(CHUNK_HEIGHT as i32 - 1) as usize;
+        Some([x, self.coordinate_profile.from_local_y(local_y)?, z])
+    }
+
     /// Internal light level: max(sky_light, block_light) for gameplay checks.
     /// Returns 0-15, where 0 is dark and 15 is fully lit.
     pub fn get_internal_light(&self, x: i32, y: i32, z: i32) -> u8 {
@@ -994,6 +1243,7 @@ impl ChunkManager {
 
         if changed {
             self.bump_chunk_revision((cx, cz));
+            self.schedule_fluids_around(x, y, z);
         }
 
         if changed {
@@ -1030,6 +1280,59 @@ impl ChunkManager {
         }
     }
 
+    fn schedule_fluids_around(&mut self, x: i32, y: i32, z: i32) {
+        for (dx, dy, dz) in [
+            (0, 0, 0),
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let pos = (x + dx, y + dy, z + dz);
+            match self.get_block_local(pos.0, pos.1, pos.2).id {
+                BlockId::Water => {
+                    self.active_water.insert(pos);
+                }
+                BlockId::Lava => {
+                    self.active_lava.insert(pos);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn activate_flowing_fluids_in_chunk(&mut self, key: (i32, i32)) {
+        let Some(chunk) = self.chunks.get(&key) else {
+            return;
+        };
+        let positions: Vec<_> = chunk
+            .fluid_positions
+            .iter()
+            .filter_map(|&(lx, y, lz)| {
+                let block = chunk.get_block(lx as usize, y as usize, lz as usize);
+                (block.data != 0).then_some((
+                    key.0 * CHUNK_SIZE as i32 + lx as i32,
+                    y as i32,
+                    key.1 * CHUNK_SIZE as i32 + lz as i32,
+                    block.id,
+                ))
+            })
+            .collect();
+        for (x, y, z, id) in positions {
+            match id {
+                BlockId::Water => {
+                    self.active_water.insert((x, y, z));
+                }
+                BlockId::Lava => {
+                    self.active_lava.insert((x, y, z));
+                }
+                _ => {}
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn update_chunks(&mut self, player_cx: i32, player_cz: i32) {
         self.chunk_range(player_cx, player_cz);
@@ -1042,6 +1345,16 @@ impl ChunkManager {
 
     pub fn rebuild_dirty_meshes(&mut self) -> Vec<(i32, i32)> {
         let mut rebuilt = Vec::new();
+
+        // `has_mesh == false` is authoritative render state; the queue is only
+        // a scheduling index. Re-derive missing first-mesh work so cancellation
+        // or a stale worker result can never strand a loaded, lit chunk merely
+        // because one HashSet entry was lost.
+        for (&key, chunk) in &self.chunks {
+            if !chunk.has_mesh && !chunk.light_dirty && !self.meshing.contains_key(&key) {
+                self.dirty_keys.insert(key);
+            }
+        }
 
         // 1. Apply completed light results from background worker
         while let Ok(result) = self.light_result_rx.try_recv() {
@@ -1087,22 +1400,41 @@ impl ChunkManager {
                 if let Some(chunk) = self.chunks.get_mut(key).map(|a| clone_arc(a)) {
                     chunk.light_dirty = false;
                 }
+                // One flood-fill recomputes the entire expanded scope, not
+                // only its seed keys. Treat every validated result key as
+                // satisfied or overlapping seeds will relight the same 3x3
+                // neighborhoods repeatedly during initial loading.
+                self.light_dirty_keys.remove(key);
             }
             // Lighting is derived client/server state, not an authoritative
             // block mutation. Keeping it out of the public chunk revision is
             // required for network clients: local lighting must not make a
             // valid server block-edit request appear stale.
-            self.dirty_keys.extend(changed_keys);
+            for (cx, cz) in changed_keys {
+                for dx in -1..=1 {
+                    for dz in -1..=1 {
+                        let mesh_key = (cx + dx, cz + dz);
+                        if self.chunks.contains_key(&mesh_key) {
+                            self.dirty_keys.insert(mesh_key);
+                            if let Some(chunk) = self.chunks.get_mut(&mesh_key).map(clone_arc) {
+                                chunk.is_dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // 2. Drain completed mesh results
-        while let Ok(MeshResult {
+        for _ in 0..MAX_MESH_RESULTS_PER_FRAME {
+            let Ok(MeshResult {
             key,
             task_id,
             dependencies,
             result,
-        }) = self.mesh_result_rx.try_recv()
-        {
+            }) = self.mesh_result_rx.try_recv() else {
+                break;
+            };
             if self.meshing.get(&key) != Some(&task_id) {
                 continue;
             }
@@ -1124,9 +1456,11 @@ impl ChunkManager {
             };
             if self.chunks.contains_key(&key) {
                 self.meshes.insert(key, mesh);
+                let dirtied_while_meshing = self.dirty_keys.contains(&key);
                 if let Some(chunk) = self.chunks.get_mut(&key).map(|a| clone_arc(a)) {
                     chunk.has_mesh = true;
-                    if chunk.is_dirty {
+                    chunk.is_dirty = dirtied_while_meshing;
+                    if dirtied_while_meshing {
                         self.dirty_keys.insert(key);
                     }
                 }
@@ -1141,7 +1475,7 @@ impl ChunkManager {
         let mut dirty_keys: Vec<(i32, i32)> = self.dirty_keys.drain().collect();
         let center = self.cached_range_center;
         dirty_keys.sort_by_key(|&(cx, cz)| {
-            (cx - center.0).abs() + (cz - center.1).abs()
+            ((cx - center.0).abs() + (cz - center.1).abs(), cx, cz)
         });
 
         // 3. Schedule light recomputation on background worker
@@ -1149,13 +1483,20 @@ impl ChunkManager {
             let mut all_light_dirty: Vec<(i32, i32)> = self.light_dirty_keys.drain().collect();
             let center = self.cached_range_center;
             all_light_dirty.sort_by_key(|&(cx, cz)| {
-                (cx - center.0).abs() + (cz - center.1).abs()
+                ((cx - center.0).abs() + (cz - center.1).abs(), cx, cz)
             });
-            let light_count = all_light_dirty.len().min(MAX_LIGHT_KEYS_PER_FRAME);
-            let process_keys: HashSet<(i32, i32)> =
-                all_light_dirty.iter().take(light_count).copied().collect();
-            for key in all_light_dirty.iter().skip(light_count) {
-                self.light_dirty_keys.insert(*key);
+            let mut process_keys = HashSet::new();
+            for key in all_light_dirty {
+                if process_keys.len() < MAX_LIGHT_KEYS_PER_FRAME
+                    && self.generation_neighborhood_ready(key)
+                {
+                    process_keys.insert(key);
+                } else {
+                    self.light_dirty_keys.insert(key);
+                }
+            }
+            if process_keys.is_empty() {
+                return rebuilt;
             }
 
             let scope = lighting_scope_for(&self.chunks, &process_keys);
@@ -1217,6 +1558,12 @@ impl ChunkManager {
                 continue;
             }
             if self.meshing.contains_key(&key) {
+                // A topology or lighting result may dirty a chunk after its
+                // current mesh snapshot was dispatched. Keep that request
+                // queued so the older result publishes only provisionally and
+                // is followed by a mesh built from the newer neighborhood.
+                // Dropping it here makes load-order border artifacts permanent.
+                overflow.push(key);
                 continue;
             }
             if scheduled >= available_slots {
@@ -1254,9 +1601,6 @@ impl ChunkManager {
             {
                 self.meshing.insert(key, task_id);
                 scheduled += 1;
-                if let Some(chunk) = self.chunks.get_mut(&key).map(|a| clone_arc(a)) {
-                    chunk.is_dirty = false;
-                }
             } else {
                 overflow.push(key);
             }
@@ -1553,6 +1897,7 @@ impl ChunkManager {
 
     pub fn mark_chunk_light_dirty(&mut self, cx: i32, cz: i32) {
         self.chunk_revisions.entry((cx, cz)).or_insert(0);
+        self.work_revisions.entry((cx, cz)).or_insert(0);
         if let Some(chunk) = self.chunks.get_mut(&(cx, cz)).map(|a| clone_arc(a)) {
             chunk.light_dirty = true;
             self.light_dirty_keys.insert((cx, cz));
@@ -1612,29 +1957,28 @@ impl ChunkManager {
         }
     }
 
-    pub fn tick_lava(&mut self, player_cx: i32, player_cz: i32) {
-        let range = self.render_distance + 2;
-        let lava_keys: Vec<(i32, i32)> = self
-            .chunks
-            .iter()
-            .filter(|((cx, cz), c)| {
-                c.has_lava && (cx - player_cx).abs() <= range && (cz - player_cz).abs() <= range
-            })
-            .map(|(&k, _)| k)
-            .collect();
+    pub fn tick_lava(&mut self, _player_cx: i32, _player_cz: i32) {
+        let mut active: Vec<_> = self.active_lava.iter().copied().collect();
+        active.sort_unstable();
+        active.truncate(MAX_FLUID_TICKS_PER_STEP);
+        for pos in &active {
+            self.active_lava.remove(pos);
+        }
+        let mut lava_by_chunk: HashMap<(i32, i32), Vec<(u8, u16, u8)>> = HashMap::new();
+        for (x, y, z) in active {
+            if (0..CHUNK_HEIGHT as i32).contains(&y) {
+                lava_by_chunk.entry(chunk_key(x, z)).or_default().push((
+                    x.rem_euclid(CHUNK_SIZE as i32) as u8,
+                    y as u16,
+                    z.rem_euclid(CHUNK_SIZE as i32) as u8,
+                ));
+            }
+        }
 
         let mut updates: Vec<(i32, i32, i32, u8)> = Vec::new();
         let mut interactions: Vec<(i32, i32, i32)> = Vec::new();
 
-        for &(cx, cz) in &lava_keys {
-            // Ensure fluid positions are built
-            if let Some(chunk) = self.chunks.get(&(cx, cz)) {
-                if chunk.fluid_positions.is_empty() && chunk.has_lava {
-                    if let Some(chunk) = self.chunks.get_mut(&(cx, cz)).map(|a| clone_arc(a)) {
-                        chunk.recount_fluids();
-                    }
-                }
-            }
+        for ((cx, cz), positions) in lava_by_chunk {
             let chunk = match self.chunks.get(&(cx, cz)) {
                 Some(c) => c,
                 None => continue,
@@ -1642,7 +1986,7 @@ impl ChunkManager {
             let base_x = cx * CHUNK_SIZE as i32;
             let base_z = cz * CHUNK_SIZE as i32;
 
-            for &(lx, y, lz) in &chunk.fluid_positions {
+            for (lx, y, lz) in positions {
                 if y == 0 {
                     continue;
                 }
@@ -1713,29 +2057,28 @@ impl ChunkManager {
         }
     }
 
-    pub fn tick_water(&mut self, player_cx: i32, player_cz: i32) {
-        let range = self.render_distance + 2;
-        let watery_keys: Vec<(i32, i32)> = self
-            .chunks
-            .iter()
-            .filter(|((cx, cz), c)| {
-                c.has_water && (cx - player_cx).abs() <= range && (cz - player_cz).abs() <= range
-            })
-            .map(|(&k, _)| k)
-            .collect();
+    pub fn tick_water(&mut self, _player_cx: i32, _player_cz: i32) {
+        let mut active: Vec<_> = self.active_water.iter().copied().collect();
+        active.sort_unstable();
+        active.truncate(MAX_FLUID_TICKS_PER_STEP);
+        for pos in &active {
+            self.active_water.remove(pos);
+        }
+        let mut water_by_chunk: HashMap<(i32, i32), Vec<(u8, u16, u8)>> = HashMap::new();
+        for (x, y, z) in active {
+            if (0..CHUNK_HEIGHT as i32).contains(&y) {
+                water_by_chunk.entry(chunk_key(x, z)).or_default().push((
+                    x.rem_euclid(CHUNK_SIZE as i32) as u8,
+                    y as u16,
+                    z.rem_euclid(CHUNK_SIZE as i32) as u8,
+                ));
+            }
+        }
 
         let mut updates: Vec<(i32, i32, i32, u8)> = Vec::new();
         let mut lava_interactions: Vec<(i32, i32, i32, BlockId)> = Vec::new();
 
-        for &(cx, cz) in &watery_keys {
-            // Ensure fluid positions are built
-            if let Some(chunk) = self.chunks.get(&(cx, cz)) {
-                if chunk.fluid_positions.is_empty() && chunk.has_water {
-                    if let Some(chunk) = self.chunks.get_mut(&(cx, cz)).map(|a| clone_arc(a)) {
-                        chunk.recount_fluids();
-                    }
-                }
-            }
+        for ((cx, cz), positions) in water_by_chunk {
             let chunk = match self.chunks.get(&(cx, cz)) {
                 Some(c) => c,
                 None => continue,
@@ -1743,7 +2086,7 @@ impl ChunkManager {
             let base_x = cx * CHUNK_SIZE as i32;
             let base_z = cz * CHUNK_SIZE as i32;
 
-            for &(lx, y, lz) in &chunk.fluid_positions {
+            for (lx, y, lz) in positions {
                 if y == 0 {
                     continue;
                 }
@@ -2183,6 +2526,7 @@ mod tests {
 
         manager.set_block(0, 101, 0, Block::new(BlockId::Water));
         assert_eq!(manager.find_safe_spawn(0, 0, 0), None);
+        assert_eq!(manager.find_spawn_fallback(0, 0), Some([0, 102, 0]));
 
         manager.set_block(0, 101, 0, Block::new(BlockId::Lava));
         assert_eq!(manager.find_safe_spawn(0, 0, 0), None);
@@ -2206,20 +2550,169 @@ mod tests {
             }
         }
 
+        let epoch_before = manager.work_epoch;
+        manager.light_in_flight = Some(HashSet::from([(0, 0)]));
         manager.invalidate_chunk_topology((0, 0));
+
+        // Unrelated topology changes no longer globally cancel lighting. Each
+        // affected dependency gets its own derived-work revision instead.
+        assert_eq!(manager.work_epoch, epoch_before);
 
         for dx in -1..=1 {
             for dz in -1..=1 {
                 let key = (dx, dz);
                 assert!(manager.dirty_keys.contains(&key));
                 assert!(!manager.meshing.contains_key(&key));
+                assert!(manager.work_revisions.get(&key).copied().unwrap_or(0) > 0);
                 assert_eq!(manager.get_chunk(dx, dz).unwrap().light_dirty, dx == 0 || dz == 0);
             }
         }
     }
 
     #[test]
-    fn changed_chunk_is_saved_before_streaming_unload() {
+    fn initial_chunk_arrival_does_not_restart_unready_neighbors() {
+        let mut manager = ChunkManager::new(
+            7,
+            2,
+            WorldCoordinateProfile::JavaOverworld,
+            WorldGenerationProfile::Minecraft26Geometry,
+        );
+        manager.chunks.insert((0, 0), Arc::new(Chunk::new(0, 0)));
+        manager.chunks.insert((1, 0), Arc::new(Chunk::new(1, 0)));
+
+        manager.invalidate_chunk_arrival((1, 0));
+
+        assert!(manager.light_dirty_keys.contains(&(1, 0)));
+        assert!(!manager.light_dirty_keys.contains(&(0, 0)));
+        assert!(!manager.dirty_keys.contains(&(0, 0)));
+    }
+
+    #[test]
+    fn arrival_rebuilds_an_already_published_neighbor() {
+        let mut manager = ChunkManager::new(
+            7,
+            2,
+            WorldCoordinateProfile::JavaOverworld,
+            WorldGenerationProfile::Minecraft26Geometry,
+        );
+        let mut existing = Chunk::new(0, 0);
+        existing.light_dirty = false;
+        existing.has_mesh = true;
+        manager.chunks.insert((0, 0), Arc::new(existing));
+        manager.chunks.insert((1, 0), Arc::new(Chunk::new(1, 0)));
+
+        manager.invalidate_chunk_arrival((1, 0));
+
+        assert!(manager.light_dirty_keys.contains(&(0, 0)));
+        assert!(manager.dirty_keys.contains(&(0, 0)));
+    }
+
+    #[test]
+    fn center_waits_for_requested_generation_neighbors_before_lighting() {
+        let mut manager = ChunkManager::new(
+            7,
+            2,
+            WorldCoordinateProfile::JavaOverworld,
+            WorldGenerationProfile::Minecraft26Base,
+        );
+        manager.cached_range = (-1..=1)
+            .flat_map(|cx| (-1..=1).map(move |cz| (cx, cz)))
+            .collect();
+        manager.chunks.insert((0, 0), Arc::new(Chunk::new(0, 0)));
+        assert!(!manager.generation_neighborhood_ready((0, 0)));
+
+        for key in manager.cached_range.clone() {
+            manager.chunks.entry(key).or_insert_with(|| Arc::new(Chunk::new(key.0, key.1)));
+        }
+        assert!(manager.generation_neighborhood_ready((0, 0)));
+        assert!(manager.mesh_neighborhood_ready((0, 0)));
+
+        manager.chunks.remove(&(1, 1));
+        assert!(!manager.generation_neighborhood_ready((0, 0)));
+        assert!(!manager.mesh_neighborhood_ready((0, 0)));
+    }
+
+    #[test]
+    fn missing_first_mesh_is_rederived_from_chunk_state() {
+        let mut manager = ChunkManager::new(
+            7,
+            2,
+            WorldCoordinateProfile::JavaOverworld,
+            WorldGenerationProfile::Minecraft26Base,
+        );
+        let mut chunk = Chunk::new(12, 21);
+        chunk.light_dirty = false;
+        chunk.is_dirty = false;
+        chunk.has_mesh = false;
+        manager.chunks.insert((12, 21), Arc::new(chunk));
+        manager.cached_range = vec![(12, 21)];
+        assert!(!manager.dirty_keys.contains(&(12, 21)));
+
+        manager.rebuild_dirty_meshes();
+
+        assert!(manager.is_chunk_meshing(12, 21));
+    }
+
+    #[test]
+    fn dirty_mesh_request_survives_while_older_snapshot_is_in_flight() {
+        let mut manager = ChunkManager::new(
+            7,
+            2,
+            WorldCoordinateProfile::JavaOverworld,
+            WorldGenerationProfile::Minecraft26Base,
+        );
+        let key = (0, 0);
+        let mut chunk = Chunk::new(key.0, key.1);
+        chunk.light_dirty = false;
+        chunk.has_mesh = true;
+        manager.chunks.insert(key, Arc::new(chunk));
+        manager.meshing.insert(key, 99);
+        manager.dirty_keys.insert(key);
+
+        manager.rebuild_dirty_meshes();
+
+        assert!(manager.dirty_keys.contains(&key));
+        assert_eq!(manager.meshing.get(&key), Some(&99));
+    }
+
+    #[test]
+    fn stable_generated_ocean_water_is_not_globally_ticked() {
+        let mut manager = ChunkManager::new(
+            7,
+            2,
+            WorldCoordinateProfile::LegacyLocal,
+            WorldGenerationProfile::legacy(),
+        );
+        let mut chunk = Chunk::new(0, 0);
+        chunk.set_block(8, 40, 8, Block::new(BlockId::Water));
+        manager.chunks.insert((0, 0), Arc::new(chunk));
+
+        manager.tick_water(0, 0);
+
+        assert!(manager.active_water.is_empty());
+        assert!(manager.get_block_local(9, 40, 8).is_air());
+    }
+
+    #[test]
+    fn changed_water_schedules_position_specific_fluid_work() {
+        let mut manager = ChunkManager::new(
+            7,
+            2,
+            WorldCoordinateProfile::LegacyLocal,
+            WorldGenerationProfile::legacy(),
+        );
+        manager.chunks.insert((0, 0), Arc::new(Chunk::new(0, 0)));
+        manager.set_block_local(8, 39, 8, Block::new(BlockId::Stone));
+        manager.set_block_local(8, 40, 8, Block::new(BlockId::Water));
+        assert!(manager.active_water.contains(&(8, 40, 8)));
+
+        manager.tick_water(0, 0);
+
+        assert_eq!(manager.get_block_local(9, 40, 8).id, BlockId::Water);
+    }
+
+    #[test]
+    fn changed_chunk_is_queued_before_streaming_unload_and_flushes() {
         let path = std::env::temp_dir().join(format!(
             "vibecraft-chunk-save-{}",
             std::time::SystemTime::now()
@@ -2236,8 +2729,26 @@ mod tests {
         manager.update_chunks_async(10, 10);
 
         assert!(!manager.chunks.contains_key(&(0, 0)));
+        assert!(manager.flush_saved_chunks());
         let saved = storage.load_chunk(0, 0).unwrap().into_chunk().unwrap();
         assert_eq!(saved.get_block(1, 30, 2).id, BlockId::DiamondBlock);
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn required_only_stream_does_not_expand_to_render_distance() {
+        let mut manager = ChunkManager::new(
+            7,
+            12,
+            WorldCoordinateProfile::JavaOverworld,
+            WorldGenerationProfile::Minecraft26Base,
+        );
+        let required = vec![(7, 10), (8, 10), (9, 10)];
+
+        manager.update_required_chunks_async((8, 10), &required);
+
+        let cached: HashSet<_> = manager.cached_range.iter().copied().collect();
+        assert_eq!(cached, required.into_iter().collect());
+        assert_eq!(manager.cached_range_center, (8, 10));
     }
 }

@@ -205,28 +205,211 @@ impl std::fmt::Display for UnsupportedBiome {
 
 impl std::error::Error for UnsupportedBiome {}
 
+/// Port of Minecraft 26.2 `Climate.RTree`. The Overworld contains thousands
+/// of overlapping parameter boxes; a linear nearest-neighbor scan at every
+/// quart sample dominates chunk generation at normal render distances.
+#[derive(Clone)]
+struct ClimateRTree {
+    root: ClimateNode,
+}
+
+#[derive(Clone)]
+struct ClimateNode {
+    bounds: [ClimateParameter; 7],
+    min_order: usize,
+    kind: ClimateNodeKind,
+}
+
+#[derive(Clone)]
+enum ClimateNodeKind {
+    Leaf(ClimateLeaf),
+    Branch(Vec<ClimateNode>),
+}
+
+#[derive(Clone, Copy)]
+struct ClimateLeaf {
+    point: ParameterPoint,
+    order: usize,
+}
+
+impl ClimateNode {
+    fn leaf(point: ParameterPoint, order: usize) -> Self {
+        Self {
+            bounds: point.parameters,
+            min_order: order,
+            kind: ClimateNodeKind::Leaf(ClimateLeaf { point, order }),
+        }
+    }
+
+    fn branch(children: Vec<Self>) -> Self {
+        let mut bounds = children[0].bounds;
+        for child in children.iter().skip(1) {
+            for (bound, child_bound) in bounds.iter_mut().zip(child.bounds) {
+                *bound = ClimateParameter::join(*bound, child_bound);
+            }
+        }
+        Self {
+            bounds,
+            min_order: children.iter().map(|child| child.min_order).min().unwrap(),
+            kind: ClimateNodeKind::Branch(children),
+        }
+    }
+
+    fn distance(&self, target: [i64; 7]) -> i64 {
+        self.bounds
+            .iter()
+            .zip(target)
+            .map(|(parameter, value)| parameter.distance(value).pow(2))
+            .sum()
+    }
+
+    fn search(&self, target: [i64; 7], candidate: Option<ClimateLeaf>) -> ClimateLeaf {
+        match &self.kind {
+            ClimateNodeKind::Leaf(leaf) => *leaf,
+            ClimateNodeKind::Branch(children) => {
+                let mut closest = candidate;
+                let mut min_distance = closest.map_or(i64::MAX, |leaf| leaf.point.fitness(target));
+                for child in children {
+                    let child_distance = child.distance(target);
+                    let can_improve_order = closest
+                        .is_some_and(|leaf| child_distance == min_distance && child.min_order < leaf.order);
+                    if min_distance > child_distance || can_improve_order {
+                        let leaf = child.search(target, closest);
+                        let leaf_distance = if matches!(child.kind, ClimateNodeKind::Leaf(_)) {
+                            child_distance
+                        } else {
+                            leaf.point.fitness(target)
+                        };
+                        if min_distance > leaf_distance
+                            || (min_distance == leaf_distance
+                                && closest.is_none_or(|closest| leaf.order < closest.order))
+                        {
+                            min_distance = leaf_distance;
+                            closest = Some(leaf);
+                        }
+                    }
+                }
+                closest.expect("climate branch must contain a leaf")
+            }
+        }
+    }
+}
+
+impl ClimateRTree {
+    fn new(points: &[ParameterPoint]) -> Self {
+        assert!(!points.is_empty(), "climate index requires at least one point");
+        let leaves = points
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(order, point)| ClimateNode::leaf(point, order))
+            .collect();
+        Self { root: Self::build(leaves) }
+    }
+
+    fn build(mut nodes: Vec<ClimateNode>) -> ClimateNode {
+        if nodes.len() == 1 {
+            return nodes.pop().unwrap();
+        }
+        if nodes.len() <= 6 {
+            nodes.sort_by_key(|node| {
+                node.bounds
+                    .iter()
+                    .map(|parameter| ((parameter.min + parameter.max) / 2).abs())
+                    .sum::<i64>()
+            });
+            return ClimateNode::branch(nodes);
+        }
+
+        let mut best_cost = i64::MAX;
+        let mut best_dimension = 0;
+        let mut best_buckets = Vec::new();
+        for dimension in 0..7 {
+            Self::sort_nodes(&mut nodes, dimension, false);
+            let buckets = Self::bucketize(&nodes);
+            let cost = buckets.iter().map(Self::node_cost).sum();
+            if best_cost > cost {
+                best_cost = cost;
+                best_dimension = dimension;
+                best_buckets = buckets;
+            }
+        }
+        Self::sort_nodes(&mut best_buckets, best_dimension, true);
+        ClimateNode::branch(
+            best_buckets
+                .into_iter()
+                .map(|bucket| match bucket.kind {
+                    ClimateNodeKind::Branch(children) => Self::build(children),
+                    ClimateNodeKind::Leaf(_) => unreachable!("bucket is always a branch"),
+                })
+                .collect(),
+        )
+    }
+
+    fn sort_nodes(nodes: &mut [ClimateNode], dimension: usize, absolute: bool) {
+        nodes.sort_by(|a, b| {
+            for offset in 0..7 {
+                let d = (dimension + offset) % 7;
+                let center = |node: &ClimateNode| {
+                    let value = (node.bounds[d].min + node.bounds[d].max) / 2;
+                    if absolute { value.abs() } else { value }
+                };
+                let ordering = center(a).cmp(&center(b));
+                if !ordering.is_eq() {
+                    return ordering;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    fn bucketize(nodes: &[ClimateNode]) -> Vec<ClimateNode> {
+        let mut children_per_bucket = 1usize;
+        while children_per_bucket.saturating_mul(6) < nodes.len() {
+            children_per_bucket *= 6;
+        }
+        nodes
+            .chunks(children_per_bucket)
+            .map(|children| ClimateNode::branch(children.to_vec()))
+            .collect()
+    }
+
+    fn node_cost(node: &ClimateNode) -> i64 {
+        node.bounds
+            .iter()
+            .map(|parameter| (parameter.max - parameter.min).abs())
+            .sum()
+    }
+
+    fn search(&self, target: [i64; 7]) -> BiomeId {
+        self.root.search(target, None).point.biome
+    }
+}
+
 /// Deterministic implementation of `MultiNoiseBiomeSource` using the
 /// 26.2 Overworld parameter list.
 #[derive(Clone)]
 pub struct OverworldBiomeSource {
     router: NoiseRouter,
-    parameters: Vec<ParameterPoint>,
+    index: ClimateRTree,
 }
 
 impl OverworldBiomeSource {
     pub fn from_router(router: NoiseRouter) -> Self {
+        let parameters = build_parameter_points();
         Self {
             router,
-            parameters: build_parameter_points(),
+            index: ClimateRTree::new(&parameters),
         }
     }
 
     pub(crate) fn from_router_compatibility(router: NoiseRouter) -> Self {
         // Persisted pre-Geometry profiles keep their original labels and axis
         // mistake so streaming cannot introduce profile-local biome seams.
+        let parameters = build_compatibility_parameter_points();
         Self {
             router,
-            parameters: build_compatibility_parameter_points(),
+            index: ClimateRTree::new(&parameters),
         }
     }
 
@@ -269,8 +452,95 @@ impl OverworldBiomeSource {
     }
 
     fn get_biome_for_target(&self, target: [i64; 7]) -> Result<Biome, UnsupportedBiome> {
-        closest_biome(&self.parameters, target).supported()
+        self.index.search(target).supported()
     }
+
+    /// Port of `Climate.Sampler.findSpawnPosition` for the Overworld's two
+    /// `spawn_target` points. This finds a climate-suitable *suggestion*;
+    /// callers must still find a collision-free terrain position nearby.
+    pub fn find_spawn_position(&self) -> (i32, i32) {
+        let targets = spawn_target_points();
+        let mut best = self.spawn_candidate_fitness(&targets, 0, 0);
+        best = self.refine_spawn_position(&targets, best, 2048.0, 512.0);
+        best = self.refine_spawn_position(&targets, best, 512.0, 32.0);
+        (best.0, best.1)
+    }
+
+    fn refine_spawn_position(
+        &self,
+        targets: &[ParameterPoint],
+        mut best: (i32, i32, i128),
+        max_radius: f32,
+        radius_increment: f32,
+    ) -> (i32, i32, i128) {
+        let (origin_x, origin_z) = (best.0, best.1);
+        let mut angle = 0.0f32;
+        let mut radius = radius_increment;
+        while radius <= max_radius {
+            let x = origin_x + (angle.sin() * radius) as i32;
+            let z = origin_z + (angle.cos() * radius) as i32;
+            let candidate = self.spawn_candidate_fitness(targets, x, z);
+            if candidate.2 < best.2 {
+                best = candidate;
+            }
+            angle += radius_increment / radius;
+            if angle > std::f32::consts::TAU {
+                angle = 0.0;
+                radius += radius_increment;
+            }
+        }
+        best
+    }
+
+    fn spawn_candidate_fitness(
+        &self,
+        targets: &[ParameterPoint],
+        x: i32,
+        z: i32,
+    ) -> (i32, i32, i128) {
+        let mut target = self.sample_target(x, 0, z);
+        target[4] = 0; // `Climate.SpawnFinder` ignores sampled depth.
+        let climate_fitness = targets
+            .iter()
+            .map(|point| point.fitness(target))
+            .min()
+            .unwrap_or(i64::MAX) as i128;
+        let distance_bias = i128::from(x).pow(2) + i128::from(z).pow(2);
+        (x, z, climate_fitness * i128::from(2048_i32.pow(2)) + distance_bias)
+    }
+}
+
+fn spawn_target_points() -> [ParameterPoint; 2] {
+    let full = ClimateParameter::span(-1.0, 1.0);
+    let continentalness = ClimateParameter::span(-0.11, 1.0);
+    let depth = ClimateParameter::point(0.0);
+    let offset = ClimateParameter::point(0.0);
+    [
+        ParameterPoint {
+            parameters: [
+                full,
+                full,
+                continentalness,
+                full,
+                depth,
+                ClimateParameter::span(-1.0, -0.16),
+                offset,
+            ],
+            biome: BiomeId::Plains,
+        },
+        ParameterPoint {
+            parameters: [
+                full,
+                full,
+                continentalness,
+                full,
+                depth,
+                ClimateParameter::span(0.16, 1.0),
+                offset,
+            ],
+            biome: BiomeId::Plains,
+        },
+    ]
 }
 
 fn quantize(value: f64) -> i64 {
@@ -695,6 +965,7 @@ fn add_valleys(output: &mut Vec<ParameterPoint>, temperatures: &[ClimateParamete
     }
 }
 
+#[cfg(test)]
 fn closest_biome(parameters: &[ParameterPoint], target: [i64; 7]) -> BiomeId {
     let mut best = parameters[0];
     let mut best_fitness = best.fitness(target);
@@ -732,6 +1003,59 @@ mod tests {
             point(ClimateParameter::point(0.0), ClimateParameter::point(0.0), ClimateParameter::point(0.0), ClimateParameter::point(0.0), ClimateParameter::point(0.0), ClimateParameter::point(0.0), 0.0, BiomeId::Forest),
         ];
         assert_eq!(closest_biome(&parameters, target), BiomeId::Plains);
+    }
+
+    #[test]
+    fn climate_rtree_matches_brute_force_distance_for_parameter_centers_and_samples() {
+        let parameters = build_parameter_points();
+        let index = ClimateRTree::new(&parameters);
+        for point in parameters.iter().step_by(37) {
+            let target = point.parameters.map(|parameter| (parameter.min + parameter.max) / 2);
+            let indexed = index.root.search(target, None).point;
+            let brute = parameters
+                .iter()
+                .copied()
+                .min_by_key(|point| point.fitness(target))
+                .unwrap();
+            assert_eq!(indexed.fitness(target), brute.fitness(target));
+        }
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..1024 {
+            let mut target = [0; 7];
+            for value in &mut target {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *value = ((state >> 32) as i32 % 20_001 - 10_000) as i64;
+            }
+            target[6] = 0;
+            let indexed = index.root.search(target, None).point;
+            let brute = parameters
+                .iter()
+                .copied()
+                .min_by_key(|point| point.fitness(target))
+                .unwrap();
+            assert_eq!(indexed.fitness(target), brute.fitness(target));
+        }
+    }
+
+    #[test]
+    fn seed_one_172_182_uses_reference_parameter_order_for_equal_fitness() {
+        let source = OverworldBiomeSource::from_router(
+            crate::world::world_gen::noise_router::NoiseRouterData::create_overworld_router_reference(1, false, false),
+        );
+        let target = source.sample_target(172, 96, 182);
+        let parameters = build_parameter_points();
+        let brute = parameters.iter().copied().min_by_key(|point| point.fitness(target)).unwrap();
+        let indexed = source.index.root.search(target, None).point;
+        assert_eq!(brute.biome, BiomeId::Forest);
+        assert_eq!(indexed.biome, BiomeId::Forest);
+        assert_eq!(indexed.fitness(target), brute.fitness(target));
+
+        let target = source.sample_target(158, 88, 165);
+        let indexed = source.index.root.search(target, None).point;
+        let brute = parameters.iter().copied().min_by_key(|point| point.fitness(target)).unwrap();
+        assert_eq!(indexed.biome, BiomeId::Forest);
+        assert_eq!(indexed, brute);
     }
 
     #[test]
@@ -825,6 +1149,14 @@ mod tests {
         );
         let source = OverworldBiomeSource::from_router(router);
         assert_eq!(source.get_biome(0, 64, 0), Ok(Biome::MushroomFields));
+    }
+
+    #[test]
+    fn seed_one_spawn_suggestion_matches_the_reference_search() {
+        let source = OverworldBiomeSource::from_router(
+            crate::world::world_gen::noise_router::NoiseRouterData::create_overworld_router_reference(1, false, false),
+        );
+        assert_eq!(source.find_spawn_position(), (126, 178));
     }
 
     #[test]

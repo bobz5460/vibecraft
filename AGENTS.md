@@ -30,9 +30,9 @@ This repository is a native Rust implementation of Minecraft-like Java Edition g
 
 ### Assets And Runtime Environment
 
-- The default Minecraft asset checkout is `/tmp/opencode/minecraft-assets`.
+- The default Minecraft asset checkout is the sibling `../minecraft-26.2-assets`; `/tmp/opencode/minecraft-assets` remains a fallback for existing setups.
 - Override the asset root with `VIBECRAFT_ASSETS=/path/to/minecraft-assets`.
-- The root must contain `assets/minecraft/...`; do not point the variable directly at `assets/minecraft`.
+- The override may be an asset checkout containing `assets/minecraft/...` or the `assets/minecraft` namespace directory itself.
 - Startup loads terrain textures, font assets, and common sounds. Test with real assets after changing an asset path, loader, atlas, or shader sampling rule.
 - If startup fails because assets are absent, report that as an environment blocker. Do not silently replace a production asset failure with arbitrary placeholder content unless the task specifically adds a documented fallback.
 

@@ -94,7 +94,11 @@ impl BlockMeshAssets {
     }
 
     fn set_texture_tiles(&mut self, tiles: &[texture_map::TextureTile]) {
-        self.texture_tiles = tiles.iter().map(|tile| (tile.path.clone(), tile.tile_index)).collect();
+        self.texture_tiles = tiles
+            .iter()
+            .filter(|tile| tile.frame == 0)
+            .map(|tile| (tile.path.clone(), tile.tile_index))
+            .collect();
     }
 
     pub fn has_model(&self, id: BlockId) -> bool {

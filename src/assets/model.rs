@@ -5,8 +5,35 @@ use crate::assets::reader::AssetReader;
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModelFile {
     pub parent: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_textures")]
     pub textures: Option<HashMap<String, String>>,
     pub elements: Option<Vec<ModelElement>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TextureDefinition {
+    Name(String),
+    Sprite { sprite: String },
+}
+
+fn deserialize_textures<'de, D>(deserializer: D) -> Result<Option<HashMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let definitions = HashMap::<String, TextureDefinition>::deserialize(deserializer)?;
+    Ok(Some(
+        definitions
+            .into_iter()
+            .map(|(name, definition)| {
+                let texture = match definition {
+                    TextureDefinition::Name(texture) => texture,
+                    TextureDefinition::Sprite { sprite } => sprite,
+                };
+                (name, texture)
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -86,7 +113,13 @@ pub fn load_model(reader: &AssetReader, name: &str) -> Option<ModelFile> {
     }
 
     let content = reader.read_to_string(&cache_key)?;
-    let model: ModelFile = serde_json::from_str(&content).ok()?;
+    let model: ModelFile = match serde_json::from_str(&content) {
+        Ok(model) => model,
+        Err(error) => {
+            log::warn!("failed to parse block model {cache_key}: {error}");
+            return None;
+        }
+    };
     let mut cache = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     cache
         .get_or_insert_with(HashMap::new)
@@ -216,5 +249,21 @@ mod tests {
     fn texture_reference_handles_cycles_without_looping() {
         let textures = HashMap::from([("a".to_string(), "#b".to_string()), ("b".to_string(), "#a".to_string())]);
         assert_eq!(resolve_texture_ref("#a", &textures), "#a");
+    }
+
+    #[test]
+    fn deserializes_structured_26_2_texture_definitions() {
+        let model: ModelFile = serde_json::from_str(
+            r##"{
+                "textures": {
+                    "line": {"sprite":"block/redstone_dust_dot","force_translucent":true},
+                    "particle": "block/redstone_dust_dot"
+                }
+            }"##,
+        )
+        .unwrap();
+        let textures = model.textures.unwrap();
+        assert_eq!(textures["line"], "block/redstone_dust_dot");
+        assert_eq!(textures["particle"], "block/redstone_dust_dot");
     }
 }

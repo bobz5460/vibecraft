@@ -498,6 +498,7 @@ const CROSSED_BITMASK: [u64; 7] = bitmask!(
     Ladder, SweetBerryBush,
     Torch, SoulTorch, RedstoneTorch,
     Fire, SoulFire,
+    Seagrass, TallSeagrass, Kelp, KelpPlant,
 );
 
 impl BlockId {

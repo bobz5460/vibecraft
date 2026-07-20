@@ -23,7 +23,9 @@ vibecraft [--config PATH] [--seed U64] [--world-dir PATH]
 | `--graphics` | `regular` or `vibrant` | Set initial render quality. |
 | `--keybind` | `ACTION=KEY` | Override a core key binding. |
 
-`VIBECRAFT_ASSETS` must point to an asset root containing `assets/minecraft`. It defaults to `/tmp/opencode/minecraft-assets`.
+`VIBECRAFT_ASSETS` may point to an asset checkout containing `assets/minecraft`
+or directly to `assets/minecraft`. Without it, Vibecraft first uses the supplied
+`../minecraft-26.2-assets` checkout and then `/tmp/opencode/minecraft-assets`.
 
 ## Chat
 

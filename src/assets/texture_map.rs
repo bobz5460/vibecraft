@@ -8,6 +8,27 @@ use crate::assets::reader::AssetReader;
 pub struct TextureTile {
     pub path: String,
     pub tile_index: u32,
+    /// Vertical animation frame in the source PNG. Frame zero is the tile
+    /// referenced by block mappings; following frames are packed contiguously.
+    pub frame: u32,
+}
+
+fn animation_frame_count(path: &str) -> u32 {
+    match path {
+        "water_still" => 32,
+        "lava_still" | "kelp" | "kelp_plant" => 20,
+        _ => 1,
+    }
+}
+
+fn push_texture_frames(tiles: &mut Vec<TextureTile>, path: &str) {
+    for frame in 0..animation_frame_count(path) {
+        tiles.push(TextureTile {
+            path: path.to_string(),
+            tile_index: tiles.len() as u32,
+            frame,
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +82,7 @@ fn minecraft_name(id: BlockId) -> Option<&'static str> {
         MossyCobblestone => Some("mossy_cobblestone"),
         Obsidian => Some("obsidian"),
         Spawner => Some("spawner"),
+        MagmaBlock => Some("magma_block"),
         Sandstone => Some("sandstone"),
         StoneBricks => Some("stone_bricks"),
         Granite => Some("granite"),
@@ -196,6 +218,7 @@ fn minecraft_name(id: BlockId) -> Option<&'static str> {
         TintedGlass => Some("tinted_glass"),
         AmethystBlock => Some("amethyst_block"),
         BuddingAmethyst => Some("budding_amethyst"),
+        AmethystCluster => Some("amethyst_cluster"),
         CopperOre => Some("copper_ore"),
         CopperBlock => Some("copper_block"),
         ExposedCopper => Some("exposed_copper"),
@@ -214,6 +237,9 @@ fn minecraft_name(id: BlockId) -> Option<&'static str> {
         PackedMud => Some("packed_mud"),
         MudBricks => Some("mud_bricks"),
         MossBlock => Some("moss_block"),
+        Seagrass | TallSeagrass => Some("seagrass"),
+        Kelp => Some("kelp"),
+        KelpPlant => Some("kelp_plant"),
         DriedKelpBlock => Some("dried_kelp_block"),
         BlueIce => Some("blue_ice"),
         PackedIce => Some("packed_ice"),
@@ -291,8 +317,18 @@ fn face_textures_for_block(reader: &AssetReader, id: BlockId) -> Option<[String;
     };
 
     if let Some(tex_map) = resolved {
+        let deterministic_fallback = tex_map
+            .iter()
+            .min_by(|left, right| left.0.cmp(right.0))
+            .map(|(_, texture)| texture.clone())
+            .unwrap_or_else(|| {
+                // The vanilla chest block model has no cube elements; it only
+                // declares oak planks as its particle material. Use that for
+                // the legacy cube until chest entity geometry is implemented.
+                if id == BlockId::Chest { "oak_planks" } else { name }.to_string()
+            });
         let get = |key: &str| -> String {
-            tex_map.get(key).cloned().unwrap_or_else(|| name.to_string())
+            tex_map.get(key).cloned().unwrap_or_else(|| deterministic_fallback.clone())
         };
         Some([
             get("up"), get("down"), get("west"),
@@ -624,6 +660,15 @@ fn collect_all_block_ids() -> Vec<(BlockId, &'static str)> {
     push!(GreenShulkerBox, "green_shulker_box");
     push!(RedShulkerBox, "red_shulker_box");
     push!(BlackShulkerBox, "black_shulker_box");
+    // Close the manual compatibility list over the canonical resource map so
+    // a supported/generated block cannot be forgotten in this second registry.
+    for value in 0..=413 {
+        let Some(id) = BlockId::from_repr(value) else { continue };
+        let Some(name) = minecraft_name(id) else { continue };
+        if !all.iter().any(|(registered, _)| *registered == id) {
+            all.push((id, name));
+        }
+    }
     all
 }
 
@@ -652,10 +697,7 @@ impl BlockTextureMapping {
         for (_, faces) in &self.entries {
             for tex_name in faces {
                 if seen.insert(tex_name.clone()) {
-                    tiles.push(TextureTile {
-                        path: tex_name.clone(),
-                        tile_index: tiles.len() as u32,
-                    });
+                    push_texture_frames(&mut tiles, tex_name);
                 }
             }
         }
@@ -673,22 +715,18 @@ impl BlockTextureMapping {
             "cactus_side", "sugar_cane", "lily_pad",
             "vine", "weeping_vines", "twisting_vines", "glow_lichen",
             "spore_blossom", "azalea_plant", "flowering_azalea_side",
+            "amethyst_cluster",
+            "seagrass", "kelp", "kelp_plant",
         ];
         for &tex in &crossed_textures {
             if seen.insert(tex.to_string()) {
-                tiles.push(TextureTile {
-                    path: tex.to_string(),
-                    tile_index: tiles.len() as u32,
-                });
+                push_texture_frames(&mut tiles, tex);
             }
         }
 
         for tex in extra_textures {
             if seen.insert(tex.clone()) {
-                tiles.push(TextureTile {
-                    path: tex.clone(),
-                    tile_index: tiles.len() as u32,
-                });
+                push_texture_frames(&mut tiles, tex);
             }
         }
 
@@ -698,7 +736,7 @@ impl BlockTextureMapping {
     pub fn resolve_face_tiles(&self, tiles: &[TextureTile]) -> HashMap<(BlockId, BlockFace), u32> {
         let mut map: HashMap<String, u32> = HashMap::new();
         for tile in tiles {
-            map.insert(tile.path.clone(), tile.tile_index);
+            map.entry(tile.path.clone()).or_insert(tile.tile_index);
         }
 
         let mut result = HashMap::new();
@@ -748,7 +786,8 @@ impl BlockTextureMapping {
                         if w == 16 && h == 16 {
                             rgba.into_raw()
                         } else if w == 16 && h >= 16 && h % 16 == 0 {
-                            image::imageops::crop_imm(&rgba, 0, 0, 16, 16).to_image().into_raw()
+                            let frame_y = tile.frame.min(h / 16 - 1) * 16;
+                            image::imageops::crop_imm(&rgba, 0, frame_y, 16, 16).to_image().into_raw()
                         } else {
                             let resized = image::imageops::resize(&rgba, 16, 16, image::imageops::FilterType::Nearest);
                             resized.into_raw()
@@ -790,7 +829,7 @@ impl BlockTextureMapping {
         use BlockId::*;
         let mut map: HashMap<String, u32> = HashMap::new();
         for tile in tiles {
-            map.insert(tile.path.clone(), tile.tile_index);
+            map.entry(tile.path.clone()).or_insert(tile.tile_index);
         }
 
         let mut result = HashMap::new();
@@ -835,6 +874,11 @@ impl BlockTextureMapping {
             (SporeBlossom, "spore_blossom"),
             (Azalea, "azalea_plant"),
             (FloweringAzalea, "flowering_azalea_side"),
+            (AmethystCluster, "amethyst_cluster"),
+            (Seagrass, "seagrass"),
+            (TallSeagrass, "seagrass"),
+            (Kelp, "kelp"),
+            (KelpPlant, "kelp_plant"),
         ];
         for &(id, tex) in crossed {
             if let Some(&tile) = map.get(tex) {
@@ -863,4 +907,92 @@ fn generate_fallback(name: &str) -> Vec<u8> {
         }
     }
     pixels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn minecraft_asset_reader() -> Option<AssetReader> {
+        let mut candidates = Vec::new();
+        if let Some(path) = std::env::var_os("VIBECRAFT_ASSETS") {
+            candidates.push(PathBuf::from(path));
+        }
+        candidates.push(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../minecraft-26.2-assets"),
+        );
+        candidates.push(PathBuf::from("/tmp/opencode/minecraft-assets"));
+
+        candidates.into_iter().find_map(|root| {
+            let namespace = if root.join("assets/minecraft").is_dir() {
+                root.join("assets/minecraft")
+            } else {
+                root
+            };
+            namespace.join("blockstates/stone.json").is_file()
+                .then(|| AssetReader::new(namespace))
+        })
+    }
+
+    #[test]
+    fn canonical_resource_blocks_are_registered_for_the_atlas() {
+        let registered = collect_all_block_ids();
+        for expected in [
+            BlockId::Spawner,
+            BlockId::MagmaBlock,
+            BlockId::AmethystBlock,
+            BlockId::BuddingAmethyst,
+            BlockId::AmethystCluster,
+            BlockId::Seagrass,
+            BlockId::TallSeagrass,
+            BlockId::Kelp,
+            BlockId::KelpPlant,
+        ] {
+            assert!(
+                registered.iter().any(|(id, _)| *id == expected),
+                "{expected:?} was omitted from atlas registration"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_and_entity_models_use_existing_texture_fallbacks() {
+        let Some(reader) = minecraft_asset_reader() else {
+            eprintln!("skipping real-asset texture resolution test: assets unavailable");
+            return;
+        };
+
+        let magma = face_textures_for_block(&reader, BlockId::MagmaBlock).unwrap();
+        assert!(magma.iter().all(|texture| texture == "magma"));
+
+        let door = face_textures_for_block(&reader, BlockId::OakDoor).unwrap();
+        assert!(door.iter().all(|texture| texture != "oak_door"));
+
+        let roots = face_textures_for_block(&reader, BlockId::MangroveRoots).unwrap();
+        assert!(roots.iter().all(|texture| texture != "mangrove_roots"));
+
+        let chest = face_textures_for_block(&reader, BlockId::Chest).unwrap();
+        assert!(chest.iter().all(|texture| texture == "oak_planks"));
+
+        let mapping = build_texture_mapping(&reader);
+        let tiles = mapping.build_tile_list(&[]);
+        let faces = mapping.resolve_face_tiles(&tiles);
+        for id in [BlockId::Seagrass, BlockId::TallSeagrass, BlockId::Kelp, BlockId::KelpPlant] {
+            for face in FACES {
+                assert!(faces.contains_key(&(id, face)), "missing {id:?} {face:?} atlas face");
+            }
+        }
+        let water_frames: Vec<_> = tiles.iter().filter(|tile| tile.path == "water_still").collect();
+        assert_eq!(water_frames.len(), 32);
+        assert!(water_frames.windows(2).all(|pair| {
+            pair[1].tile_index == pair[0].tile_index + 1 && pair[1].frame == pair[0].frame + 1
+        }));
+        let images = mapping.load_all_pngs(&tiles);
+        assert_ne!(
+            images[water_frames[0].tile_index as usize],
+            images[water_frames[1].tile_index as usize],
+            "water animation frames must not be collapsed to frame zero"
+        );
+    }
 }

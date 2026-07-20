@@ -7,6 +7,6 @@
 /embeds_minecraft
 
 # Generated world data.
-world/chunks/
+world/
 
 .DS_Store

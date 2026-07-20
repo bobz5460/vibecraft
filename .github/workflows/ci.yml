@@ -70,6 +70,8 @@ jobs:
     - name: Build (cross-compile)
       if: ${{ matrix.target }}
       run: cargo build --release --features bundled --target ${{ matrix.target }}
+    - name: Verify bundled assets
+      run: cargo test --release --features bundled assets::reader::tests::bundled_reader_recognizes_asset_directories
     - name: Upload bundled executable
       uses: actions/upload-artifact@v4
       with:

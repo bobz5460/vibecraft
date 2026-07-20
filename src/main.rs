@@ -79,12 +79,17 @@ fn resolve_minecraft_asset_directory() -> Result<std::path::PathBuf, String> {
         });
     }
 
+    #[cfg(feature = "bundled")]
+    return Ok(std::path::PathBuf::new());
+
     // The supplied 26.2 assets normally live next to this repository. Keep
     // the historical CI/developer checkout as a fallback for existing setups.
+    #[cfg(not(feature = "bundled"))]
     let candidates = [
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../minecraft-26.2-assets"),
         std::path::PathBuf::from("/tmp/opencode/minecraft-assets"),
     ];
+    #[cfg(not(feature = "bundled"))]
     candidates
         .iter()
         .find_map(|root| minecraft_asset_directory(root))
@@ -1146,7 +1151,11 @@ async fn run(config: AppConfig) {
             return;
         }
     };
-    log::info!("using Minecraft assets from {}", asset_directory.display());
+    if asset_directory.as_os_str().is_empty() {
+        log::info!("using bundled Minecraft assets");
+    } else {
+        log::info!("using Minecraft assets from {}", asset_directory.display());
+    }
     let asset_reader = vibecraft::assets::reader::AssetReader::new(asset_directory);
 
     let mut render_distance = config.render_distance;
